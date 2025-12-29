@@ -27,6 +27,7 @@
 *.zip
 *.uasset
 *.umap
+*.pth
 AirSim_Source/AirLib/lib/
 AirSim_Source/docs/annsim23_tutorial/
 AirSim_Source/DroneServer/temp/
@@ -60,3 +61,4 @@ deps/
 cmake_build/
 build_debug/
 build_release/
+ppo_drone_tensorboard/
