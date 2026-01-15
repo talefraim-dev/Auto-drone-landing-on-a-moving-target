@@ -1,3 +1,4 @@
+# object_tracker.py
 import cv2
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ class tracker:
         self.target_features = None
         self.last_bbox = None
 
-        self.MATCH_TH = 0.40 # TODO: raise the TH along the training
+        self.MATCH_TH = 0.45  # TODO: raise the TH along the training
         self.AUTOLOCK_TH = 0.35
 
         self.last_mode = "NONE"
@@ -42,14 +43,35 @@ class tracker:
         self._prev_center = None
         self._vel_ema = np.zeros(2, dtype=np.float32)
 
+        # -----------------------------
+        # YAW ego-motion compensation (POC)
+        # -----------------------------
+        # env should update this every step:
+        #   tracker.last_yaw_rate_cmd_dps = yaw_rate_cmd_dps
+        self.last_yaw_rate_cmd_dps = 0.0
+
+        # How many pixels we shift the predicted center per 1 deg/sec of commanded yaw,
+        # assuming dt ~ 0.1s. This is an approximate compensation to reduce drift in PRED.
+        # Tune this gently (start small).
+        self.YAW_PIX_PER_DPS = 0.12  # pixels per (deg/sec) per step (approx)
+
     # -----------------------------
     def get_features(self, frame, bbox_xywh):
         x, y, w, h = bbox_xywh
         if w <= 0 or h <= 0:
             return None
-        roi = frame[y:y + h, x:x + w]
+
+        # clip ROI to frame bounds (safe)
+        H, W = frame.shape[:2]
+        x0 = int(np.clip(x, 0, W - 1))
+        y0 = int(np.clip(y, 0, H - 1))
+        x1 = int(np.clip(x + w, 0, W))
+        y1 = int(np.clip(y + h, 0, H))
+
+        roi = frame[y0:y1, x0:x1]
         if roi.size == 0:
             return None
+
         hist = cv2.calcHist([roi], [0, 1, 2], None, [8, 8, 8], [0, 256] * 3)
         return cv2.normalize(hist, hist).flatten()
 
@@ -68,6 +90,8 @@ class tracker:
     def set_target_class(self, cid):
         self.target_class_id = None if cid is None else int(cid)
 
+    # -----------------------------
+    # IMPORTANT: keep this function (env depends on it)
     # -----------------------------
     def select_target_and_get_class(self, frame, x, y):
         results = self.model.predict(frame, conf=0.3, verbose=False)[0]
@@ -193,13 +217,20 @@ class tracker:
             self.last_mode = "MATCH"
             return self.last_bbox
 
+        # No match => PRED (with yaw compensation)
         if self.last_bbox is None:
             self.STATE = "SEARCH"
             self.last_mode = "NONE"
             return None
 
+        # --- Ego-motion compensation: shift predicted center by commanded yaw ---
+        # If the drone yaws right (+), the image content shifts left.
+        # So we shift the predicted center opposite sign (approx).
+        pred_cx += -float(self.last_yaw_rate_cmd_dps) * float(self.YAW_PIX_PER_DPS)
+
         x1, y1, x2, y2 = self.last_bbox
         w, h = x2 - x1, y2 - y1
+
         self.last_bbox = [
             int(pred_cx - w / 2), int(pred_cy - h / 2),
             int(pred_cx + w / 2), int(pred_cy + h / 2)

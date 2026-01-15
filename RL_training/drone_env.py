@@ -406,6 +406,14 @@ class DroneEnv(gym.Env):
 
         yaw_rate_cmd = float(action[3]) * self.cfg.yaw_rate_scale_dps
 
+        # -----------------------------
+        # YAW COMPENSATION FEED (for tracker PRED correction)
+        # -----------------------------
+        # The tracker has no access to drone controls/ego-motion by itself.
+        # We feed the commanded yaw-rate (deg/sec) each step so it can compensate
+        # predicted BBox drift during PRED mode.
+        self.tracker.last_yaw_rate_cmd_dps = float(yaw_rate_cmd)
+
         # Save command for disturbance estimate
         self._last_cmd_vx = vx_cmd
         self._last_cmd_vy = vy_cmd
@@ -459,7 +467,8 @@ class DroneEnv(gym.Env):
 
         # Fill self state block (B)
         vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n = self._get_self_state_features()
-        obs[6:16] = np.array([vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n], dtype=np.float32)
+        obs[6:16] = np.array([vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n],
+                             dtype=np.float32)
 
         # Fill lidar sectors block (C)
         d_front, d_fl, d_left, d_right, d_fr, d_down = self._get_lidar_sectors()
@@ -638,9 +647,9 @@ class DroneEnv(gym.Env):
                 f"return={self._ep_return:+.2f} "
                 f"max_focus={self._ep_max_focus:.1f}s "
                 f"GLOBAL={self._global_max_focus:.1f}s "
-                f"MATCH={100*self._ep_match/total:.1f}% "
-                f"PRED={100*self._ep_pred/total:.1f}% "
-                f"NONE={100*self._ep_none/total:.1f}% "
+                f"MATCH={100 * self._ep_match / total:.1f}% "
+                f"PRED={100 * self._ep_pred / total:.1f}% "
+                f"NONE={100 * self._ep_none / total:.1f}% "
                 f"dur={dur:.1f}s reason={term_reason}"
             )
 
