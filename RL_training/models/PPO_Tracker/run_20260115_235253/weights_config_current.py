@@ -85,8 +85,6 @@ class EnvConfig:
     center_decay: float = 2.0
     w_area: float = 1.2
     w_focus: float = 3.0  # multiplied by min(2, focus/4)
-    w_vz = 0.03 # Tal E: Until phase #2, keep small.
-
 
     # termination penalties
     penalty_focus_timeout: float = 20.0

@@ -23,6 +23,15 @@ class EnvConfig:
     print_ep_summary: bool = True
 
     # -----------------------------
+    # Camera geometry
+    # -----------------------------
+    camera_pitch_deg: float = 30.0
+    # 0.0  = camera looks straight forward
+    # +20  = camera pitched DOWN by 20 degrees
+    # -20  = camera pitched UP by 20 degrees
+
+
+    # -----------------------------
     # Timing
     # -----------------------------
     max_step_sec: float = 0.20
@@ -33,11 +42,11 @@ class EnvConfig:
     # -----------------------------
     vx_scale: float = 2.0
     vy_scale: float = 2.0
-    vz_scale: float = 0.5
+    vz_scale: float = 3.0
     yaw_rate_scale_dps: float = 70.0  # deg/sec
 
     # Stage-1 stability
-    freeze_vz: bool = False
+    freeze_vz: bool = True
 
     # -----------------------------
     # Observation signature
@@ -52,8 +61,8 @@ class EnvConfig:
     use_obstacle_penalty: bool = False
     use_collision_termination: bool = False
 
-    use_range_proxy_from_area: bool = True
-    use_range_rate_proxy: bool = True
+    use_range_proxy_from_area: bool = False
+    use_range_rate_proxy: bool = False
 
     # If you later have real range-to-target from LiDAR/GPS/vision fusion:
     use_real_range_to_target: bool = False
@@ -81,12 +90,10 @@ class EnvConfig:
     energy_penalty_k: float = 0.06
 
     # shaping
-    w_center: float = 24
-    center_decay: float = 2.0
+    w_center: float = 2.5
+    center_decay: float = 3.0
     w_area: float = 1.2
-    w_focus: float = 3.0  # multiplied by min(2, focus/4)
-    w_vz = 0.03 # Tal E: Until phase #2, keep small.
-
+    w_focus: float = 1.0  # multiplied by min(2, focus/4)
 
     # termination penalties
     penalty_focus_timeout: float = 20.0
@@ -94,8 +101,7 @@ class EnvConfig:
     penalty_collision: float = 50.0
 
     # no bbox penalty (keep it mild to not kill early learning)
-    penalty_no_bbox: float = 2.5
-    w_calm_no_bbox: float = 0.8
+    penalty_no_bbox: float = 5.0
 
     # -----------------------------
     # Normalization scales (tune for sim/real)

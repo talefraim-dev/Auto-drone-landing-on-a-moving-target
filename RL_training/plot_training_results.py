@@ -3,7 +3,25 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# GLOBAL DARK STYLE
+# -----------------------------
+plt.style.use("dark_background")
+plt.rcParams.update({
+    "figure.facecolor": "#111111",
+    "axes.facecolor": "#111111",
+    "axes.edgecolor": "#666666",
+    "axes.labelcolor": "#DDDDDD",
+    "xtick.color": "#BBBBBB",
+    "ytick.color": "#BBBBBB",
+    "grid.color": "#333333",
+    "text.color": "#DDDDDD",
+    "legend.frameon": False,
+})
 
 
 def find_run_dir(log_root="logs", preferred=None) -> Path | None:
@@ -29,11 +47,14 @@ def find_run_dir(log_root="logs", preferred=None) -> Path | None:
 def merge_scalars(run_dir: Path, wanted_tags: list[str]):
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-    event_files = sorted(run_dir.rglob("events.out.tfevents.*"), key=lambda f: f.stat().st_mtime)
+    event_files = sorted(
+        run_dir.rglob("events.out.tfevents.*"),
+        key=lambda f: f.stat().st_mtime,
+    )
     if not event_files:
         return {}, []
 
-    merged = {t: {} for t in wanted_tags}  # tag -> {step: value}
+    merged = {t: {} for t in wanted_tags}
     available_union = set()
 
     for ev in event_files:
@@ -47,7 +68,6 @@ def merge_scalars(run_dir: Path, wanted_tags: list[str]):
             if tag not in tags:
                 continue
             for s in ea.Scalars(tag):
-                # keep newest value for each step
                 merged[tag][int(s.step)] = float(s.value)
 
     out = {}
@@ -61,9 +81,21 @@ def merge_scalars(run_dir: Path, wanted_tags: list[str]):
     return out, sorted(list(available_union))
 
 
+def ema(y: list[float], alpha: float = 0.08) -> np.ndarray:
+    """Exponential moving average for nicer readability."""
+    y = np.asarray(y, dtype=np.float64)
+    if y.size == 0:
+        return y
+    out = np.empty_like(y)
+    out[0] = y[0]
+    for i in range(1, len(y)):
+        out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
 def main():
     try:
-        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator  # noqa: F401
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator  # noqa
     except Exception:
         print("Missing tensorboard package. Install with: pip install tensorboard")
         return
@@ -76,14 +108,22 @@ def main():
 
     print("Reading run:", run_dir)
 
+    # =============================
+    # REALLY INFORMATIVE METRICS
+    # =============================
     wanted = [
-        "time/fps",
-        "train/std",
+        # Behavior KPIs (you are blind without these)
+        "rollout/ep_rew_mean",
+        "rollout/ep_len_mean",
+        "rollout/success_rate",      # may not exist unless you log success
+
+        # PPO health signals
         "train/explained_variance",
-        "train/approx_kl",
         "train/entropy_loss",
-        "train/value_loss",
-        "train/policy_gradient_loss",
+        "train/approx_kl",
+
+        # Perf
+        "time/fps",
     ]
 
     plt.ion()
@@ -93,33 +133,59 @@ def main():
         data, available = merge_scalars(run_dir, wanted)
 
         if not data:
-            print("No wanted tags found yet. Available:", available)
+            print("No wanted tags found yet.")
+            print("Available tags:", available)
             time.sleep(3)
             continue
 
         ax.clear()
 
-        for tag, (xs, ys) in data.items():
-            ax.plot(xs, ys, linewidth=2, label=tag)
+        # Plot order: KPIs first, then training health
+        plot_order = [
+            "rollout/ep_rew_mean",
+            "rollout/ep_len_mean",
+            "rollout/success_rate",
+            "train/explained_variance",
+            "train/entropy_loss",
+            "train/approx_kl",
+            "time/fps",
+        ]
 
-            # last point + label
-            x_last, y_last = xs[-1], ys[-1]
-            ax.scatter([x_last], [y_last], s=35)
+        for tag in plot_order:
+            if tag not in data:
+                continue
+
+            xs, ys = data[tag]
+
+            # Smooth only the noisy one
+            if tag == "rollout/ep_rew_mean" and len(ys) >= 5:
+                ys_plot = ema(ys, alpha=0.08)
+                label = f"{tag} (EMA)"
+            else:
+                ys_plot = np.asarray(ys, dtype=np.float64)
+                label = tag
+
+            ax.plot(xs, ys_plot, linewidth=2, label=label)
+
+            x_last, y_last = xs[-1], float(ys_plot[-1])
+            ax.scatter([x_last], [y_last], s=28)
             ax.text(
                 x_last,
                 y_last,
-                f"  {tag}={y_last:.4f}",
+                f"  {label}={y_last:.3f}",
                 fontsize=9,
                 va="center",
             )
 
-        ax.set_title(f"Live SB3 scalars (merged events) — {run_dir.name}")
+        ax.set_title(f"Training KPIs + PPO health — {run_dir.name}", fontsize=13)
         ax.set_xlabel("timesteps")
-        ax.grid(True)
+        ax.grid(True, alpha=0.3)
+
+        # Show legend only for existing plotted lines
         ax.legend(loc="best")
+
         plt.tight_layout()
         plt.pause(0.2)
-
         time.sleep(3)
 
 

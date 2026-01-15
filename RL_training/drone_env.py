@@ -404,6 +404,7 @@ class DroneEnv(gym.Env):
         else:
             vz_cmd = float(action[2]) * self.cfg.vz_scale
 
+
         yaw_rate_cmd = float(action[3]) * self.cfg.yaw_rate_scale_dps
 
         # -----------------------------
@@ -442,6 +443,7 @@ class DroneEnv(gym.Env):
         # energy penalty
         a = np.array(action, dtype=np.float32)
         energy_penalty = -float(self.cfg.energy_penalty_k) * float(np.abs(a).sum())
+
 
         # Optional collision termination
         done = False
@@ -487,11 +489,40 @@ class DroneEnv(gym.Env):
         # Reward
         reward = 0.0
 
+        # -----------------------------
+        # Small penalty on vertical motion (Z calmness)
+        # Tal E: The penalty will be  removed / changed on phase #2 (splitting the mission to  land/follow)
+        # -----------------------------
+        reward -= float(self.cfg.w_vz) * abs(vz_cmd) * dt
+
         if bbox is None and not done:
             self._ep_none += 1
             obs[3] = -1.0  # quality NONE
 
             reward = -float(self.cfg.penalty_no_bbox) + energy_penalty
+
+            # -----------------------------
+            # Fallback shaping when bbox is missing:
+            # reward calm motion instead of chaotic exploration
+            # -----------------------------
+            vx_n = abs(vx_cmd) / max(1e-6, float(self.cfg.vx_scale))
+            vy_n = abs(vy_cmd) / max(1e-6, float(self.cfg.vy_scale))
+            yaw_n = abs(yaw_rate_cmd) / max(1e-6, float(self.cfg.yaw_rate_scale_dps))
+
+            vx_n = float(np.clip(vx_n, 0.0, 1.0))
+            vy_n = float(np.clip(vy_n, 0.0, 1.0))
+            yaw_n = float(np.clip(yaw_n, 0.0, 1.0))
+
+            # 1 when calm, 0 when maxed
+            calm = 1.0 - (0.45 * vx_n + 0.45 * vy_n + 0.10 * yaw_n)
+            calm = float(np.clip(calm, 0.0, 1.0))
+
+            reward += float(self.cfg.w_calm_no_bbox) * calm * dt
+
+            # -----------------------------
+            # -----------------------------
+
+
             reward += self._obstacle_penalty(dt)
 
             self._lost_time += dt

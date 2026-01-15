@@ -35,7 +35,7 @@ class tracker:
         self.target_features = None
         self.last_bbox = None
 
-        self.MATCH_TH = 0.45  # TODO: raise the TH along the training
+        self.MATCH_TH = 0.52  # TODO: raise the TH along the training
         self.AUTOLOCK_TH = 0.35
 
         self.last_mode = "NONE"
