@@ -113,7 +113,7 @@ def main():
     env = DummyVecEnv([lambda: DroneEnv()])
 
     # You can change this target anytime. Resume logic will train only the remaining.
-    target_total_timesteps = 200_000
+    target_total_timesteps = 500_000
 
     # --------------------------------------------------
     # Resume logic
