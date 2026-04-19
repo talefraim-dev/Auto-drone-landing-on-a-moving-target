@@ -1,3 +1,6 @@
+# Baseline V2: Stable tracking + CNN/Histogram fusion + illumination robustness (low FPS)
+# changes in algo core.
+
 import cv2
 import numpy as np
 import torch
