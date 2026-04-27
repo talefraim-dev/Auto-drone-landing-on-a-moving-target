@@ -1,15 +1,15 @@
-# Run_train.py
+import hashlib
 import os
 import re
 import shutil
-import hashlib
 from datetime import datetime
 
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+import torch
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from drone_env import DroneEnv
+from plain_pyplot_window import LivePyplotCallback, PlottingPPO
 
 
 # --------------------------------------------------
@@ -33,10 +33,7 @@ def copy_with_hash(src: str, dst: str) -> str:
 # Find latest checkpoint (recursive)
 # --------------------------------------------------
 def get_latest_checkpoint_recursive(models_dir: str):
-    """
-    Finds the latest checkpoint based on *_XXXXX_steps.zip naming, recursively.
-    Returns (full_path, steps_int) or (None, None).
-    """
+    """Find the latest checkpoint based on *_XXXXX_steps.zip naming, recursively."""
     if not os.path.isdir(models_dir):
         return None, None
 
@@ -60,10 +57,7 @@ def get_latest_checkpoint_recursive(models_dir: str):
 
 
 def find_nearest_config_snapshot(ckpt_path: str):
-    """
-    Looks for a weights_config snapshot in the same directory as the checkpoint.
-    Returns path or None.
-    """
+    """Looks for a weights_config snapshot in the same directory as the checkpoint."""
     d = os.path.dirname(ckpt_path)
     candidates = [
         os.path.join(d, "weights_config_snapshot.py"),
@@ -76,7 +70,7 @@ def find_nearest_config_snapshot(ckpt_path: str):
 
 
 # --------------------------------------------------
-# Progress callback (clean, no spam)
+# Progress callback
 # --------------------------------------------------
 class PrintProgressCallback(BaseCallback):
     def __init__(self, target_total_timesteps: int, print_every_steps: int = 2000, verbose: int = 0):
@@ -96,43 +90,38 @@ class PrintProgressCallback(BaseCallback):
 # Main
 # --------------------------------------------------
 def main():
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available. Install a CUDA-enabled PyTorch build before training."
+        )
+
+    print(f"[TRAIN] Using CUDA device: {torch.cuda.get_device_name(0)}")
+
     models_root = "models/PPO_Tracker"
     log_dir = "logs"
     os.makedirs(models_root, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
-    # Your config file (snapshot it!)
     cfg_src = os.path.join(os.getcwd(), "weights_config.py")
     if not os.path.isfile(cfg_src):
         raise FileNotFoundError(
-            "weights_config.py not found next to Run_train.py. "
-            "Put weights_config.py in the project root."
+            "weights_config.py not found next to Run_train.py. Put weights_config.py in the project root."
         )
 
-    # One env instance (DummyVecEnv)
     env = DummyVecEnv([lambda: DroneEnv()])
-
-    # You can change this target anytime. Resume logic will train only the remaining.
     target_total_timesteps = 500_000
 
-    # --------------------------------------------------
-    # Resume logic
-    # --------------------------------------------------
     latest_ckpt, ckpt_steps = get_latest_checkpoint_recursive(models_root)
 
-    # Run directory per session (keeps checkpoints + matching config snapshot)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(models_root, f"run_{run_id}")
     os.makedirs(run_dir, exist_ok=True)
 
-    # Snapshot the CURRENT config for this run
-    # (So every run has exact config record)
     current_cfg_hash = copy_with_hash(cfg_src, os.path.join(run_dir, "weights_config_snapshot.py"))
 
     if latest_ckpt is not None:
         print(f"[TRAIN] Resuming from checkpoint: {latest_ckpt} (steps={ckpt_steps})")
 
-        # Compare config snapshots (if exists next to ckpt)
         prev_cfg = find_nearest_config_snapshot(latest_ckpt)
         if prev_cfg is not None:
             prev_hash = sha256_file(prev_cfg)
@@ -149,14 +138,15 @@ def main():
         else:
             print("[WARN] No weights_config snapshot found next to the checkpoint. (Older runs?)")
 
-        # Load model
-        model = PPO.load(
-            latest_ckpt,
-            env=env,
-            device="cpu"
-        )
+        try:
+            model = PlottingPPO.load(latest_ckpt, env=env, device="cuda")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load the latest checkpoint. If this is an old 34-channel model, remove it before "
+                "training the 48-channel architecture.\n"
+                f"Checkpoint: {latest_ckpt}\nError: {e}"
+            ) from e
 
-        # Train only remaining steps to reach target_total_timesteps
         already = int(getattr(model, "num_timesteps", 0))
         remaining = max(0, target_total_timesteps - already)
 
@@ -167,7 +157,7 @@ def main():
     else:
         print("[TRAIN] Starting new training (no checkpoints found)")
 
-        model = PPO(
+        model = PlottingPPO(
             "MlpPolicy",
             env,
             verbose=1,
@@ -177,28 +167,24 @@ def main():
             n_epochs=10,
             gamma=0.99,
             tensorboard_log=log_dir,
-            device="cpu"
+            device="cuda",
         )
 
         remaining = target_total_timesteps
         reset_num_timesteps = True
 
-    # --------------------------------------------------
-    # Callbacks
-    # - Checkpoints saved INSIDE run_dir to keep them tied to the config snapshot
-    # --------------------------------------------------
     checkpoint_callback = CheckpointCallback(
         save_freq=10_000,
         save_path=run_dir,
-        name_prefix="tracker_rl_model"
+        name_prefix="tracker_rl_model",
     )
-
     progress_callback = PrintProgressCallback(
         target_total_timesteps=target_total_timesteps,
-        print_every_steps=2000
+        print_every_steps=2000,
     )
+    # plot_callback = LivePyplotCallback()
 
-    print("\n--- Training Started (checkpoint + auto-resume + config snapshots) ---\n")
+    print("\n--- Training Started (48-ch + rewards.py + resume/checkpoints + live pyplot) ---\n")
     print(f"[TRAIN] run_dir: {run_dir}")
     print(f"[TRAIN] target_total_timesteps: {target_total_timesteps}")
     print(f"[TRAIN] remaining_to_train: {remaining}")
@@ -207,21 +193,16 @@ def main():
         if remaining > 0:
             model.learn(
                 total_timesteps=remaining,
+                # callback=[checkpoint_callback, progress_callback, plot_callback], original callback with live loss and %Match plot
                 callback=[checkpoint_callback, progress_callback],
                 progress_bar=True,
-                reset_num_timesteps=reset_num_timesteps
+                reset_num_timesteps=reset_num_timesteps,
             )
     except KeyboardInterrupt:
         print("\n[TRAIN] Interrupted by user. Saving last model...")
 
-    # --------------------------------------------------
-    # Final save (always) + save a copy of current config next to final model
-    # --------------------------------------------------
     final_path = os.path.join(run_dir, "ppo_tracker_final")
     model.save(final_path)
-
-    # Also copy the config again as "weights_config_current.py"
-    # (so you have both: snapshot-at-start and current state at end)
     copy_with_hash(cfg_src, os.path.join(run_dir, "weights_config_current.py"))
 
     print(f"[TRAIN] Final model saved: {final_path}")

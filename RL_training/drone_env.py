@@ -1,4 +1,3 @@
-# drone_env.py
 import time
 import numpy as np
 import cv2
@@ -7,100 +6,104 @@ from gymnasium import spaces
 import cosysairsim as airsim
 
 from object_tracker import tracker
+from rewards import RewardManager
 from weights_config import EnvConfig
 
 
 class DroneEnv(gym.Env):
     """
-    ObsDim=34 (fixed, prepared for real drone: LiDAR/GPS/IMU + wind + ground slope)
+    ObsDim=48
 
-    Actions (4): [vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd]
+    A Target / vision (0..7)
+      0 rel_x
+      1 rel_y
+      2 area_m11
+      3 quality_m11 (MATCH=+1, PRED=+0.2, NONE=-1)
+      4 img_vel_x
+      5 img_vel_y
+      6 focus_streak_norm
+      7 match_state (MATCH=+1, PRED=0, NONE=-1)
 
-    OBS layout (34):
-      A Target (6): 0..5
-        0 t_rel_x
-        1 t_rel_y
-        2 t_area_m11
-        3 t_quality_m11 (MATCH=+1, PRED~=+0.2, NONE=-1)
-        4 t_vx_img
-        5 t_vy_img
+    B Self state (8..18)
+      8 vbx
+      9 vby
+      10 vbz
+      11 ax
+      12 ay
+      13 az
+      14 yaw_rate
+      15 roll
+      16 pitch
+      17 yaw_abs
+      18 alt_agl
 
-      B Self state (10): 6..15
-        6  vbx
-        7  vby
-        8  vbz
-        9  ax   (reserved)
-        10 ay   (reserved)
-        11 yaw_rate
-        12 roll
-        13 pitch
-        14 alt_agl
-        15 alt_rate
+    C Obstacle awareness (19..28)
+      19 front
+      20 front_left
+      21 left
+      22 right
+      23 front_right
+      24 down
+      25 up
+      26 min_obstacle
+      27 obstacle_bearing_x
+      28 obstacle_bearing_y
 
-      C LiDAR sectors (6): 16..21
-        16 d_front
-        17 d_front_left
-        18 d_left
-        19 d_right
-        20 d_front_right
-        21 d_down
+    D Range / mission geometry (29..35)
+      29 range_to_target
+      30 range_rate
+      31 desired_range
+      32 range_error
+      33 desired_alt
+      34 alt_error
+      35 bearing_error
 
-      D Range context (2): 22..23
-        22 range_to_target (real or proxy)
-        23 range_rate (real or proxy)
+    E Control history (36..43)
+      36 prev_vx_cmd
+      37 prev_vy_cmd
+      38 prev_vz_cmd
+      39 prev_yaw_cmd
+      40 d_vx_cmd
+      41 d_vy_cmd
+      42 d_vz_cmd
+      43 d_yaw_cmd
 
-      E Intent (4): 24..27
-        24 desired_range
-        25 desired_alt
-        26 mode
-        27 phase_progress
-
-      F Disturbance/Wind estimate (3): 28..30
-        28 disturb_bx
-        29 disturb_by
-        30 disturb_bz
-
-      G Ground plane normal (3): 31..33
-        31 ground_nx
-        32 ground_ny
-        33 ground_nz
-
-    Notes:
-    - Many blocks can be "reserved" (filled with safe defaults) until you enable them.
-    - You manually harden config values in weights_config.py (or swap configs).
+    F Mission / reserve (44..47)
+      44 mode
+      45 phase_progress
+      46 disturb_bx
+      47 disturb_by
     """
+
+    metadata = {"render_modes": []}
 
     def __init__(self, cfg: EnvConfig | None = None):
         super().__init__()
         self.cfg = cfg if cfg is not None else EnvConfig()
 
-        # AirSim
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
 
-        # Tracker
         self.tracker = tracker()
+        self.reward_manager = RewardManager(self.cfg)
 
-        # Spaces
         self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
         self.OBS_DIM = int(self.cfg.obs_dim)
         self.observation_space = spaces.Box(low=-1, high=1, shape=(self.OBS_DIM,), dtype=np.float32)
 
-        # One-time target persistence
         self.target_fingerprint = None
         self.target_class_id = None
         self._target_initialized = False
 
-        # Timing / FPS
         self._fps_ema = 0.0
-
-        # Episode state
         self.episode_id = 0
         self.step_in_episode = 0
 
         self._lost_time = 0.0
         self._focus_streak = 0.0
         self._pred_focus_time = 0.0
+        self._low_alt_time = 0.0
+        self._stuck_time = 0.0
 
         self._ep_return = 0.0
         self._ep_match = 0
@@ -110,23 +113,20 @@ class DroneEnv(gym.Env):
         self._global_max_focus = 0.0
         self._ep_start = time.time()
 
-        # For target img velocity features
         self._prev_rel_x = None
         self._prev_rel_y = None
         self._prev_area01 = None
+        self._prev_range_proxy = None
 
-        # For obstacle debug
         self._last_min_obst = None
-        self._last_sectors = np.zeros(6, dtype=np.float32)
+        self._last_sectors = np.zeros(7, dtype=np.float32)
 
-        # For disturbance estimate (need last commanded v)
         self._last_cmd_vx = 0.0
         self._last_cmd_vy = 0.0
         self._last_cmd_vz = 0.0
+        self._last_action = np.zeros(4, dtype=np.float32)
+        self._prev_action = np.zeros(4, dtype=np.float32)
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
     @staticmethod
     def _clip01(x: float) -> float:
         return float(np.clip(x, 0.0, 1.0))
@@ -148,9 +148,6 @@ class DroneEnv(gym.Env):
     def _deg(rad: float) -> float:
         return float(rad * 180.0 / np.pi)
 
-    # -----------------------------
-    # Frame
-    # -----------------------------
     def _get_frame(self):
         responses = self.client.simGetImages([
             airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
@@ -162,9 +159,6 @@ class DroneEnv(gym.Env):
         frame = img.reshape(responses[0].height, responses[0].width, 3)
         return cv2.resize(frame, (640, 360))
 
-    # -----------------------------
-    # One-time click lock
-    # -----------------------------
     def _click_lock_once(self):
         selected = False
         win = "INITIAL SETUP: Click target (ONE TIME)"
@@ -194,12 +188,9 @@ class DroneEnv(gym.Env):
         if self.cfg.print_reset:
             print("[ENV] Target locked and persisted\n")
 
-    # -----------------------------
-    # Self state block (10)
-    # -----------------------------
     def _get_self_state_features(self):
         if not self.cfg.use_self_state_obs:
-            return (0.0,) * 10
+            return (0.0,) * 11
 
         try:
             ms = self.client.getMultirotorState()
@@ -210,45 +201,48 @@ class DroneEnv(gym.Env):
             vby = self._norm_by_max_to_11(float(v.y_val), self.cfg.vb_max_mps)
             vbz = self._norm_by_max_to_11(float(v.z_val), self.cfg.vb_max_mps)
 
-            axn = 0.0
-            ayn = 0.0
+            axn = ayn = azn = 0.0
             if self.cfg.use_accel_slots:
                 a = k.linear_acceleration
-                axn = self._norm_by_max_to_11(float(a.x_val), 10.0)
-                ayn = self._norm_by_max_to_11(float(a.y_val), 10.0)
+                axn = self._norm_by_max_to_11(float(a.x_val), self.cfg.accel_max_mps2)
+                ayn = self._norm_by_max_to_11(float(a.y_val), self.cfg.accel_max_mps2)
+                azn = self._norm_by_max_to_11(float(a.z_val), self.cfg.accel_max_mps2)
 
-            av = k.angular_velocity  # rad/s
+            av = k.angular_velocity
             yaw_rate_dps = self._deg(float(av.z_val))
             yawrn = self._norm_by_max_to_11(yaw_rate_dps, self.cfg.yaw_rate_max_dps)
 
             q = k.orientation
-            pitch_r, roll_r, _yaw_r = airsim.to_eularian_angles(q)
+            pitch_r, roll_r, yaw_r = airsim.to_eularian_angles(q)
             pitch_deg = self._deg(float(pitch_r))
             roll_deg = self._deg(float(roll_r))
+            yaw_deg = self._deg(float(yaw_r))
 
-            pitchn = self._norm_by_max_to_11(pitch_deg, self.cfg.att_max_deg)
             rolln = self._norm_by_max_to_11(roll_deg, self.cfg.att_max_deg)
+            pitchn = self._norm_by_max_to_11(pitch_deg, self.cfg.att_max_deg)
+            yawn = self._norm_by_max_to_11(yaw_deg, 180.0) if self.cfg.use_abs_yaw_obs else 0.0
 
             pos = k.position
-            alt_m = float(-pos.z_val)  # approx AGL in sim (NED)
+            alt_m = float(-pos.z_val)
             alt_agl_n = self._norm_by_max_to_11(alt_m, self.cfg.alt_max_m)
 
-            alt_rate_mps = float(-v.z_val)
-            alt_rate_n = self._norm_by_max_to_11(alt_rate_mps, self.cfg.alt_rate_max_mps)
-
-            return (vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n)
-
+            return (vbx, vby, vbz, axn, ayn, azn, yawrn, rolln, pitchn, yawn, alt_agl_n)
         except Exception:
-            return (0.0,) * 10
+            return (0.0,) * 11
 
-    # -----------------------------
-    # LiDAR sectors block (6)
-    # -----------------------------
-    def _get_lidar_sectors(self):
+
+    def _get_alt_agl_m(self) -> float | None:
+        try:
+            ms = self.client.getMultirotorState()
+            return float(-ms.kinematics_estimated.position.z_val)
+        except Exception:
+            return None
+
+    def _get_lidar_features(self):
         if not self.cfg.use_lidar_sectors_obs:
             self._last_min_obst = None
             self._last_sectors[:] = 0.0
-            return (0.0,) * 6
+            return (0.0,) * 10
 
         try:
             data = self.client.getDistanceSensorData(self.cfg.distance_sensor_name, vehicle_name=self.cfg.vehicle_name)
@@ -256,55 +250,31 @@ class DroneEnv(gym.Env):
             if not np.isfinite(d) or d <= 0.0:
                 d = 0.0
 
-            self._last_min_obst = d
-
-            dn01 = float(np.clip(d / self.cfg.lidar_max_dist_m, 0.0, 1.0))
+            self._last_min_obst = d if d > 0.0 else None
+            dn01 = float(np.clip((d if d > 0.0 else self.cfg.lidar_max_dist_m) / self.cfg.lidar_max_dist_m, 0.0, 1.0))
             v11 = self._map01_to_11(dn01)
 
-            sectors = (v11, v11, v11, v11, v11, v11)  # replicate (POC)
-            self._last_sectors[:] = np.array(sectors, dtype=np.float32)
-            return sectors
-
+            features = (v11, v11, v11, v11, v11, v11, 1.0, v11, 0.0, 0.0)
+            self._last_sectors[:] = np.array([v11, v11, v11, v11, v11, v11, 1.0], dtype=np.float32)
+            return features
         except Exception:
             self._last_min_obst = None
             self._last_sectors[:] = 0.0
-            return (0.0,) * 6
+            return (0.0,) * 10
 
-    def _obstacle_penalty(self, dt: float) -> float:
-        if (not self.cfg.use_obstacle_penalty) or (self._last_min_obst is None):
-            return 0.0
-        d = float(self._last_min_obst)
-        if d <= 0.0 or d >= self.cfg.obstacle_safe_dist_m:
-            return 0.0
-        return -self.cfg.obstacle_penalty_k * (self.cfg.obstacle_safe_dist_m - d) * dt
-
-    # -----------------------------
-    # Range proxies (block D)
-    # -----------------------------
     def _range_proxy_from_area(self, area01: float) -> float:
         far01 = 1.0 - float(np.clip(area01, 0.0, 1.0))
         return self._map01_to_11(far01)
 
-    def _range_rate_proxy(self, area01: float, dt: float) -> float:
-        if dt <= 1e-6 or self._prev_area01 is None:
+    def _range_rate_proxy(self, range_proxy: float, dt: float) -> float:
+        if dt <= 1e-6 or self._prev_range_proxy is None:
             return 0.0
-        da = (area01 - float(self._prev_area01)) / dt
-        return self._norm_by_max_to_11(da, max_abs=2.0)
+        dr = (float(range_proxy) - float(self._prev_range_proxy)) / dt
+        return self._norm_by_max_to_11(dr, max_abs=2.0)
 
-    # -----------------------------
-    # Disturbance / wind estimate (block F)
-    # -----------------------------
-    def _disturbance_estimate(self):
-        """
-        Returns (disturb_bx, disturb_by, disturb_bz) normalized to [-1,1].
-
-        Practical definition (works for sim and real):
-          disturb ≈ v_measured - v_commanded
-
-        If not enabled -> zeros.
-        """
+    def _disturbance_estimate_2d(self):
         if not self.cfg.use_disturbance_estimate:
-            return (0.0, 0.0, 0.0)
+            return (0.0, 0.0)
 
         try:
             ms = self.client.getMultirotorState()
@@ -312,38 +282,30 @@ class DroneEnv(gym.Env):
 
             dx = float(v.x_val) - float(self._last_cmd_vx)
             dy = float(v.y_val) - float(self._last_cmd_vy)
-            dz = float(v.z_val) - float(self._last_cmd_vz)
 
             return (
                 self._norm_by_max_to_11(dx, self.cfg.disturb_max_mps),
                 self._norm_by_max_to_11(dy, self.cfg.disturb_max_mps),
-                self._norm_by_max_to_11(dz, self.cfg.disturb_max_mps),
             )
         except Exception:
-            return (0.0, 0.0, 0.0)
+            return (0.0, 0.0)
 
-    # -----------------------------
-    # Ground plane normal estimate (block G)
-    # -----------------------------
-    def _ground_normal_estimate(self):
-        """
-        Returns (nx, ny, nz) normalized to [-1,1].
+    @staticmethod
+    def _match_state_feature(is_match: bool, is_pred: bool) -> float:
+        if is_match:
+            return 1.0
+        if is_pred:
+            return 0.0
+        return -1.0
 
-        Default safe value for "flat ground":
-          normal = (0, 0, 1)
+    def _action_history_features(self, action: np.ndarray):
+        prev = self._prev_action.copy()
+        delta = action - prev
+        return (
+            float(prev[0]), float(prev[1]), float(prev[2]), float(prev[3]),
+            float(delta[0]), float(delta[1]), float(delta[2]), float(delta[3]),
+        )
 
-        In real drone:
-          - fit a plane under the drone using LiDAR/depth points
-          - compute its normal in body/world frame
-        """
-        if not self.cfg.use_ground_normal_estimate:
-            return (0.0, 0.0, 1.0)
-
-        # Placeholder: you can replace this with real plane-fitting later.
-        # For now keep "flat".
-        return (0.0, 0.0, 1.0)
-
-    # -----------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.episode_id += 1
@@ -352,6 +314,8 @@ class DroneEnv(gym.Env):
         self._lost_time = 0.0
         self._focus_streak = 0.0
         self._pred_focus_time = 0.0
+        self._low_alt_time = 0.0
+        self._stuck_time = 0.0
 
         self._ep_return = 0.0
         self._ep_match = 0
@@ -363,6 +327,7 @@ class DroneEnv(gym.Env):
         self._prev_rel_x = None
         self._prev_rel_y = None
         self._prev_area01 = None
+        self._prev_range_proxy = None
 
         self._last_min_obst = None
         self._last_sectors[:] = 0.0
@@ -370,6 +335,10 @@ class DroneEnv(gym.Env):
         self._last_cmd_vx = 0.0
         self._last_cmd_vy = 0.0
         self._last_cmd_vz = 0.0
+        self._last_action[:] = 0.0
+        self._prev_action[:] = 0.0
+
+        self.reward_manager.reset_episode()
 
         self.client.reset()
         self.client.enableApiControl(True)
@@ -391,42 +360,28 @@ class DroneEnv(gym.Env):
         obs = np.zeros(self.OBS_DIM, dtype=np.float32)
         return obs, {}
 
-    # -----------------------------
     def step(self, action):
         t0 = time.time()
+        action = np.asarray(action, dtype=np.float32)
 
-        # Scale actions
         vx_cmd = float(action[0]) * self.cfg.vx_scale
         vy_cmd = float(action[1]) * self.cfg.vy_scale
-
-        if self.cfg.freeze_vz:
-            vz_cmd = 0.0
-        else:
-            vz_cmd = float(action[2]) * self.cfg.vz_scale
-
-
+        vz_cmd = 0.0 if self.cfg.freeze_vz else float(action[2]) * self.cfg.vz_scale
         yaw_rate_cmd = float(action[3]) * self.cfg.yaw_rate_scale_dps
 
-        # -----------------------------
-        # YAW COMPENSATION FEED (for tracker PRED correction)
-        # -----------------------------
-        # The tracker has no access to drone controls/ego-motion by itself.
-        # We feed the commanded yaw-rate (deg/sec) each step so it can compensate
-        # predicted BBox drift during PRED mode.
         self.tracker.last_yaw_rate_cmd_dps = float(yaw_rate_cmd)
 
-        # Save command for disturbance estimate
         self._last_cmd_vx = vx_cmd
         self._last_cmd_vy = vy_cmd
         self._last_cmd_vz = vz_cmd
+        self._last_action[:] = action
 
-        # Execute
         self.client.moveByVelocityBodyFrameAsync(
             vx=vx_cmd,
             vy=vy_cmd,
             vz=vz_cmd,
             duration=float(self.cfg.cmd_duration_s),
-            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate_cmd)
+            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate_cmd),
         ).join()
 
         frame = self._get_frame()
@@ -440,103 +395,83 @@ class DroneEnv(gym.Env):
         is_match = (self.tracker.last_mode == "MATCH")
         is_pred = (self.tracker.last_mode == "PRED")
 
-        # energy penalty
-        a = np.array(action, dtype=np.float32)
-        energy_penalty = -float(self.cfg.energy_penalty_k) * float(np.abs(a).sum())
-
-
-        # Optional collision termination
         done = False
         term_reason = ""
+        collision_now = False
+        focus_timeout = False
+        pred_timeout = False
 
         if self.cfg.use_collision_termination:
             try:
                 col = self.client.simGetCollisionInfo()
                 if getattr(col, "has_collided", False):
                     done = True
+                    collision_now = True
                     term_reason = "collision"
             except Exception:
                 pass
 
-        # Build obs (always 34)
         obs = np.zeros(self.OBS_DIM, dtype=np.float32)
 
-        # Fill intent block (E)
-        obs[24] = self._clip11(float(self.cfg.desired_range_norm))
-        obs[25] = self._clip11(float(self.cfg.desired_alt_norm))
-        obs[26] = self._clip11(float(self.cfg.mode_norm))
-        obs[27] = self._clip11(float(self.cfg.phase_progress_norm))
+        vbx, vby, vbz, axn, ayn, azn, yawrn, rolln, pitchn, yawn, alt_agl_n = self._get_self_state_features()
+        obs[8:19] = np.array([vbx, vby, vbz, axn, ayn, azn, yawrn, rolln, pitchn, yawn, alt_agl_n], dtype=np.float32)
+        alt_agl_m = self._get_alt_agl_m()
+        speed_xy_mps = float(np.sqrt((float(vbx) * self.cfg.vb_max_mps) ** 2 + (float(vby) * self.cfg.vb_max_mps) ** 2))
 
-        # Fill self state block (B)
-        vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n = self._get_self_state_features()
-        obs[6:16] = np.array([vbx, vby, vbz, axn, ayn, yawrn, rolln, pitchn, alt_agl_n, alt_rate_n],
-                             dtype=np.float32)
+        lidar_feats = self._get_lidar_features()
+        obs[19:29] = np.array(lidar_feats, dtype=np.float32)
 
-        # Fill lidar sectors block (C)
-        d_front, d_fl, d_left, d_right, d_fr, d_down = self._get_lidar_sectors()
-        obs[16:22] = np.array([d_front, d_fl, d_left, d_right, d_fr, d_down], dtype=np.float32)
+        prev_vx, prev_vy, prev_vz, prev_yaw, dvx, dvy, dvz, dyaw = self._action_history_features(action)
+        obs[36:44] = np.array([prev_vx, prev_vy, prev_vz, prev_yaw, dvx, dvy, dvz, dyaw], dtype=np.float32)
 
-        # Disturbance / wind block (F)
-        dbx, dby, dbz = self._disturbance_estimate()
-        obs[28:31] = np.array([dbx, dby, dbz], dtype=np.float32)
-
-        # Ground normal block (G)
-        nx, ny, nz = self._ground_normal_estimate()
-        obs[31:34] = np.array([self._clip11(nx), self._clip11(ny), self._clip11(nz)], dtype=np.float32)
+        disturb_bx, disturb_by = self._disturbance_estimate_2d()
+        obs[44:48] = np.array([
+            self._clip11(float(self.cfg.mode_norm)),
+            self._clip11(float(self.cfg.phase_progress_norm)),
+            disturb_bx,
+            disturb_by,
+        ], dtype=np.float32)
 
         self.step_in_episode += 1
 
-        # Reward
-        reward = 0.0
-
-        # -----------------------------
-        # Small penalty on vertical motion (Z calmness)
-        # Tal E: The penalty will be  removed / changed on phase #2 (splitting the mission to  land/follow)
-        # -----------------------------
-        reward -= float(self.cfg.w_vz) * abs(vz_cmd) * dt
+        alt_error = float(alt_agl_n - float(self.cfg.desired_alt_norm))
 
         if bbox is None and not done:
             self._ep_none += 1
-            obs[3] = -1.0  # quality NONE
-
-            reward = -float(self.cfg.penalty_no_bbox) + energy_penalty
-
-            # -----------------------------
-            # Fallback shaping when bbox is missing:
-            # reward calm motion instead of chaotic exploration
-            # -----------------------------
-            vx_n = abs(vx_cmd) / max(1e-6, float(self.cfg.vx_scale))
-            vy_n = abs(vy_cmd) / max(1e-6, float(self.cfg.vy_scale))
-            yaw_n = abs(yaw_rate_cmd) / max(1e-6, float(self.cfg.yaw_rate_scale_dps))
-
-            vx_n = float(np.clip(vx_n, 0.0, 1.0))
-            vy_n = float(np.clip(vy_n, 0.0, 1.0))
-            yaw_n = float(np.clip(yaw_n, 0.0, 1.0))
-
-            # 1 when calm, 0 when maxed
-            calm = 1.0 - (0.45 * vx_n + 0.45 * vy_n + 0.10 * yaw_n)
-            calm = float(np.clip(calm, 0.0, 1.0))
-
-            reward += float(self.cfg.w_calm_no_bbox) * calm * dt
-
-            # -----------------------------
-            # -----------------------------
-
-
-            reward += self._obstacle_penalty(dt)
+            obs[3] = -1.0
+            obs[7] = -1.0
+            obs[31] = self._clip11(float(self.cfg.desired_range_norm))
+            obs[33] = self._clip11(float(self.cfg.desired_alt_norm))
+            obs[34] = self._clip11(alt_error)
 
             self._lost_time += dt
             self._focus_streak = 0.0
             self._pred_focus_time = 0.0
 
-            if self._lost_time >= float(self.cfg.focus_fail_sec):
-                reward -= float(self.cfg.penalty_focus_timeout)
+            ground_contact = False
+            self._low_alt_time = 0.0
+
+            if (not done) and self._lost_time >= float(self.cfg.focus_fail_sec):
                 done = True
+                focus_timeout = True
                 term_reason = "focus_timeout"
+
+            reward = self.reward_manager.compute_no_bbox_reward(
+                action=action,
+                dt=dt,
+                vz_cmd=vz_cmd,
+                min_obst_m=self._last_min_obst,
+                focus_timeout=focus_timeout,
+                pred_timeout=False,
+                collision=False,
+                alt_agl_m=alt_agl_m,
+                ground_contact=ground_contact,
+            )
 
         elif not done:
             h, w = frame.shape[:2]
-            cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+            cx = (bbox[0] + bbox[2]) / 2.0
+            cy = (bbox[1] + bbox[3]) / 2.0
 
             rel_x = self._clip11(float((cx - w / 2.0) / (w / 2.0)))
             rel_y = self._clip11(float((cy - h / 2.0) / (h / 2.0)))
@@ -545,19 +480,15 @@ class DroneEnv(gym.Env):
             area01 = self._clip01(area01)
             area_m11 = self._map01_to_11(area01)
 
-            # quality
             if is_match:
                 q = 1.0
                 self._ep_match += 1
-                reward += float(self.cfg.match_warmup_reward)
             elif is_pred:
                 q = 0.2
                 self._ep_pred += 1
-                reward += float(self.cfg.pred_warmup_reward)
             else:
                 q = -1.0
 
-            # img velocity
             if self._prev_rel_x is None or dt <= 1e-6:
                 t_vx_img = 0.0
                 t_vy_img = 0.0
@@ -570,13 +501,9 @@ class DroneEnv(gym.Env):
             self._prev_rel_x = rel_x
             self._prev_rel_y = rel_y
 
-            # Target block (A)
-            obs[0:6] = np.array([rel_x, rel_y, area_m11, self._clip11(q), t_vx_img, t_vy_img], dtype=np.float32)
-
-            # Focus logic
-            dist = float(np.sqrt(rel_x * rel_x + rel_y * rel_y))
-            in_focus_match = (is_match and dist < float(self.cfg.center_ok_dist))
-            in_focus_pred = (is_pred and dist < float(self.cfg.pred_center_ok_dist))
+            center_error = float(np.sqrt(rel_x * rel_x + rel_y * rel_y))
+            in_focus_match = (is_match and center_error < float(self.cfg.center_ok_dist))
+            in_focus_pred = (is_pred and center_error < float(self.cfg.pred_center_ok_dist))
 
             if in_focus_match:
                 self._lost_time = 0.0
@@ -593,94 +520,141 @@ class DroneEnv(gym.Env):
 
             self._ep_max_focus = max(self._ep_max_focus, self._focus_streak)
             self._global_max_focus = max(self._global_max_focus, self._focus_streak)
+            focus_streak_norm = self._clip11(min(1.0, self._focus_streak / max(1e-6, float(self.cfg.focus_fail_sec))))
+            match_state = self._match_state_feature(is_match, is_pred)
 
-            if self._pred_focus_time >= float(self.cfg.pred_focus_max_sec):
-                reward -= float(self.cfg.penalty_pred_focus_timeout)
-                done = True
-                term_reason = "pred_focus_timeout"
-
-            if (not done) and (self._lost_time >= float(self.cfg.focus_fail_sec)):
-                reward -= float(self.cfg.penalty_focus_timeout)
-                done = True
-                term_reason = "focus_timeout"
-
-            # Shaping
-            reward += float(self.cfg.w_center) * float(np.exp(-dist * float(self.cfg.center_decay)))
-            reward += float(self.cfg.w_area) * float(np.sqrt(area01))
-            reward += float(self.cfg.w_focus) * float(min(2.0, self._focus_streak / 4.0))
-
-            # PRED penalty
-            if is_pred:
-                if dist < float(self.cfg.pred_center_ok_dist):
-                    reward -= 0.05 * float(self.cfg.pred_penalty_per_sec) * dt
-                else:
-                    reward -= float(self.cfg.pred_penalty_per_sec) * dt
-
-            # Obstacle penalty
-            reward += self._obstacle_penalty(dt)
-
-            reward += energy_penalty
-
-            # Range block (D)
-            r_to = 0.0
-            r_rate = 0.0
+            range_to_target = 0.0
+            range_rate = 0.0
             if self.cfg.use_real_range_to_target:
-                # reserved: plug your real sensor fusion later
-                r_to = 0.0
-                r_rate = 0.0
+                range_to_target = 0.0
+                range_rate = 0.0
             else:
                 if self.cfg.use_range_proxy_from_area:
-                    r_to = self._range_proxy_from_area(area01)
+                    range_to_target = self._range_proxy_from_area(area01)
                 if self.cfg.use_range_rate_proxy:
-                    r_rate = self._range_rate_proxy(area01, dt)
+                    range_rate = self._range_rate_proxy(range_to_target, dt)
+            range_error = float(range_to_target - float(self.cfg.desired_range_norm))
+            bearing_error = float(rel_x)
 
-            obs[22] = self._clip11(r_to)
-            obs[23] = self._clip11(r_rate)
-
+            self._prev_range_proxy = range_to_target
             self._prev_area01 = area01
 
+            obs[0:8] = np.array([
+                rel_x, rel_y, area_m11, self._clip11(q), t_vx_img, t_vy_img,
+                focus_streak_norm, match_state,
+            ], dtype=np.float32)
+            obs[29:36] = np.array([
+                self._clip11(range_to_target),
+                self._clip11(range_rate),
+                self._clip11(float(self.cfg.desired_range_norm)),
+                self._clip11(range_error),
+                self._clip11(float(self.cfg.desired_alt_norm)),
+                self._clip11(alt_error),
+                self._clip11(bearing_error),
+            ], dtype=np.float32)
+
+            ground_contact = False
+            self._low_alt_time = 0.0
+
+            action_delta_norm = float(np.max(np.abs(action - self._prev_action)))
+            stuck_triggered = False
+            focused_now = bool(in_focus_match or in_focus_pred)
+            if self.cfg.use_stuck_penalty and focused_now and speed_xy_mps < float(self.cfg.stuck_speed_thresh_mps) and action_delta_norm < float(self.cfg.stuck_action_thresh):
+                self._stuck_time += dt
+                stuck_triggered = self._stuck_time >= float(self.cfg.stuck_time_s)
+            else:
+                self._stuck_time = 0.0
+
+            if not done:
+                if self._pred_focus_time >= float(self.cfg.pred_focus_max_sec):
+                    done = True
+                    pred_timeout = True
+                    term_reason = "pred_focus_timeout"
+                elif self._lost_time >= float(self.cfg.focus_fail_sec):
+                    done = True
+                    focus_timeout = True
+                    term_reason = "focus_timeout"
+
+            reward = self.reward_manager.compute_tracking_reward(
+                action=action,
+                dt=dt,
+                vz_cmd=vz_cmd,
+                area01=area01,
+                center_error=center_error,
+                focus_streak=self._focus_streak,
+                is_match=is_match,
+                is_pred=is_pred,
+                range_error=range_error,
+                range_to_target=range_to_target,
+                desired_range=float(self.cfg.desired_range_norm),
+                alt_error=alt_error,
+                alt_agl_m=alt_agl_m,
+                bearing_error=bearing_error,
+                min_obst_m=self._last_min_obst,
+                focus_timeout=focus_timeout,
+                pred_timeout=pred_timeout,
+                collision=False,
+                stuck_triggered=stuck_triggered,
+                ground_contact=ground_contact,
+            )
+
         else:
-            # Collision termination
             obs[:] = 0.0
             obs[3] = -1.0
-            reward = -float(self.cfg.penalty_collision)
+            obs[7] = -1.0
+            reward = self.reward_manager.compute_no_bbox_reward(
+                action=action,
+                dt=dt,
+                vz_cmd=vz_cmd,
+                min_obst_m=self._last_min_obst,
+                focus_timeout=False,
+                pred_timeout=False,
+                collision=True,
+                alt_agl_m=alt_agl_m,
+                ground_contact=False,
+            )
 
         self._ep_return += float(reward)
+        self._prev_action[:] = action
 
-        # HUD
         if self.cfg.show_cv_window:
             self.tracker.draw(frame, fps_show)
-
-            mode_txt = getattr(self.tracker, "last_mode", "?")
-            cv2.putText(frame, f"MODE: {mode_txt}", (20, 90),
+            cv2.putText(frame, f"MODE: {getattr(self.tracker, 'last_mode', '?')}", (20, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             cv2.putText(frame, f"FPS: {fps_show}", (20, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
             cv2.putText(frame, f"EP MAX FOCUS: {self._ep_max_focus:.1f}s", (20, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
             cv2.putText(frame, f"GLOBAL MAX FOCUS: {self._global_max_focus:.1f}s", (20, 180),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-
             if self.cfg.use_lidar_sectors_obs and (self._last_min_obst is not None):
                 cv2.putText(frame, f"MIN OBST: {self._last_min_obst:.2f}m", (20, 210),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-
             cv2.imshow("Tracker Debug", frame)
             cv2.waitKey(1)
 
-        # Episode summary
+        total = max(1, self.step_in_episode)
+        match_pct = 100.0 * self._ep_match / total
+        pred_pct = 100.0 * self._ep_pred / total
+        none_pct = 100.0 * self._ep_none / total
+
         if done and self.cfg.print_ep_summary:
             dur = time.time() - self._ep_start
-            total = max(1, self.step_in_episode)
             print(
                 f"[EP {self.episode_id}] steps={self.step_in_episode} "
                 f"return={self._ep_return:+.2f} "
                 f"max_focus={self._ep_max_focus:.1f}s "
                 f"GLOBAL={self._global_max_focus:.1f}s "
-                f"MATCH={100 * self._ep_match / total:.1f}% "
-                f"PRED={100 * self._ep_pred / total:.1f}% "
-                f"NONE={100 * self._ep_none / total:.1f}% "
+                f"MATCH={match_pct:.1f}% "
+                f"PRED={pred_pct:.1f}% "
+                f"NONE={none_pct:.1f}% "
+                f"R_center={self.reward_manager.stats.center:+.2f} "
+                f"R_obst={self.reward_manager.stats.obstacle:+.2f} "
+                f"R_range={self.reward_manager.stats.range_term:+.2f} "
+                f"R_smooth={self.reward_manager.stats.smooth:+.2f} "
+                f"R_low_alt={self.reward_manager.stats.low_alt:+.2f} "
+                f"R_too_close={self.reward_manager.stats.too_close:+.2f} "
+                f"R_stuck={self.reward_manager.stats.stuck:+.2f} "
                 f"dur={dur:.1f}s reason={term_reason}"
             )
 
@@ -692,6 +666,12 @@ class DroneEnv(gym.Env):
             "lost_time_s": float(self._lost_time),
             "global_max_focus_s": float(self._global_max_focus),
             "min_obstacle_dist_m": None if self._last_min_obst is None else float(self._last_min_obst),
+            "alt_agl_m": None if alt_agl_m is None else float(alt_agl_m),
+            "stuck_time_s": float(self._stuck_time),
+            "match_pct": float(match_pct),
+            "pred_pct": float(pred_pct),
+            "none_pct": float(none_pct),
+            "episode_done": bool(done),
         }
 
         return obs, float(reward), bool(done), False, info

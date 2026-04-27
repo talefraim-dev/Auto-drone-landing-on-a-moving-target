@@ -1,0 +1,49 @@
+index,name,purpose/use,active now?,source now,future HW source
+0,rel_x,Horizontal image error of target for centering and XY correction,Yes,Tracker bbox center in image,Static camera vision pipeline
+1,rel_y,Vertical image error of target for centering and Z/alignment correction,Yes,Tracker bbox center in image,Static camera vision pipeline
+2,area_m11,Target apparent size as distance proxy and follow/landing cue,Yes,Tracker bbox area,Camera vision or fused vision-range estimate
+3,quality_m11,Tracker confidence / lock quality for focus reward and gating,Yes,Tracker state/confidence,Tracker confidence from vision module
+4,img_vel_x,Horizontal image-space motion of target for servoing and anticipation,Yes,Frame-to-frame bbox motion,Vision tracker/detector temporal estimate
+5,img_vel_y,Vertical image-space motion of target for servoing and anticipation,Yes,Frame-to-frame bbox motion,Vision tracker/detector temporal estimate
+6,focus_streak_norm,How long target lock has been maintained for stability learning,Yes,Episode focus streak counter,Same from tracker state machine
+7,match_state,Encoded MATCH/PRED/NONE state for lock mode awareness,Yes,Tracker mode/state,Tracker mode/state
+8,vbx,Drone body-frame X velocity for motion control and smoothing,Yes,AirSim multirotor state,Flight controller state estimate
+9,vby,Drone body-frame Y velocity for motion control and smoothing,Yes,AirSim multirotor state,Flight controller state estimate
+10,vbz,Drone body-frame Z velocity for altitude/descent control,Yes,AirSim multirotor state,Flight controller state estimate
+11,ax,Body-frame X acceleration for smoothness and dynamic awareness,Yes,AirSim kinematics linear acceleration,Flight controller IMU estimate
+12,ay,Body-frame Y acceleration for smoothness and dynamic awareness,Yes,AirSim kinematics linear acceleration,Flight controller IMU estimate
+13,az,Body-frame Z acceleration for vertical smoothness and landing dynamics,Yes,AirSim kinematics linear acceleration,Flight controller IMU estimate
+14,yaw_rate,Angular yaw rate for heading control and oscillation suppression,Yes,AirSim angular velocity,Flight controller gyro estimate
+15,roll,Roll attitude for lateral stability and control awareness,Yes,AirSim orientation,Flight controller attitude estimate
+16,pitch,Pitch attitude for longitudinal stability and control awareness,Yes,AirSim orientation,Flight controller attitude estimate
+17,yaw_abs,Absolute heading for bearing-aware navigation and yaw correction,Yes,AirSim orientation,Compass plus flight-controller fused heading
+18,alt_agl,Altitude above ground for follow height and landing control,Yes,AirSim position/altitude estimate,"LiDAR down, barometer, or FC fused altitude"
+19,obs_front,Obstacle clearance directly ahead for collision avoidance,No,Zero/disabled placeholder,Forward LiDAR or depth sensing
+20,obs_front_left,Front-left obstacle clearance for path shaping around obstacles,No,Zero/disabled placeholder,Directional LiDAR/depth sensing
+21,obs_left,Left-side clearance for side safety and wall avoidance,No,Zero/disabled placeholder,Directional LiDAR/depth sensing
+22,obs_right,Right-side clearance for side safety and wall avoidance,No,Zero/disabled placeholder,Directional LiDAR/depth sensing
+23,obs_front_right,Front-right obstacle clearance for path shaping around obstacles,No,Zero/disabled placeholder,Directional LiDAR/depth sensing
+24,obs_down,Downward clearance for landing safety and ground approach,No,Zero/disabled placeholder,Downward LiDAR/rangefinder
+25,obs_up,Upward clearance for ascent safety and overhead obstacle avoidance,No,Zero/disabled placeholder,Upward LiDAR/depth sensing
+26,min_obstacle,Summary of nearest obstacle severity for strong avoidance behavior,No,Zero/disabled placeholder,Fused minimum from obstacle sensors
+27,obstacle_bearing_x,Horizontal direction of strongest obstacle pressure for steering away,No,Zero/disabled placeholder,Derived from multi-sector obstacle sensing
+28,obstacle_bearing_y,Vertical or lateralized direction of strongest obstacle pressure,No,Zero/disabled placeholder,Derived from multi-sector obstacle sensing
+29,range_to_target,Distance to target for safe following or landing approach,Yes,Vision proxy from bbox area,"Vision-depth fusion, LiDAR, stereo, or GPS-relative estimate"
+30,range_rate,Closing/opening rate to target for progress and overshoot control,Yes,Temporal derivative of range proxy,Derived from fused target range over time
+31,desired_range,Commanded safe follow distance conditioning input,Yes,Config/mission parameter,Mission planner or operator command
+32,range_error,Difference between current target range and desired range,Yes,Computed from range proxy and desired_range,Computed from real fused range and desired_range
+33,desired_alt,Commanded altitude target conditioning input,Yes,Config/mission parameter,Mission planner or operator command
+34,alt_error,Difference between current altitude and desired altitude,Yes,Computed from alt_agl and desired_alt,Computed from fused altitude and desired_alt
+35,bearing_error,Heading error toward target for yaw correction and direct pursuit,Yes,Computed from image/heading proxy,Computed from vision plus compass/GPS-relative target bearing
+36,prev_vx_cmd,Previous X command for smoothness and control memory,Yes,Previous action history,Same from command history buffer
+37,prev_vy_cmd,Previous Y command for smoothness and control memory,Yes,Previous action history,Same from command history buffer
+38,prev_vz_cmd,Previous Z command for smoothness and control memory,Yes,Previous action history,Same from command history buffer
+39,prev_yaw_cmd,Previous yaw command for smoothness and anti-oscillation,Yes,Previous action history,Same from command history buffer
+40,d_vx_cmd,Change in X command for jitter and aggressiveness penalty awareness,Yes,Current minus previous action,Same from command history buffer
+41,d_vy_cmd,Change in Y command for jitter and aggressiveness penalty awareness,Yes,Current minus previous action,Same from command history buffer
+42,d_vz_cmd,Change in Z command for smooth descent/climb behavior,Yes,Current minus previous action,Same from command history buffer
+43,d_yaw_cmd,Change in yaw command for yaw smoothness and oscillation control,Yes,Current minus previous action,Same from command history buffer
+44,mode,Mission conditioning such as follow versus land,Yes,Env mode/config,Mission planner or operator command
+45,phase_progress,Phase conditioning such as early approach versus late approach/touchdown,Yes,Env phase logic,Mission state machine
+46,disturb_bx,Estimated disturbance/wind on body X axis for robust control,No,Zero/disabled placeholder,Wind/disturbance estimator from FC/observer
+47,disturb_by,Estimated disturbance/wind on body Y axis for robust control,No,Zero/disabled placeholder,Wind/disturbance estimator from FC/observer
