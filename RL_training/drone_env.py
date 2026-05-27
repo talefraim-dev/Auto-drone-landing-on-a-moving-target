@@ -152,12 +152,23 @@ class DroneEnv(gym.Env):
         responses = self.client.simGetImages([
             airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
         ])
-        if not responses or not responses[0].image_data_uint8:
-            return np.zeros((360, 640, 3), dtype=np.uint8)
 
-        img = np.frombuffer(responses[0].image_data_uint8, dtype=np.uint8)
-        frame = img.reshape(responses[0].height, responses[0].width, 3)
-        return cv2.resize(frame, (640, 360))
+        if not responses or not responses[0].image_data_uint8:
+            print("[DEBUG] No image received, returning black frame")
+            return np.zeros((540, 960, 3), dtype=np.uint8)
+
+        response = responses[0]
+
+        img = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+        frame = img.reshape(response.height, response.width, 3)
+
+
+        # AirSim usually gives RGB, OpenCV displays BGR.
+        # This also fixes red cars appearing blue.
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+
+        return frame
 
     def _click_lock_once(self):
         selected = False
