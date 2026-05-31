@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, Popup, CircleMarker } from 'react-leaflet'
+import { Config, PixelStreaming } from '@epicgames-ps/lib-pixelstreamingfrontend-ue5.3';
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 
@@ -30,22 +31,41 @@ function App() {
   // add log
   const addLog = (message, type = 'INFO') => {
     const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
-    setLogs(prev => [{ id: Date.now(), time, message, type }, ...prev].slice(0, 50));
+    setLogs(prev => [{ 
+        id: crypto.randomUUID(), 
+        time, 
+        message, 
+        type 
+    }, ...prev].slice(0, 50));
   };
 
   // camera activate
+  // Unreal Engine Pixel Streaming activate
   useEffect(() => {
     addLog("Initializing AeroGuard System...", "SYS");
-    async function setupCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
-        if (videoRef.current) videoRef.current.srcObject = stream;
-        addLog("Camera Feed Connected", "SUCCESS");
-      } catch (err) {
-        addLog("Camera Connection Failed: " + err.message, "ERROR");
+    addLog("Connecting to Unreal Engine Simulator...", "INFO");
+    
+    const config = new Config({
+      initialSettings: {
+        AutoPlayVideo: true,
+        AutoConnect: true,
+        ss: "ws://127.0.0.1:80", 
+        StartVideoMuted: true,
+        HoveringMouse: true,
       }
-    }
-    setupCamera();
+    });
+
+    const stream = new PixelStreaming(config, {
+      videoElementParent: videoRef.current 
+    });
+
+    stream.addEventListener('playStream', () => {
+        addLog("Simulator Feed Connected", "SUCCESS");
+    });
+
+    return () => {
+      if (stream) stream.disconnect();
+    };
   }, []);
 
   // data simulation
@@ -199,8 +219,7 @@ function App() {
       
       {/* 1. Main Video Area */}
       <div className="video-section" onClick={handleVideoClick} style={{cursor: 'crosshair'}}>
-        <video ref={videoRef} autoPlay playsInline muted className="live-feed" />
-        <div className="video-overlay-mesh"></div>
+        <div ref={videoRef} className="live-feed" style={{ width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, zIndex: 0 }}></div>        <div className="video-overlay-mesh"></div>
         
         <div style={{position: 'absolute', top: 20, left: 20, display: 'flex', gap: 20, pointerEvents: 'none'}}>
             <div style={{background: 'rgba(0,0,0,0.6)', padding: '5px 10px', fontSize: 12}}>
@@ -357,5 +376,3 @@ function App() {
     </div>
   )
 }
-
-export default App
