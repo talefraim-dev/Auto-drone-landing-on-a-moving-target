@@ -223,6 +223,5 @@ body {
 .live-feed video {
     width: 100% !important;
     height: 100% !important;
-    object-fit: cover !important; 
-    pointer-events: none; 
+    object-fit: cover !important;
 }
