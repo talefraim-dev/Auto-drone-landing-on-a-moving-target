@@ -1,89 +1,45 @@
-import React, { useRef, useEffect } from 'react';
-import { MapContainer, TileLayer, Popup, CircleMarker } from 'react-leaflet';
-import 'leaflet/dist/leaflet.css';
+import React, { useRef } from 'react';
 import './App.css';
 
 // Hooks
+import { usePixelStreaming } from './hooks/usePixelStreaming';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useDroneLogic } from './hooks/useDroneLogic';
-import { usePixelStreaming } from './hooks/usePixelStreaming';
 
 // Components
 import VideoFeed from './components/VideoFeed';
+import Minimap from './components/Minimap';
 import Footer from './components/Footer';
 
 function App() {
   const videoRef = useRef(null); 
   
-  // Custom Hooks initialization
-  const { telemetry } = useTelemetry();
-  const { mode, target, setTarget, logs, abortConfirm, addLog, handleCommand } = useDroneLogic();
-  const stream = usePixelStreaming(videoRef, addLog);
+  const stream = usePixelStreaming(videoRef, (msg, type) => console.log(msg));
 
-  // Target lock simulation
-  useEffect(() => {
-    const interval = setInterval(() => {
-        setTarget(prev => {
-            if (prev.status !== 'LOCKED') return prev;
-            return {
-                ...prev,
-                x: prev.x + (Math.random() - 0.5) * 3,
-                y: prev.y + (Math.random() - 0.5) * 3
-            };
-        });
-    }, 100);
-    return () => clearInterval(interval);
-  }, [setTarget]);
+  const { telemetry } = useTelemetry(stream);
+  const { mode, target, logs, abortConfirm, addLog, handleCommand, handleTargetLock } = useDroneLogic(stream);
 
-  // Video interaction handler
-  const handleVideoClick = (e) => {
+  const onVideoClick = (e) => {
     if (mode === 'LANDING' || mode === 'EMERGENCY') return;
-
     const rect = e.target.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    setTarget({ x, y, status: 'SEARCHING' });
-    addLog(`Acquiring target...`, "INFO");
-
-    // Optional: Send coordinates back to Unreal Engine
-    if (stream) {
-      stream.emitUIInteraction({ Command: "SetTarget", TargetX: x, TargetY: y });
-    }
-
-    setTimeout(() => {
-        setTarget(prev => ({ ...prev, status: 'LOCKED' }));
-        addLog("Target Locked. Confidence: 98%", "SUCCESS");
-    }, 1000);
+    handleTargetLock(e.clientX - rect.left, e.clientY - rect.top);
   };
 
   return (
     <div className="app-container">
       
-      {/* 1. Main Video Area */}
       <VideoFeed 
         videoRef={videoRef} 
         telemetry={telemetry} 
         mode={mode} 
         target={target} 
-        onVideoClick={handleVideoClick} 
+        onVideoClick={onVideoClick} 
       />
 
-      {/* 2. Right Sidebar */}
       <div className="right-sidebar">
         
-        {/* Map Section */}
-        <div style={{height: '200px', border: '1px solid var(--border)', position: 'relative'}}>
-             <div className="panel-header" style={{position:'absolute', zIndex:400, top:0, left:0, background:'rgba(0,0,0,0.7)', width:'100%'}}>
-                 GPS POSITION
-             </div>
-             <MapContainer center={[32.0853, 34.7818]} zoom={13} zoomControl={false} scrollWheelZoom={true}>
-                <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" />
-                <CircleMarker center={[Number(telemetry.lat), Number(telemetry.lng)]} pathOptions={{ color: 'cyan' }} radius={6}>
-                    <Popup>Drone</Popup>
-                </CircleMarker>
-            </MapContainer>
-        </div>
+        {}
+        <Minimap lat={telemetry.lat} lng={telemetry.lng} />
 
         {/* System Status Section */}
         <div>
@@ -94,13 +50,6 @@ function App() {
                 </div>
                 <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
                     <div style={{width:`${telemetry.bat}%`, height:'100%', background: telemetry.bat > 30 ? 'cyan' : 'red'}}></div>
-                </div>
-
-                <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
-                    <span>LINK QUALITY</span><span style={{color: telemetry.linkQuality > 50 ? '#00ff00' : 'orange'}}>{Math.floor(Number(telemetry.linkQuality))}%</span>
-                </div>
-                <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
-                    <div style={{width:`${telemetry.linkQuality}%`, height:'100%', background: telemetry.linkQuality > 50 ? '#00ff00' : 'orange'}}></div>
                 </div>
 
                 <div style={{display:'flex', gap: 5}}>
@@ -123,17 +72,12 @@ function App() {
             </button>
             <button className="cmd-btn" onClick={() => handleCommand('SYNC')}>⟳ SYNC</button>
             <button className="cmd-btn" onClick={() => handleCommand('RTH')} style={{color:'#ff9800'}}>⟲ RTH</button>
-            <button className={`cmd-btn ${mode === 'HOVER' ? 'active' : ''}`} onClick={() => handleCommand('HOVER')} style={{display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'}}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
-                </svg> HOVER
-            </button>
-            <button className={`cmd-btn ${mode === 'FOLLOW' ? 'active' : ''}`} onClick={() => handleCommand('FOLLOW')}>⊕ FOLLOW</button>
+            <button className={`cmd-btn ${mode === 'HOVER' ? 'active' : ''}`} onClick={() => handleCommand('HOVER')}>HOVER</button>
             <button className="cmd-btn danger" onClick={() => handleCommand('LAND')}>↓ LAND</button>
             <button className={`cmd-btn abort-btn ${abortConfirm ? 'confirm-state' : ''}`} onClick={() => handleCommand('ABORT')}>{abortConfirm ? 'CONFIRM ABORT?' : 'ABORT MISSION'}</button>
         </div>
 
-        {/* Log Stream Section */}
+        {/* Log Stream */}
         <div className="log-stream">
             {logs.length === 0 && <div style={{opacity:0.5}}>No logs yet...</div>}
             {logs.map(log => (
@@ -148,7 +92,6 @@ function App() {
 
       </div>
 
-      {/* 3. Footer */}
       <Footer lat={telemetry.lat} lng={telemetry.lng} mode={mode} />
 
     </div>
