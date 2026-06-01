@@ -6,6 +6,7 @@ from gymnasium import spaces
 import cosysairsim as airsim
 
 from object_tracker import tracker
+from tracking.target_tracker_manager import TargetTrackerManager
 from weights_config import EnvConfig
 
 from observation_builder import (
@@ -43,7 +44,48 @@ class DroneEnv(gym.Env):
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
 
+        # ------------------------------------------------------------------
+        # Moving target car actor.
+        #
+        # IMPORTANT:
+        # This must match the Actor instance name returned by:
+        # client.simListSceneObjects(".*")
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Moving target car actor and fixed start marker.
+        #
+        # IMPORTANT:
+        # train_target_car must match the moving car Actor name returned by:
+        # client.simListSceneObjects(".*")
+        #
+        # car_start_marker must match the empty Actor marker in Unreal.
+        # The marker is used as the fixed reset pose, so the car can return
+        # to the correct start position even if Play was running for a long time
+        # before the Python training process started.
+        # ------------------------------------------------------------------
+        self.train_target_car = "BP_X6M_C_2"
+        self.car_start_marker = "TargetCarStart"
+
+        self.car_start_pose = self.client.simGetObjectPose(self.car_start_marker)
+
+        if (
+            self.car_start_pose is None
+            or not np.isfinite(float(self.car_start_pose.position.x_val))
+            or not np.isfinite(float(self.car_start_pose.position.y_val))
+            or not np.isfinite(float(self.car_start_pose.position.z_val))
+        ):
+            raise RuntimeError(
+                f"[ENV INIT] Failed to read start pose marker: {self.car_start_marker}. "
+                "Make sure the marker Actor exists in Unreal and is visible to simListSceneObjects."
+            )
+
+        print(f"[ENV INIT] target car actor: {self.train_target_car}")
+        print(f"[ENV INIT] target car start marker: {self.car_start_marker}")
+        print("[ENV INIT] target car marker start pose:", self.car_start_pose)
         self.tracker = tracker()
+        self.tracker_manager = self._create_tracker_manager()
+        self._tracking_result = None
+        self._stable_bbox_xyxy = None
 
         self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
         self.OBS_DIM = int(self.cfg.obs_dim)
@@ -82,23 +124,28 @@ class DroneEnv(gym.Env):
 
         self.reward_config = FollowRewardConfig(
             w_center=float(self.cfg.w_center),
+            center_reward_alpha=float(self.cfg.center_reward_alpha),
             w_distance=float(self.cfg.w_distance),
+            desired_distance_proxy=float(self.cfg.desired_distance_proxy),
+            distance_tolerance=float(self.cfg.distance_tolerance),
             w_visibility=float(self.cfg.w_visibility),
             w_lost_target=float(self.cfg.w_lost_target),
             w_altitude_safe=float(self.cfg.w_altitude_safe),
             w_altitude_low_penalty=float(self.cfg.w_altitude_low_penalty),
             w_altitude_high_penalty=float(self.cfg.w_altitude_high_penalty),
-            w_smooth_follow=float(self.cfg.w_smooth_follow),
-            w_control=float(self.cfg.w_control),
-            w_action_delta=float(self.cfg.w_action_delta),
-            w_obstacle=float(self.cfg.w_obstacle),
-            w_safety_intervention=float(self.cfg.w_safety_intervention),
-            desired_distance_proxy=float(self.cfg.desired_distance_proxy),
-            distance_tolerance=float(self.cfg.distance_tolerance),
             min_safe_altitude_m=float(self.cfg.min_safe_altitude_m),
             max_safe_altitude_m=float(self.cfg.max_safe_altitude_m),
+            w_smooth_follow=float(self.cfg.w_smooth_follow),
             max_img_motion=float(self.cfg.max_img_motion),
+            w_control=float(self.cfg.w_control),
+            w_action_delta=float(self.cfg.w_action_delta),
+            w_slow=float(self.cfg.w_slow),
+            w_time=float(self.cfg.w_time),
+            w_obstacle=float(self.cfg.w_obstacle),
+            w_safety_intervention=float(self.cfg.w_safety_intervention),
             collision_penalty=float(self.cfg.penalty_collision),
+            timeout_penalty=float(self.cfg.penalty_timeout),
+            altitude_termination_penalty=float(self.cfg.penalty_altitude_termination),
         )
 
         self.target_fingerprint = None
@@ -126,6 +173,7 @@ class DroneEnv(gym.Env):
         self._last_safe_action = np.zeros(4, dtype=np.float32)
 
         self._safety_interventions = 0
+        self._last_distance_proxy_norm = 1.0
 
     @staticmethod
     def _deg(rad: float) -> float:
@@ -135,6 +183,43 @@ class DroneEnv(gym.Env):
     def _clip(value: float, min_value: float, max_value: float) -> float:
         return max(min_value, min(max_value, float(value)))
 
+    def _reset_target_car_debug(self, settle_sec: float = 0.10) -> None:
+        """
+        Reset the moving target car to the fixed TargetCarStart marker pose.
+        """
+        before_pose = self.client.simGetObjectPose(self.train_target_car)
+
+        ok = self.client.simSetObjectPose(
+            self.train_target_car,
+            self.car_start_pose,
+            teleport=True,
+        )
+
+        time.sleep(float(settle_sec))
+
+        after_pose = self.client.simGetObjectPose(self.train_target_car)
+
+        print(
+            "[CAR RESET DEBUG] "
+            f"ok={ok} "
+            f"name={self.train_target_car} "
+            f"marker={self.car_start_marker} "
+            f"before=({before_pose.position.x_val:.2f}, "
+            f"{before_pose.position.y_val:.2f}, "
+            f"{before_pose.position.z_val:.2f}) "
+            f"target=({self.car_start_pose.position.x_val:.2f}, "
+            f"{self.car_start_pose.position.y_val:.2f}, "
+            f"{self.car_start_pose.position.z_val:.2f}) "
+            f"after=({after_pose.position.x_val:.2f}, "
+            f"{after_pose.position.y_val:.2f}, "
+            f"{after_pose.position.z_val:.2f})"
+        )
+
+        if not ok:
+            raise RuntimeError(
+                f"[CAR RESET DEBUG] simSetObjectPose returned False for actor '{self.train_target_car}'. "
+                "Check the actor name and whether the target actor can be moved by AirSim."
+            )
     def _get_frame(self):
         responses = self.client.simGetImages([
             airsim.ImageRequest("0", airsim.ImageType.Scene, False, False)
@@ -156,7 +241,7 @@ class DroneEnv(gym.Env):
     def _click_lock_once(self):
         selected = False
         win = "INITIAL SETUP: Click target (ONE TIME)"
-        cv2.namedWindow(win)
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
         if self.cfg.print_reset:
             print("\n[ENV] ONE-TIME TARGET SELECTION (click object)\n")
@@ -164,17 +249,35 @@ class DroneEnv(gym.Env):
         def on_click(event, x, y, flags, param):
             nonlocal selected
             if event == cv2.EVENT_LBUTTONDOWN:
+                print(f"[ENV CLICK] received click x={x} y={y}")
                 cid = self.tracker.select_target_and_get_class(param["frame"], x, y)
-                if cid is not None:
+
+                # Do not require class_id to be non-None.
+                # If YOLO misses, object_tracker can still lock a manual fallback bbox
+                # and return cid=None. The real success condition is that a bbox and
+                # fingerprint exist.
+                fp = self.tracker.get_target_fingerprint()
+                bbox = getattr(self.tracker, "last_bbox", None)
+
+                if bbox is not None and fp is not None:
                     self.target_class_id = cid
-                    self.target_fingerprint = self.tracker.get_target_fingerprint()
+                    self.target_fingerprint = fp
                     selected = True
+                    print(f"[ENV CLICK] target selected cid={cid} bbox={bbox}")
+                else:
+                    print("[ENV CLICK] click did not produce a valid target. Try clicking the car body again.")
+
+        # Keep one named window alive and refresh the callback frame.
+        # waitKey(20) gives OpenCV enough time to process mouse events reliably.
+        cv2.resizeWindow(win, int(self.cfg.image_width), int(self.cfg.image_height))
 
         while not selected:
             frame = self._get_frame()
             cv2.setMouseCallback(win, on_click, param={"frame": frame})
             cv2.imshow(win, frame)
-            cv2.waitKey(1)
+            key = cv2.waitKey(20) & 0xFF
+            if key == 27:
+                raise RuntimeError("Target selection cancelled by ESC")
 
         cv2.destroyWindow(win)
         self._target_initialized = True
@@ -182,8 +285,39 @@ class DroneEnv(gym.Env):
         if self.cfg.print_reset:
             print("[ENV] Target locked and persisted\n")
 
-    def _bbox_from_tracker(self, bbox) -> BBox | None:
-        if bbox is None:
+    def _create_tracker_manager(self) -> TargetTrackerManager:
+        """
+        Create the external bbox stabilizer.
+
+        This layer sits after object_tracker.py and before the observation/controller.
+        It does not replace the visual tracker. It only rejects suspicious bbox jumps,
+        predicts short gaps with Kalman, and exposes MATCH/PRED/LOST for the env.
+        """
+        return TargetTrackerManager(
+            min_tracker_confidence=0.45,
+            max_center_jump_pixels=120.0,
+            min_iou_with_prediction=0.05,
+            max_pred_frames=25,
+        )
+
+    @staticmethod
+    def _mode_to_bbox_conf(mode: str) -> float:
+        if mode == "MATCH":
+            return 1.0
+        if mode == "PRED":
+            return 0.2
+        return 0.0
+
+    def _bbox_to_observation(self, bbox, mode: str) -> BBox | None:
+        """
+        Convert an xyxy bbox to the ObservationBuilder BBox format.
+
+        Important:
+            In LOST mode we intentionally return None, even if the stabilizer still
+            has a last stable bbox. This lets lost_target_time increase correctly
+            and prevents the policy from chasing an old guess forever.
+        """
+        if bbox is None or mode == "LOST":
             return None
 
         try:
@@ -192,18 +326,206 @@ class DroneEnv(gym.Env):
             h = max(0.0, y2 - y1)
             cx = x1 + 0.5 * w
             cy = y1 + 0.5 * h
-
-            mode = getattr(self.tracker, "last_mode", "NONE")
-            if mode == "MATCH":
-                conf = 1.0
-            elif mode == "PRED":
-                conf = 0.2
-            else:
-                conf = 0.0
-
+            conf = self._mode_to_bbox_conf(mode)
             return BBox(cx=cx, cy=cy, w=w, h=h, conf=conf)
         except Exception:
             return None
+
+    def _raw_tracker_confidence(self) -> float:
+        """Return a simple confidence proxy from the current visual tracker mode."""
+        raw_mode = getattr(self.tracker, "last_mode", "NONE")
+        return self._mode_to_bbox_conf(raw_mode)
+
+    def _update_stable_tracking(self, bbox_raw, frame, dt: float) -> dict:
+        frame_height, frame_width = frame.shape[:2]
+        tracker_confidence = self._raw_tracker_confidence()
+        raw_tracker_mode = str(getattr(self.tracker, "last_raw_mode", "") or "")
+
+        if bbox_raw is None:
+            if not self.tracker_manager.initialized:
+                result = {
+                    "mode": "LOST",
+                    "stable_bbox": None,
+                    "kalman_pred_bbox": None,
+                    "accepted_tracker": False,
+                    "tracker_confidence": 0.0,
+                    "center_error": None,
+                    "iou_with_prediction": None,
+                    "pred_frames": 0,
+                }
+            else:
+                result = self.tracker_manager.update(
+                    tracker_bbox_xyxy=None,
+                    tracker_confidence=0.0,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    dt=dt,
+                )
+        else:
+            bbox_raw = np.asarray(bbox_raw, dtype=np.float32)
+
+            # ------------------------------------------------------------------
+            # Active reacquisition bridge
+            # ------------------------------------------------------------------
+            # object_tracker.py can now perform ACTIVE_REACQUIRE:
+            #   - full-frame YOLO search
+            #   - class/identity/size/aspect gates
+            #   - strong score threshold
+            #
+            # The old TargetTrackerManager gate is intentionally conservative and
+            # rejects large bbox jumps. That is correct for normal tracking, but
+            # wrong after ACTIVE_REACQUIRE, because a true relock may legitimately
+            # jump far away from the stale predicted bbox.
+            #
+            # Therefore ACTIVE_REACQUIRE is allowed to reset/reinitialize the
+            # stabilizer around the recovered bbox.
+            # ------------------------------------------------------------------
+            if raw_tracker_mode == "ACTIVE_REACQUIRE":
+                self.tracker_manager = self._create_tracker_manager()
+                self.tracker_manager.initialize(bbox_raw)
+
+                result = {
+                    "mode": "MATCH",
+                    "stable_bbox": bbox_raw.copy(),
+                    "kalman_pred_bbox": bbox_raw.copy(),
+                    "accepted_tracker": True,
+                    "tracker_confidence": 1.0,
+                    "center_error": 0.0,
+                    "iou_with_prediction": 1.0,
+                    "pred_frames": 0,
+                    "reacquired": True,
+                }
+
+                self._tracking_result = result
+                self._stable_bbox_xyxy = result.get("stable_bbox")
+
+                if getattr(self.cfg, "print_obstacle_debug", False):
+                    print(f"[STABLE TRACKER RESET] ACTIVE_REACQUIRE bbox={bbox_raw.tolist()}")
+
+                return result
+
+            # ------------------------------------------------------------------
+            # RAW MATCH fast-adopt bridge
+            # ------------------------------------------------------------------
+            # Failure mode observed during training:
+            #   RAW MATCH bbox is visually accurate,
+            #   but the stable layer remains in PRED for too long.
+            #
+            # A RAW MATCH means object_tracker.py found a candidate in the current
+            # frame and passed the tracker gates. If the stable manager is not
+            # already in MATCH, the raw match is allowed to re-anchor it immediately.
+            #
+            # ACTIVE_REACQUIRE still performs a full reset above.
+            # RAW MATCH fast-adopt is slightly softer:
+            #   it resets only when stable state is not already MATCH / has PRED debt.
+            # ------------------------------------------------------------------
+            is_raw_match = raw_tracker_mode.startswith("MATCH_") or raw_tracker_mode == "MATCH"
+            prev_result = getattr(self, "_tracking_result", {}) or {}
+            prev_stable_mode = str(prev_result.get("mode", "") or "")
+            prev_pred_frames = int(prev_result.get("pred_frames", 0) or 0)
+
+            should_fast_adopt_raw_match = bool(
+                is_raw_match
+                and (
+                    not self.tracker_manager.initialized
+                    or prev_stable_mode != "MATCH"
+                    or prev_pred_frames > 0
+                )
+            )
+
+            if should_fast_adopt_raw_match:
+                self.tracker_manager = self._create_tracker_manager()
+                self.tracker_manager.initialize(bbox_raw)
+
+                result = {
+                    "mode": "MATCH",
+                    "stable_bbox": bbox_raw.copy(),
+                    "kalman_pred_bbox": bbox_raw.copy(),
+                    "accepted_tracker": True,
+                    "tracker_confidence": float(max(tracker_confidence, 0.90)),
+                    "center_error": 0.0,
+                    "iou_with_prediction": 1.0,
+                    "pred_frames": 0,
+                    "fast_adopted_raw_match": True,
+                }
+
+                self._tracking_result = result
+                self._stable_bbox_xyxy = result.get("stable_bbox")
+
+                if getattr(self.cfg, "print_obstacle_debug", False):
+                    print(
+                        "[STABLE TRACKER FAST-ADOPT] "
+                        f"raw_mode={raw_tracker_mode} bbox={bbox_raw.tolist()}"
+                    )
+
+                return result
+
+            if not self.tracker_manager.initialized:
+                self.tracker_manager.initialize(bbox_raw)
+                result = {
+                    "mode": "MATCH",
+                    "stable_bbox": bbox_raw.copy(),
+                    "kalman_pred_bbox": bbox_raw.copy(),
+                    "accepted_tracker": True,
+                    "tracker_confidence": float(tracker_confidence),
+                    "center_error": 0.0,
+                    "iou_with_prediction": 1.0,
+                    "pred_frames": 0,
+                }
+            else:
+                result = self.tracker_manager.update(
+                    tracker_bbox_xyxy=bbox_raw,
+                    tracker_confidence=tracker_confidence,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    dt=dt,
+                )
+
+        self._tracking_result = result
+        self._stable_bbox_xyxy = result.get("stable_bbox")
+        return result
+
+
+    @staticmethod
+    def _draw_xyxy_box(frame, bbox, color, label: str):
+        if bbox is None:
+            return
+
+        x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
+
+    def _draw_tracking_overlay(self, frame, bbox_raw, tracking_result: dict | None):
+        """Draw raw tracker bbox, Kalman prediction, and stable bbox."""
+        if tracking_result is None:
+            return
+
+        mode = tracking_result.get("mode", "LOST")
+        accepted = bool(tracking_result.get("accepted_tracker", False))
+        pred_frames = int(tracking_result.get("pred_frames", 0))
+        raw_mode = getattr(self.tracker, "last_mode", "NONE")
+
+        self._draw_xyxy_box(frame, bbox_raw, (0, 0, 255), f"RAW {raw_mode}")
+        self._draw_xyxy_box(frame, tracking_result.get("kalman_pred_bbox"), (255, 0, 0), "KALMAN")
+        self._draw_xyxy_box(frame, tracking_result.get("stable_bbox"), (0, 255, 0), f"STABLE {mode}")
+
+        cv2.putText(
+            frame,
+            f"STABLE_MODE: {mode} | RAW_MODE: {raw_mode} | accepted={accepted} | pred_frames={pred_frames}",
+            (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (0, 255, 255),
+            2,
+        )
 
     def _get_drone_state(self) -> DroneState:
         """
@@ -405,9 +727,17 @@ class DroneEnv(gym.Env):
         self._last_raw_action[:] = 0.0
         self._last_safe_action[:] = 0.0
         self._safety_interventions = 0
+        self._last_distance_proxy_norm = 1.0
+
+        self.tracker_manager = self._create_tracker_manager()
+        self._tracking_result = None
+        self._stable_bbox_xyxy = None
 
         self.obs_builder.reset()
 
+        # ------------------------------------------------------------------
+        # 1. Reset drone / AirSim vehicle.
+        # ------------------------------------------------------------------
         self.client.reset()
         time.sleep(float(self.cfg.reset_settle_sec))
 
@@ -426,18 +756,51 @@ class DroneEnv(gym.Env):
 
         time.sleep(float(self.cfg.reset_settle_sec))
 
+        # ------------------------------------------------------------------
+        # 2. Reset target car AFTER the drone is ready and BEFORE the first
+        # tracker frame. This prints before/target/after so we can verify that
+        # the reset really affected the visible actor.
+        # ------------------------------------------------------------------
+        self._reset_target_car_debug(settle_sec=0.10)
+
+        # ------------------------------------------------------------------
+        # 3. Get a fresh frame after the car reset.
+        # ------------------------------------------------------------------
         frame = self._get_frame()
 
+        # ------------------------------------------------------------------
+        # 4. One-time manual target selection.
+        #
+        # The click window internally displays fresh frames until selection.
+        # After it closes, get a new frame again so tracker startup uses the
+        # current scene state.
+        # ------------------------------------------------------------------
         if not self._target_initialized or self.target_fingerprint is None:
             self._click_lock_once()
+            frame = self._get_frame()
 
+        # ------------------------------------------------------------------
+        # 5. Restore target identity and auto-lock on current frame.
+        # ------------------------------------------------------------------
         self.tracker.set_target_fingerprint(self.target_fingerprint)
         self.tracker.set_target_class(self.target_class_id)
         self.tracker.auto_lock_on_fingerprint(frame, use_class_gate=True)
 
-        # Build a real initial observation instead of returning zeros.
+        # ------------------------------------------------------------------
+        # 6. Build a real initial observation instead of returning zeros.
+        # ------------------------------------------------------------------
         bbox_raw = self.tracker.update(frame)
-        bbox = self._bbox_from_tracker(bbox_raw)
+
+        tracking_result = self._update_stable_tracking(
+            bbox_raw=bbox_raw,
+            frame=frame,
+            dt=float(self.cfg.cmd_duration_s),
+        )
+
+        bbox = self._bbox_to_observation(
+            tracking_result.get("stable_bbox"),
+            tracking_result.get("mode", "LOST"),
+        )
 
         drone_state = self._get_drone_state()
         obstacle_dict = self._get_obstacle_state_m(altitude_m=drone_state.altitude_m)
@@ -457,6 +820,8 @@ class DroneEnv(gym.Env):
             obstacle_state=obstacle_state,
             dt=float(self.cfg.cmd_duration_s),
         )
+
+        self._last_distance_proxy_norm = float(obs_dict.get("distance_proxy_norm", 1.0))
 
         if self.cfg.print_reset:
             print(f"[RESET] Episode {self.episode_id}")
@@ -500,7 +865,57 @@ class DroneEnv(gym.Env):
 
         vx_cmd = float(safe_action[0]) * self.cfg.vx_scale
         vy_cmd = float(safe_action[1]) * self.cfg.vy_scale
-        vz_cmd = 0.0 if self.cfg.freeze_vz else float(safe_action[2]) * self.cfg.vz_scale
+
+        # AirSim NED:
+        #   vz > 0 means down
+        #   vz < 0 means up
+        #
+        # Important:
+        # freeze_vz no longer means "send vz=0", because SimpleFlight may still
+        # drift down over time. Instead, freeze_vz enables a small altitude-hold
+        # controller around a configurable target altitude.
+        if bool(self.cfg.freeze_vz):
+            if bool(self.cfg.altitude_hold_enabled):
+                target_alt_m = float(self.cfg.altitude_hold_target_m)
+                alt_error_m = float(pre_drone_state.altitude_m) - target_alt_m
+                vz_cmd = float(np.clip(
+                    float(self.cfg.altitude_hold_kp) * alt_error_m,
+                    -float(self.cfg.altitude_hold_max_vz_mps),
+                    float(self.cfg.altitude_hold_max_vz_mps),
+                ))
+            else:
+                vz_cmd = 0.0
+        else:
+            vz_cmd = float(safe_action[2]) * self.cfg.vz_scale
+
+        # Dynamic minimum-distance-to-target guard.
+        # distance_proxy_norm is lower when the target is closer/larger.
+        # If too close, do not allow more forward movement.
+        if (
+            bool(self.cfg.block_forward_when_too_close)
+            and float(self._last_distance_proxy_norm) < float(self.cfg.min_target_distance_proxy)
+            and vx_cmd > 0.0
+        ):
+            vx_cmd = 0.0
+            safety_info.setdefault("safety_reasons", []).append("target_too_close_block_forward")
+            safety_info["safety_intervention"] = True
+
+        # Dynamic altitude lower-bound safety clamp.
+        if bool(self.cfg.altitude_safety_enabled):
+            alt_m = float(pre_drone_state.altitude_m)
+
+            if alt_m <= float(self.cfg.min_termination_altitude_m):
+                # Emergency climb.
+                vz_cmd = min(vz_cmd, -abs(float(self.cfg.emergency_climb_vz_mps)))
+                safety_info.setdefault("safety_reasons", []).append("altitude_emergency_force_up")
+                safety_info["safety_intervention"] = True
+
+            elif alt_m < float(self.cfg.min_safe_altitude_m):
+                # Below soft floor: block descent and force gentle climb.
+                vz_cmd = min(vz_cmd, -abs(float(self.cfg.low_altitude_climb_vz_mps)))
+                safety_info.setdefault("safety_reasons", []).append("altitude_low_force_up")
+                safety_info["safety_intervention"] = True
+
         yaw_rate_cmd = float(safe_action[3]) * self.cfg.yaw_rate_scale_dps
 
         self.tracker.last_yaw_rate_cmd_dps = float(yaw_rate_cmd)
@@ -525,8 +940,15 @@ class DroneEnv(gym.Env):
         self._fps_ema = fps if self._fps_ema == 0 else 0.9 * self._fps_ema + 0.1 * fps
         fps_show = int(self._fps_ema)
 
-        is_match = (getattr(self.tracker, "last_mode", "NONE") == "MATCH")
-        is_pred = (getattr(self.tracker, "last_mode", "NONE") == "PRED")
+        tracking_result = self._update_stable_tracking(
+            bbox_raw=bbox_raw,
+            frame=frame,
+            dt=dt,
+        )
+        tracking_mode = tracking_result.get("mode", "LOST")
+
+        is_match = tracking_mode == "MATCH"
+        is_pred = tracking_mode == "PRED"
 
         if is_match:
             self._ep_match += 1
@@ -543,7 +965,10 @@ class DroneEnv(gym.Env):
         self._ep_max_focus = max(self._ep_max_focus, self._focus_streak)
         self._global_max_focus = max(self._global_max_focus, self._focus_streak)
 
-        bbox = self._bbox_from_tracker(bbox_raw)
+        bbox = self._bbox_to_observation(
+            tracking_result.get("stable_bbox"),
+            tracking_mode,
+        )
         drone_state = self._get_drone_state()
         obstacle_dict = self._get_obstacle_state_m(altitude_m=drone_state.altitude_m)
 
@@ -563,27 +988,54 @@ class DroneEnv(gym.Env):
             dt=dt,
         )
 
+        self._last_distance_proxy_norm = float(obs_dict.get("distance_proxy_norm", self._last_distance_proxy_norm))
+
         collision_now = False
+        collision_raw = False
+        collision_object_name = ""
+        collision_penetration_depth = 0.0
+
         if self.cfg.use_collision_termination:
             try:
                 col = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
-                collision_now = bool(getattr(col, "has_collided", False))
+
+                collision_raw = bool(getattr(col, "has_collided", False))
+                collision_object_name = str(getattr(col, "object_name", "") or "")
+                collision_penetration_depth = float(getattr(col, "penetration_depth", 0.0) or 0.0)
+
+                # In small custom training levels AirSim can briefly report a startup/floor
+                # collision-like state around spawn/reset even when the drone is visibly
+                # airborne. This should not end the episode at step 0.
+                #
+                # Use an existing config field if present, otherwise default to 20 steps.
+                ignore_collision_steps = int(
+                    getattr(
+                        self.cfg,
+                        "ignore_collision_termination_first_steps",
+                        getattr(self.cfg, "ignore_obstacle_termination_first_steps", 20),
+                    )
+                )
+
+                object_lower = collision_object_name.lower()
+                is_floor_startup_noise = (
+                    self.step_in_episode <= ignore_collision_steps
+                    and ("floor" in object_lower or "ground" in object_lower or "plane" in object_lower)
+                    and collision_penetration_depth <= 0.10
+                )
+
+                collision_now = bool(collision_raw and not is_floor_startup_noise)
+
+                if collision_raw and is_floor_startup_noise and getattr(self.cfg, "print_obstacle_debug", False):
+                    print(
+                        "[COLLISION IGNORED] startup/floor noise "
+                        f"step={self.step_in_episode} "
+                        f"object={collision_object_name} "
+                        f"depth={collision_penetration_depth:.3f}"
+                    )
+
             except Exception:
                 collision_now = False
-
-        env_reward_info = {
-            "altitude_m": float(drone_state.altitude_m),
-            "collision_detected": bool(collision_now),
-            "safety_intervention": bool(safety_info.get("safety_intervention", False)),
-        }
-
-        reward, reward_parts = compute_follow_reward(
-            obs=obs_dict,
-            action=safe_action,
-            prev_action=self._prev_action,
-            env_info=env_reward_info,
-            config=self.reward_config,
-        )
+                collision_raw = False
 
         done = False
         term_reason = ""
@@ -621,6 +1073,21 @@ class DroneEnv(gym.Env):
             done = True
             term_reason = "episode_timeout"
 
+        env_reward_info = {
+            "altitude_m": float(drone_state.altitude_m),
+            "collision_detected": bool(collision_now),
+            "safety_intervention": bool(safety_info.get("safety_intervention", False)),
+            "termination_reason": term_reason,
+        }
+
+        reward, reward_parts = compute_follow_reward(
+            obs=obs_dict,
+            action=safe_action,
+            prev_action=self._prev_action,
+            env_info=env_reward_info,
+            config=self.reward_config,
+        )
+
         self._ep_return += float(reward)
         self._prev_action[:] = safe_action
         self.step_in_episode += 1
@@ -646,7 +1113,7 @@ class DroneEnv(gym.Env):
             )
 
         if self.cfg.show_cv_window:
-            self.tracker.draw(frame, fps_show)
+            self._draw_tracking_overlay(frame, bbox_raw, tracking_result)
 
             safety_active = bool(safety_info.get("safety_intervention", False))
             safety_reasons = safety_info.get("safety_reasons", [])
@@ -666,7 +1133,7 @@ class DroneEnv(gym.Env):
                 safety_state = "CLEAR"
                 safety_color = (0, 255, 0)
 
-            cv2.putText(frame, f"MODE: {getattr(self.tracker, 'last_mode', '?')}", (20, 90),
+            cv2.putText(frame, f"MODE: {tracking_mode}", (20, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             cv2.putText(frame, f"FPS: {fps_show}", (20, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -720,6 +1187,18 @@ class DroneEnv(gym.Env):
             "safe_action": safe_action.copy(),
             "reward_parts": reward_parts,
             "obs_dict": obs_dict,
+            "tracking_mode": tracking_mode,
+            "raw_tracker_mode": getattr(self.tracker, "last_mode", "NONE"),
+            "tracker_reject_reason": getattr(self.tracker, "last_reject_reason", ""),
+            "tracker_reject_frames": int(getattr(self.tracker, "_reject_frames", 0)),
+            "tracker_identity_metrics": dict(getattr(self.tracker, "last_identity_metrics", {}) or {}),
+            "tracking_accepted": bool(tracking_result.get("accepted_tracker", False)),
+            "tracking_pred_frames": int(tracking_result.get("pred_frames", 0)),
+            "stable_bbox_xyxy": None if tracking_result.get("stable_bbox") is None else np.asarray(tracking_result.get("stable_bbox"), dtype=np.float32).copy(),
+            "raw_bbox_xyxy": None if bbox_raw is None else np.asarray(bbox_raw, dtype=np.float32).copy(),
+            "collision_raw": bool(collision_raw),
+            "collision_object_name": collision_object_name,
+            "collision_penetration_depth": float(collision_penetration_depth),
             "episode_done": bool(done),
         }
 

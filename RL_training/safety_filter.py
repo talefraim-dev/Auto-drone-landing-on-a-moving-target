@@ -1,12 +1,18 @@
 """
-Safety filter for UAV RL actions — v37.
+Safety filter for UAV RL actions — final v37.
 
-Pipeline:
-    obs -> RL policy -> raw_action -> safety_filter -> safe_action -> AirSim
+Action convention inside the environment:
+    raw_action = [vx, vy, vz, yaw_rate] normalized to [-1, 1]
 
-Important design decision:
-- min_obstacle_dist_m is horizontal only.
-- down_dist_m is used only for vertical descent safety.
+AirSim NED convention after scaling:
+    vx > 0  => forward
+    vy > 0  => right
+    vz > 0  => down
+    vz < 0  => up
+
+This filter works at normalized-action level and uses the same sign convention:
+    action[2] > 0 means descend/down
+    action[2] < 0 means climb/up
 """
 
 from __future__ import annotations
@@ -24,7 +30,10 @@ class SafetyConfig:
 
     min_speed_scale_near_obstacle: float = 0.2
     steer_strength: float = 0.35
-    emergency_up_cmd: float = 0.2
+
+    # Positive magnitude. The filter applies it as negative vz action to climb.
+    emergency_up_cmd: float = 0.8
+
     enabled: bool = True
 
 
@@ -60,14 +69,16 @@ def safety_filter(
     back = float(obstacle_state.get("back_dist_m", cfg.safe_distance_m))
     down = float(obstacle_state.get("down_dist_m", cfg.safe_distance_m))
 
-    # Horizontal min only. Do NOT include down here.
-    min_dist = float(obstacle_state.get(
-        "min_obstacle_dist_m",
-        min(front, front_left, front_right, left, right, back),
-    ))
+    min_dist = float(
+        obstacle_state.get(
+            "min_obstacle_dist_m",
+            min(front, front_left, front_right, left, right, back),
+        )
+    )
 
     reasons = []
 
+    # Global XY slow-down near horizontal obstacles.
     speed_scale = _clip(
         min_dist / cfg.safe_distance_m,
         cfg.min_speed_scale_near_obstacle,
@@ -81,10 +92,10 @@ def safety_filter(
     if abs(vx_cmd - old_vx) > 1e-6 or abs(vy_cmd - old_vy) > 1e-6:
         reasons.append("speed_scaled_near_horizontal_obstacle")
 
+    # Direction-specific blocking.
     if front < cfg.warning_distance_m and vx_cmd > 0:
         vx_cmd *= _distance_block_scale(front, cfg)
         reasons.append("front_obstacle_warning")
-
     if front < cfg.emergency_distance_m and vx_cmd > 0:
         vx_cmd = 0.0
         reasons.append("front_obstacle_emergency")
@@ -92,7 +103,6 @@ def safety_filter(
     if back < cfg.warning_distance_m and vx_cmd < 0:
         vx_cmd *= _distance_block_scale(back, cfg)
         reasons.append("back_obstacle_warning")
-
     if back < cfg.emergency_distance_m and vx_cmd < 0:
         vx_cmd = 0.0
         reasons.append("back_obstacle_emergency")
@@ -100,7 +110,6 @@ def safety_filter(
     if left < cfg.warning_distance_m and vy_cmd < 0:
         vy_cmd *= _distance_block_scale(left, cfg)
         reasons.append("left_obstacle_warning")
-
     if left < cfg.emergency_distance_m and vy_cmd < 0:
         vy_cmd = 0.0
         reasons.append("left_obstacle_emergency")
@@ -108,11 +117,11 @@ def safety_filter(
     if right < cfg.warning_distance_m and vy_cmd > 0:
         vy_cmd *= _distance_block_scale(right, cfg)
         reasons.append("right_obstacle_warning")
-
     if right < cfg.emergency_distance_m and vy_cmd > 0:
         vy_cmd = 0.0
         reasons.append("right_obstacle_emergency")
 
+    # Basic steer around front obstacle.
     if front < cfg.warning_distance_m:
         if left > right and left > cfg.warning_distance_m:
             vy_cmd -= cfg.steer_strength
@@ -121,14 +130,14 @@ def safety_filter(
             vy_cmd += cfg.steer_strength
             reasons.append("steer_right_around_front_obstacle")
 
-    # Vertical / ground safety.
-    # vz_cmd < 0 means descend.
-    if down < cfg.warning_distance_m and vz_cmd < 0:
+    # Ground / down sensor safety.
+    # Positive vz means down/descent. Negative vz means up/climb.
+    if down < cfg.warning_distance_m and vz_cmd > 0:
         vz_cmd *= _distance_block_scale(down, cfg)
-        reasons.append("down_obstacle_warning")
+        reasons.append("down_obstacle_warning_block_descent")
 
     if down < cfg.emergency_distance_m:
-        vz_cmd = max(vz_cmd, cfg.emergency_up_cmd)
+        vz_cmd = min(vz_cmd, -abs(cfg.emergency_up_cmd))
         reasons.append("down_obstacle_emergency_force_up")
 
     safe_action = np.asarray([vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd], dtype=np.float32)
@@ -153,7 +162,6 @@ def safety_filter(
 def compute_collision_risk(min_obstacle_dist_m: float, safe_distance_m: float) -> float:
     if safe_distance_m <= 0:
         raise ValueError("safe_distance_m must be positive.")
-
     risk = 1.0 - min(max(min_obstacle_dist_m, 0.0) / safe_distance_m, 1.0)
     return _clip(risk, 0.0, 1.0)
 
