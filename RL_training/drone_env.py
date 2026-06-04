@@ -63,8 +63,8 @@ class DroneEnv(gym.Env):
         # to the correct start position even if Play was running for a long time
         # before the Python training process started.
         # ------------------------------------------------------------------
-        self.train_target_car = "BP_X6M_C_2"
-        self.car_start_marker = "TargetCarStart"
+        self.train_target_car = "BP_X6M_C_1"
+        self.car_start_marker = "Actor_1"
 
         self.car_start_pose = self.client.simGetObjectPose(self.car_start_marker)
 
@@ -337,12 +337,83 @@ class DroneEnv(gym.Env):
         return self._mode_to_bbox_conf(raw_mode)
 
     def _update_stable_tracking(self, bbox_raw, frame, dt: float) -> dict:
+        """
+        RAW-first tracking bridge for YOLO+ResNet.
+
+        Policy decision:
+            - When YOLO+ResNet reports RAW MATCH, the RL observation/reward uses
+              the raw visual bbox directly.
+            - Kalman / TargetTrackerManager is NOT allowed to smooth, lag, or
+              replace a valid YOLO+ResNet MATCH.
+            - Kalman is used only as a fallback when the visual tracker is not in
+              MATCH, for example temporary occlusion, low confidence, or no bbox.
+
+        This keeps the PPO model listening to the strongest sensor path:
+            YOLO detections + ResNet identity matching.
+        """
         frame_height, frame_width = frame.shape[:2]
         tracker_confidence = self._raw_tracker_confidence()
         raw_tracker_mode = str(getattr(self.tracker, "last_raw_mode", "") or "")
+        raw_simple_mode = str(getattr(self.tracker, "last_mode", "NONE") or "NONE")
 
-        if bbox_raw is None:
-            if not self.tracker_manager.initialized:
+        # ResNet adapter uses raw modes like:
+        #   MATCH_YOLO_RESNET score=...
+        #   PRED_LOW_SCORE_YOLO_RESNET score=...
+        # Legacy trackers may use exactly MATCH/PRED/NONE.
+        is_raw_match = bool(
+            raw_simple_mode == "MATCH"
+            or raw_tracker_mode == "MATCH"
+            or raw_tracker_mode.startswith("MATCH_")
+            or raw_tracker_mode.startswith("CLICK_SELECT_YOLO_RESNET")
+            or raw_tracker_mode.startswith("INIT_YOLO_RESNET")
+        )
+
+        # ------------------------------------------------------------------
+        # Strong path: YOLO+ResNet MATCH is trusted directly.
+        # ------------------------------------------------------------------
+        if bbox_raw is not None and is_raw_match:
+            bbox_raw = np.asarray(bbox_raw, dtype=np.float32)
+
+            # Clamp only for safety. Do not smooth, do not Kalman-update.
+            x1, y1, x2, y2 = bbox_raw[:4]
+            x1 = float(np.clip(x1, 0, frame_width - 1))
+            y1 = float(np.clip(y1, 0, frame_height - 1))
+            x2 = float(np.clip(x2, x1 + 1, frame_width))
+            y2 = float(np.clip(y2, y1 + 1, frame_height))
+            trusted_bbox = np.asarray([x1, y1, x2, y2], dtype=np.float32)
+
+            # Store last trusted visual measurement for lazy Kalman fallback init.
+            self._last_trusted_raw_bbox_xyxy = trusted_bbox.copy()
+            self._kalman_fallback_active = False
+
+            result = {
+                "mode": "MATCH",
+                "stable_bbox": trusted_bbox.copy(),       # What RL sees.
+                "kalman_pred_bbox": None,                 # No Kalman during RAW MATCH.
+                "accepted_tracker": True,
+                "tracker_confidence": float(max(tracker_confidence, 1.0)),
+                "center_error": 0.0,
+                "iou_with_prediction": 1.0,
+                "pred_frames": 0,
+                "raw_direct_yolo_resnet": True,
+                "kalman_used": False,
+            }
+
+            self._tracking_result = result
+            self._stable_bbox_xyxy = result.get("stable_bbox")
+            return result
+
+        # ------------------------------------------------------------------
+        # Fallback path: visual tracker is not trusted now.
+        # Use Kalman only here.
+        # ------------------------------------------------------------------
+        last_trusted = getattr(self, "_last_trusted_raw_bbox_xyxy", None)
+
+        if not self.tracker_manager.initialized:
+            if last_trusted is not None:
+                self.tracker_manager.initialize(np.asarray(last_trusted, dtype=np.float32))
+                self._kalman_fallback_active = True
+            else:
                 result = {
                     "mode": "LOST",
                     "stable_bbox": None,
@@ -352,134 +423,26 @@ class DroneEnv(gym.Env):
                     "center_error": None,
                     "iou_with_prediction": None,
                     "pred_frames": 0,
+                    "raw_direct_yolo_resnet": False,
+                    "kalman_used": False,
                 }
-            else:
-                result = self.tracker_manager.update(
-                    tracker_bbox_xyxy=None,
-                    tracker_confidence=0.0,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
-                    dt=dt,
-                )
-        else:
-            bbox_raw = np.asarray(bbox_raw, dtype=np.float32)
-
-            # ------------------------------------------------------------------
-            # Active reacquisition bridge
-            # ------------------------------------------------------------------
-            # object_tracker.py can now perform ACTIVE_REACQUIRE:
-            #   - full-frame YOLO search
-            #   - class/identity/size/aspect gates
-            #   - strong score threshold
-            #
-            # The old TargetTrackerManager gate is intentionally conservative and
-            # rejects large bbox jumps. That is correct for normal tracking, but
-            # wrong after ACTIVE_REACQUIRE, because a true relock may legitimately
-            # jump far away from the stale predicted bbox.
-            #
-            # Therefore ACTIVE_REACQUIRE is allowed to reset/reinitialize the
-            # stabilizer around the recovered bbox.
-            # ------------------------------------------------------------------
-            if raw_tracker_mode == "ACTIVE_REACQUIRE":
-                self.tracker_manager = self._create_tracker_manager()
-                self.tracker_manager.initialize(bbox_raw)
-
-                result = {
-                    "mode": "MATCH",
-                    "stable_bbox": bbox_raw.copy(),
-                    "kalman_pred_bbox": bbox_raw.copy(),
-                    "accepted_tracker": True,
-                    "tracker_confidence": 1.0,
-                    "center_error": 0.0,
-                    "iou_with_prediction": 1.0,
-                    "pred_frames": 0,
-                    "reacquired": True,
-                }
-
                 self._tracking_result = result
-                self._stable_bbox_xyxy = result.get("stable_bbox")
-
-                if getattr(self.cfg, "print_obstacle_debug", False):
-                    print(f"[STABLE TRACKER RESET] ACTIVE_REACQUIRE bbox={bbox_raw.tolist()}")
-
+                self._stable_bbox_xyxy = None
                 return result
 
-            # ------------------------------------------------------------------
-            # RAW MATCH fast-adopt bridge
-            # ------------------------------------------------------------------
-            # Failure mode observed during training:
-            #   RAW MATCH bbox is visually accurate,
-            #   but the stable layer remains in PRED for too long.
-            #
-            # A RAW MATCH means object_tracker.py found a candidate in the current
-            # frame and passed the tracker gates. If the stable manager is not
-            # already in MATCH, the raw match is allowed to re-anchor it immediately.
-            #
-            # ACTIVE_REACQUIRE still performs a full reset above.
-            # RAW MATCH fast-adopt is slightly softer:
-            #   it resets only when stable state is not already MATCH / has PRED debt.
-            # ------------------------------------------------------------------
-            is_raw_match = raw_tracker_mode.startswith("MATCH_") or raw_tracker_mode == "MATCH"
-            prev_result = getattr(self, "_tracking_result", {}) or {}
-            prev_stable_mode = str(prev_result.get("mode", "") or "")
-            prev_pred_frames = int(prev_result.get("pred_frames", 0) or 0)
-
-            should_fast_adopt_raw_match = bool(
-                is_raw_match
-                and (
-                    not self.tracker_manager.initialized
-                    or prev_stable_mode != "MATCH"
-                    or prev_pred_frames > 0
-                )
-            )
-
-            if should_fast_adopt_raw_match:
-                self.tracker_manager = self._create_tracker_manager()
-                self.tracker_manager.initialize(bbox_raw)
-
-                result = {
-                    "mode": "MATCH",
-                    "stable_bbox": bbox_raw.copy(),
-                    "kalman_pred_bbox": bbox_raw.copy(),
-                    "accepted_tracker": True,
-                    "tracker_confidence": float(max(tracker_confidence, 0.90)),
-                    "center_error": 0.0,
-                    "iou_with_prediction": 1.0,
-                    "pred_frames": 0,
-                    "fast_adopted_raw_match": True,
-                }
-
-                self._tracking_result = result
-                self._stable_bbox_xyxy = result.get("stable_bbox")
-
-                if getattr(self.cfg, "print_obstacle_debug", False):
-                    print(
-                        "[STABLE TRACKER FAST-ADOPT] "
-                        f"raw_mode={raw_tracker_mode} bbox={bbox_raw.tolist()}"
-                    )
-
-                return result
-
-            if not self.tracker_manager.initialized:
-                self.tracker_manager.initialize(bbox_raw)
-                result = {
-                    "mode": "MATCH",
-                    "stable_bbox": bbox_raw.copy(),
-                    "kalman_pred_bbox": bbox_raw.copy(),
-                    "accepted_tracker": True,
-                    "tracker_confidence": float(tracker_confidence),
-                    "center_error": 0.0,
-                    "iou_with_prediction": 1.0,
-                    "pred_frames": 0,
-                }
-            else:
-                result = self.tracker_manager.update(
-                    tracker_bbox_xyxy=bbox_raw,
-                    tracker_confidence=tracker_confidence,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
-                    dt=dt,
-                )
+        # During fallback, do not feed weak RAW/PRED bbox as a measurement.
+        # Let Kalman predict for a short gap. If YOLO+ResNet returns MATCH again,
+        # the top branch will immediately take over and expose raw bbox directly.
+        result = self.tracker_manager.update(
+            tracker_bbox_xyxy=None,
+            tracker_confidence=0.0,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            dt=dt,
+        )
+        result["raw_direct_yolo_resnet"] = False
+        result["kalman_used"] = True
+        result["raw_tracker_mode_at_fallback"] = raw_tracker_mode or raw_simple_mode
 
         self._tracking_result = result
         self._stable_bbox_xyxy = result.get("stable_bbox")
@@ -835,6 +798,30 @@ class DroneEnv(gym.Env):
         raw_action = np.asarray(action, dtype=np.float32)
         raw_action = np.clip(raw_action, -1.0, 1.0)
 
+        # ------------------------------------------------------------------
+        # Gentle startup yaw guard
+        # ------------------------------------------------------------------
+        # Do NOT reset/freeze the visual tracker here.
+        # We only prevent a large random PPO yaw sample during the very first
+        # startup steps of a new episode.
+        #
+        # Important:
+        #   - forward/side/vz are NOT clamped here.
+        #   - the tracker keeps its bbox/fingerprint/runtime continuity.
+        #   - the policy can still move and reacquire.
+        startup_yaw_guard_steps = int(getattr(self.cfg, "startup_yaw_guard_steps", 12))
+        startup_max_yaw_action = float(getattr(self.cfg, "startup_max_yaw_action", 0.12))
+
+        if self.step_in_episode < startup_yaw_guard_steps:
+            raw_action[3] = np.clip(raw_action[3], -startup_max_yaw_action, startup_max_yaw_action)
+
+            if getattr(self.cfg, "print_reset", False) and self.step_in_episode == 0:
+                print(
+                    "[STARTUP YAW GUARD] "
+                    f"steps={startup_yaw_guard_steps} "
+                    f"max_yaw_action={startup_max_yaw_action}"
+                )
+
         # Read current state before applying the command.
         pre_drone_state = self._get_drone_state()
         obstacle_dict_pre = self._get_obstacle_state_m(altitude_m=pre_drone_state.altitude_m)
@@ -1087,6 +1074,44 @@ class DroneEnv(gym.Env):
             env_info=env_reward_info,
             config=self.reward_config,
         )
+
+        # ------------------------------------------------------------------
+        # Hard failure rule for target_lost_too_long
+        # ------------------------------------------------------------------
+        # Tracking-agent rule:
+        #   Losing the target for too long must NEVER be profitable.
+        #
+        # Problem observed:
+        #   The agent can accumulate positive reward from good tracking, then
+        #   lose the target and still finish the episode with a positive return.
+        #   That teaches the wrong behavior: "tracking well for a while and then
+        #   losing target is acceptable."
+        #
+        # Desired behavior:
+        #   If target_lost_too_long happens:
+        #       - if accumulated episode return is positive, cancel it to zero
+        #       - then apply a large hard-fail penalty
+        #       - if already negative, still apply the large penalty
+        #
+        # This is implemented in the Env because only the Env knows the running
+        # episode return. The reward function only knows the current step.
+        # ------------------------------------------------------------------
+        if term_reason == "target_lost_too_long":
+            hard_fail_penalty = float(getattr(self.cfg, "target_lost_hard_fail_penalty", 12000.0))
+            projected_return = float(self._ep_return + reward)
+
+            if projected_return > 0.0:
+                # Make final episode return exactly -hard_fail_penalty.
+                reward = float(-self._ep_return - hard_fail_penalty)
+                hard_fail_cancelled_positive_return = projected_return
+            else:
+                # Already bad, but target loss should still be strongly punished.
+                reward = float(reward - hard_fail_penalty)
+                hard_fail_cancelled_positive_return = 0.0
+
+            reward_parts["target_lost_hard_fail_penalty"] = float(-hard_fail_penalty)
+            reward_parts["target_lost_cancelled_positive_return"] = float(-hard_fail_cancelled_positive_return)
+            reward_parts["total_reward_after_hard_fail"] = float(reward)
 
         self._ep_return += float(reward)
         self._prev_action[:] = safe_action
