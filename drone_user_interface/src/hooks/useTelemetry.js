@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react';
 
 const translateUnrealToLat = (unrealX) => {
-  const unrealMin = -100000, unrealMax = 100000;
-  const latMin = 32.0800, latMax = 32.0900;
+  const unrealMin = -120000, unrealMax = 120000;
+  const latMin = 32.0000, latMax = 32.0800;
   return latMin + ((unrealX - unrealMin) * (latMax - latMin)) / (unrealMax - unrealMin);
 };
 
 const translateUnrealToLng = (unrealY) => {
-  const unrealMin = -100000, unrealMax = 100000;
-  const lngMin = 34.7700, lngMax = 34.7900;
+  const unrealMin = -120000, unrealMax = 120000;
+  const lngMin = 34.7000, lngMax = 34.81635;
   return lngMin + ((unrealY - unrealMin) * (lngMax - lngMin)) / (unrealMax - unrealMin);
 };
 

@@ -114,8 +114,10 @@ class TrainingMetricsCallback(BaseCallback):
         info = infos[0]
         obs_dict = info.get("obs_dict", {}) or {}
 
-        ex = float(obs_dict.get("bbox_error_x_norm", obs_dict.get("center_error_x_norm", 0.0)))
-        ey = float(obs_dict.get("bbox_error_y_norm", obs_dict.get("center_error_y_norm", 0.0)))
+        # The current ObservationBuilder exposes err_x / err_y.
+        # Older keys are kept as fallback for backward compatibility.
+        ex = float(obs_dict.get("err_x", obs_dict.get("bbox_error_x_norm", obs_dict.get("center_error_x_norm", 0.0))))
+        ey = float(obs_dict.get("err_y", obs_dict.get("bbox_error_y_norm", obs_dict.get("center_error_y_norm", 0.0))))
         en = float((ex * ex + ey * ey) ** 0.5)
 
         ex = max(-1.0, min(1.0, ex))
@@ -146,6 +148,10 @@ class TrainingMetricsCallback(BaseCallback):
         self.logger.record("custom/pred_pct", float(info.get("pred_pct", 0.0)))
         self.logger.record("custom/none_pct", float(info.get("none_pct", 0.0)))
         self.logger.record("custom/safety_intervention", float(bool(info.get("safety_intervention", False))))
+        self.logger.record("custom/lidar_valid", float(bool(info.get("lidar_valid", False))))
+        self.logger.record("custom/lidar_point_count", float(info.get("lidar_point_count", 0)))
+        self.logger.record("custom/min_obstacle_dist_m", float(info.get("min_obstacle_dist_m", 0.0)))
+        self.logger.record("custom/down_dist_m", float(info.get("down_dist_m", 0.0)))
 
         return True
 
@@ -181,6 +187,21 @@ def apply_task_config_to_env_config(cfg: EnvConfig, task) -> EnvConfig:
 
     cfg.max_episode_steps = task.max_episode_steps
     cfg.focus_fail_sec = task.focus_fail_sec
+
+    for optional_name in (
+        "non_match_timeout_sec",
+        "approach_warmup_sec",
+        "not_approaching_timeout_sec",
+        "approach_target_distance_proxy",
+        "approach_min_improvement",
+        "approach_goal_distance_m",
+        "approach_min_improvement_m",
+        "not_approaching_penalty_growth_per_sec",
+        "max_initial_yaw_delta_deg",
+        "target_lost_hard_fail_penalty",
+    ):
+        if hasattr(task, optional_name):
+            setattr(cfg, optional_name, getattr(task, optional_name))
 
     cfg.w_center = task.w_center
     cfg.w_distance = task.w_distance
