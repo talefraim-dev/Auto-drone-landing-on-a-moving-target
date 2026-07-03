@@ -284,6 +284,16 @@ class DroneEnv(gym.Env):
         self._prev_action = np.zeros(4, dtype=np.float32)
         self._last_raw_action = np.zeros(4, dtype=np.float32)
         self._last_safe_action = np.zeros(4, dtype=np.float32)
+        self._prev_pitch_rad_for_smooth = 0.0
+        self._last_pitch_deg = 0.0
+        self._last_pitch_rate_dps = 0.0
+        self._last_pitch_smoothness_penalty = 0.0
+        self._prev_vx_cmd_for_slew = 0.0
+        self._prev_vy_cmd_for_slew = 0.0
+        self._last_vx_slew_delta = 0.0
+        self._last_vx_slew_limited = False
+        self._last_vy_slew_delta = 0.0
+        self._last_vy_slew_limited = False
 
         self._safety_interventions = 0
         self._focused_yaw_hard_events = 0
@@ -3209,6 +3219,45 @@ class DroneEnv(gym.Env):
         vx_cmd = float(safe_action[0]) * speed_vx_scale
         vy_cmd = float(safe_action[1]) * speed_vy_scale
 
+        # Smooth forward/lateral command changes to reduce visible attitude rocking.
+        # Pitch rocking is mainly driven by abrupt vx acceleration/deceleration.
+        stage_for_slew = str(getattr(self, "_speed_stage", "CHASE_FAST"))
+        self._last_vx_slew_delta = 0.0
+        self._last_vx_slew_limited = False
+        self._last_vy_slew_delta = 0.0
+        self._last_vy_slew_limited = False
+
+        if bool(getattr(self.cfg, "vx_slew_limit_enabled", True)):
+            if stage_for_slew == "BOTTOM_LANDING_READY":
+                max_dvx = float(getattr(self.cfg, "landing_ready_max_vx_delta_mps_per_step", 0.25))
+            elif stage_for_slew == "BOTTOM_VELOCITY_MATCH":
+                max_dvx = float(getattr(self.cfg, "bottom_match_max_vx_delta_mps_per_step", 0.45))
+            else:
+                max_dvx = float(getattr(self.cfg, "chase_max_vx_delta_mps_per_step", 0.90))
+
+            prev_vx_cmd = float(getattr(self, "_prev_vx_cmd_for_slew", 0.0))
+            raw_vx_cmd = float(vx_cmd)
+            vx_cmd = float(np.clip(raw_vx_cmd, prev_vx_cmd - max_dvx, prev_vx_cmd + max_dvx))
+            self._last_vx_slew_delta = float(vx_cmd - raw_vx_cmd)
+            self._last_vx_slew_limited = bool(abs(self._last_vx_slew_delta) > 1e-6)
+
+        if bool(getattr(self.cfg, "vy_slew_limit_enabled", False)):
+            if stage_for_slew == "BOTTOM_LANDING_READY":
+                max_dvy = float(getattr(self.cfg, "landing_ready_max_vy_delta_mps_per_step", 0.30))
+            elif stage_for_slew == "BOTTOM_VELOCITY_MATCH":
+                max_dvy = float(getattr(self.cfg, "bottom_match_max_vy_delta_mps_per_step", 0.50))
+            else:
+                max_dvy = float(getattr(self.cfg, "chase_max_vy_delta_mps_per_step", 0.90))
+
+            prev_vy_cmd = float(getattr(self, "_prev_vy_cmd_for_slew", 0.0))
+            raw_vy_cmd = float(vy_cmd)
+            vy_cmd = float(np.clip(raw_vy_cmd, prev_vy_cmd - max_dvy, prev_vy_cmd + max_dvy))
+            self._last_vy_slew_delta = float(vy_cmd - raw_vy_cmd)
+            self._last_vy_slew_limited = bool(abs(self._last_vy_slew_delta) > 1e-6)
+
+        self._prev_vx_cmd_for_slew = float(vx_cmd)
+        self._prev_vy_cmd_for_slew = float(vy_cmd)
+
         # AirSim NED:
         #   vz > 0 means down
         #   vz < 0 means up
@@ -4078,6 +4127,60 @@ class DroneEnv(gym.Env):
             reward_parts["focused_yaw_hard_suppressed_bottom"] = float(1.0)
 
         # ------------------------------------------------------------------
+        # Pitch / attitude smoothness shaping
+        # ------------------------------------------------------------------
+        # Visual professionalism objective:
+        # Penalize large forward/backward pitch and, more importantly, rapid
+        # pitch changes. CHASE_FAST is allowed more pitch than bottom/landing
+        # stages; BOTTOM_LANDING_READY is the strictest.
+        self._last_pitch_smoothness_penalty = 0.0
+        if bool(getattr(self.cfg, "pitch_smoothness_enabled", True)) and not takeoff_phase_now:
+            pitch_rad_now = float(getattr(drone_state, "pitch_rad", 0.0))
+            prev_pitch_rad = float(getattr(self, "_prev_pitch_rad_for_smooth", pitch_rad_now))
+            dt_pitch = max(1e-3, float(dt))
+
+            pitch_deg = float(np.degrees(pitch_rad_now))
+            pitch_rate_dps = float(np.degrees((pitch_rad_now - prev_pitch_rad) / dt_pitch))
+
+            stage_pitch = str(getattr(self, "_speed_stage", "CHASE_FAST"))
+            if stage_pitch == "BOTTOM_LANDING_READY":
+                pitch_ref_deg = float(getattr(self.cfg, "pitch_ref_landing_deg", 4.5))
+                pitch_rate_ref_dps = float(getattr(self.cfg, "pitch_rate_ref_landing_dps", 16.0))
+                w_pitch_abs = float(getattr(self.cfg, "w_pitch_abs_landing", 4.8))
+                w_pitch_rate = float(getattr(self.cfg, "w_pitch_rate_landing", 5.0))
+            elif stage_pitch == "BOTTOM_VELOCITY_MATCH":
+                pitch_ref_deg = float(getattr(self.cfg, "pitch_ref_bottom_deg", 8.0))
+                pitch_rate_ref_dps = float(getattr(self.cfg, "pitch_rate_ref_bottom_dps", 28.0))
+                w_pitch_abs = float(getattr(self.cfg, "w_pitch_abs_bottom", 2.2))
+                w_pitch_rate = float(getattr(self.cfg, "w_pitch_rate_bottom", 2.5))
+            else:
+                pitch_ref_deg = float(getattr(self.cfg, "pitch_ref_chase_deg", 14.0))
+                pitch_rate_ref_dps = float(getattr(self.cfg, "pitch_rate_ref_chase_dps", 45.0))
+                w_pitch_abs = float(getattr(self.cfg, "w_pitch_abs_chase", 0.8))
+                w_pitch_rate = float(getattr(self.cfg, "w_pitch_rate_chase", 0.5))
+
+            pitch_abs_norm = abs(pitch_deg) / max(1e-6, pitch_ref_deg)
+            pitch_rate_norm = abs(pitch_rate_dps) / max(1e-6, pitch_rate_ref_dps)
+
+            pitch_abs_penalty = -w_pitch_abs * min(4.0, pitch_abs_norm ** 1.35)
+            pitch_rate_penalty = -w_pitch_rate * min(4.0, pitch_rate_norm ** 1.25)
+            pitch_smoothness_penalty = float(pitch_abs_penalty + pitch_rate_penalty)
+
+            reward += pitch_smoothness_penalty
+            self._last_pitch_smoothness_penalty = pitch_smoothness_penalty
+            self._last_pitch_deg = float(pitch_deg)
+            self._last_pitch_rate_dps = float(pitch_rate_dps)
+            self._prev_pitch_rad_for_smooth = float(pitch_rad_now)
+
+            reward_parts["pitch_abs_penalty"] = float(pitch_abs_penalty)
+            reward_parts["pitch_rate_penalty"] = float(pitch_rate_penalty)
+            reward_parts["pitch_smoothness_penalty"] = float(pitch_smoothness_penalty)
+            reward_parts["pitch_deg"] = float(pitch_deg)
+            reward_parts["pitch_rate_dps"] = float(pitch_rate_dps)
+            reward_parts["pitch_stage_ref_deg"] = float(pitch_ref_deg)
+            reward_parts["pitch_stage_rate_ref_dps"] = float(pitch_rate_ref_dps)
+
+        # ------------------------------------------------------------------
         # Hard failure rule for target_lost_too_long
         # ------------------------------------------------------------------
         # Tracking-agent rule:
@@ -4272,6 +4375,11 @@ class DroneEnv(gym.Env):
                 f"R_Bprog={reward_parts.get('bottom_y_progress_reward', 0.0):+.2f} "
                 f"R_Bvx={reward_parts.get('bottom_correct_vx_bonus', 0.0) + reward_parts.get('bottom_wrong_vx_penalty', 0.0):+.2f} "
                 f"R_Bready={reward_parts.get('bottom_center_ready_bonus', 0.0):+.2f} "
+                f"Pitch={float(getattr(self, '_last_pitch_deg', 0.0)):+.1f} "
+                f"PitchRate={float(getattr(self, '_last_pitch_rate_dps', 0.0)):+.1f} "
+                f"R_pitch={float(getattr(self, '_last_pitch_smoothness_penalty', 0.0)):+.2f} "
+                f"VxSlew={int(bool(getattr(self, '_last_vx_slew_limited', False)))} "
+                f"dVxSlew={float(getattr(self, '_last_vx_slew_delta', 0.0)):+.2f} "
                 f"R_yawFocus={reward_parts.get('focused_centered_yaw_penalty', 0.0):+.2f} "
                 f"R_yawExp={reward_parts.get('exp_focused_centered_yaw_penalty', 0.0):+.2f} "
                 f"R_decenter={reward_parts.get('yaw_decenter_exp_penalty', 0.0):+.2f} "
@@ -4443,6 +4551,11 @@ class DroneEnv(gym.Env):
             "raw_action": raw_action.copy(),
             "safe_action": safe_action.copy(),
             "reward_parts": reward_parts,
+            "pitch_deg": float(getattr(self, "_last_pitch_deg", 0.0)),
+            "pitch_rate_dps": float(getattr(self, "_last_pitch_rate_dps", 0.0)),
+            "pitch_smoothness_penalty": float(getattr(self, "_last_pitch_smoothness_penalty", 0.0)),
+            "vx_slew_limited": bool(getattr(self, "_last_vx_slew_limited", False)),
+            "vx_slew_delta": float(getattr(self, "_last_vx_slew_delta", 0.0)),
             "fine_position_error_inf": float(reward_parts.get("fine_position_error_inf", 0.0)),
             "fine_position_reward_total": float(
                 reward_parts.get("fine_position_bonus", 0.0)

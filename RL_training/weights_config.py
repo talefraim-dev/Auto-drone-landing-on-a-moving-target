@@ -97,6 +97,37 @@ class EnvConfig:
     bottom_landing_ready_vx_scale: float = 1.2
     bottom_landing_ready_vy_scale: float = 1.0
 
+    # Pitch / attitude smoothness:
+    # This improves visual professionalism by discouraging forward/backward
+    # rocking. CHASE_FAST is allowed to pitch more; bottom and landing-ready
+    # stages are progressively stricter.
+    pitch_smoothness_enabled: bool = True
+    pitch_log_enabled: bool = True
+    pitch_ref_chase_deg: float = 14.0
+    pitch_ref_bottom_deg: float = 8.0
+    pitch_ref_landing_deg: float = 4.5
+    pitch_rate_ref_chase_dps: float = 45.0
+    pitch_rate_ref_bottom_dps: float = 28.0
+    pitch_rate_ref_landing_dps: float = 16.0
+    w_pitch_abs_chase: float = 0.8
+    w_pitch_abs_bottom: float = 2.2
+    w_pitch_abs_landing: float = 4.8
+    w_pitch_rate_chase: float = 0.5
+    w_pitch_rate_bottom: float = 2.5
+    w_pitch_rate_landing: float = 5.0
+
+    # Command slew limiter:
+    # Reduces visible pitch rocking immediately by limiting abrupt forward-speed
+    # command changes. This is a control smoothness layer, not a hard speed cap.
+    vx_slew_limit_enabled: bool = True
+    chase_max_vx_delta_mps_per_step: float = 0.90
+    bottom_match_max_vx_delta_mps_per_step: float = 0.45
+    landing_ready_max_vx_delta_mps_per_step: float = 0.25
+    vy_slew_limit_enabled: bool = False
+    chase_max_vy_delta_mps_per_step: float = 0.90
+    bottom_match_max_vy_delta_mps_per_step: float = 0.50
+    landing_ready_max_vy_delta_mps_per_step: float = 0.30
+
     bottom_velocity_match_enter_area: float = 0.036
     bottom_velocity_match_release_area: float = 0.022
     bottom_velocity_match_release_center_error: float = 0.68
