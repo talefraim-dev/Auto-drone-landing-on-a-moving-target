@@ -1,0 +1,1453 @@
+"""Independent Agent-2 landing environment.
+
+This module intentionally does not subclass or mutate ``DroneEnv``. Agent 1
+keeps its original configuration, initialized reward objects, safety objects,
+tracker memory and control pipeline. Agent 2 owns a separate control loop that
+uses:
+
+* bottom camera only;
+* immutable user-selected visual identity;
+* horizontal LiDAR sectors only;
+* AirSim API Z for all vertical state;
+* AirSim collision API as the touchdown signal;
+* a collision-gated landing reward bank.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import time
+from typing import Any, Optional
+
+import cv2
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import torch
+import torch.nn.functional as F
+import cosysairsim as airsim
+
+from lidar_processor import LidarProcessor, LidarProcessorConfig, point_cloud_to_array
+from observation_builder import (
+    BBox,
+    DroneState,
+    ObstacleState,
+    ObservationBuilder,
+    ObservationBuilderConfig,
+)
+from resnet_yolo_tracker import YoloResNetTracker
+
+
+@dataclass
+class Agent2Config:
+    vehicle_name: str = "Drone1"
+    bottom_camera_name: str = "bottom_center"
+    lidar_sensor_name: str = "LidarSensor1"
+    image_width: int = 960
+    image_height: int = 720
+
+    cmd_duration_s: float = 0.10
+    vx_scale_mps: float = 1.20
+    vy_scale_mps: float = 1.20
+    vz_scale_mps: float = 0.65
+    yaw_scale_dps: float = 25.0
+    max_episode_steps: int = 900
+
+    # YOLO class is used only during the first click so a bbox can be obtained.
+    # After that, the selected instance is internally named ``user_target`` and
+    # every YOLO candidate is judged only by ResNet visual similarity.
+    strict_class_gate: bool = False
+    yolo_proposal_conf: float = 0.05
+    # ResNet remains the identity judge. These gates only decide whether a
+    # visual match is reliable enough to be treated as a LIVE control input.
+    min_match_similarity: float = 0.60
+    min_match_margin: float = 0.03
+    high_conf_reacquire_similarity: float = 0.78
+    max_reacquire_center_jump_norm: float = 0.35
+    match_confirmation_steps: int = 3
+    max_prediction_steps: int = 20
+    show_camera: bool = True
+
+    # Vertical state machine. AirSim NED uses positive vz for DOWN.
+    # Agent 2 is a landing-only controller: policy commands may request hover
+    # or descent, but never climb. Descent is additionally blocked unless the
+    # target is detected in the current frame, confirmed over consecutive
+    # frames and sufficiently aligned.
+    descent_min_live_match_streak: int = 3
+    descent_min_similarity: float = 0.65
+
+    # Horizontal visual-servo controller. PPO does not directly command the
+    # full XY velocity anymore; it learns only a small residual around a
+    # deterministic bottom-camera PD controller.
+    horizontal_pd_kp_y_to_vx: float = 1.10
+    horizontal_pd_kd_y_to_vx: float = 0.16
+    horizontal_pd_kp_x_to_vy: float = 0.82
+    horizontal_pd_kd_x_to_vy: float = 0.12
+    horizontal_pd_max_action: float = 0.90
+    horizontal_ppo_residual_max_action: float = 0.12
+    horizontal_deadband_error: float = 0.025
+    horizontal_deadband_velocity: float = 0.08
+    horizontal_velocity_ema_alpha: float = 0.35
+    horizontal_velocity_clip_per_s: float = 4.0
+
+    # Speed shrinks near touchdown. The final limit also considers bbox area,
+    # so a wrong actor-Z estimate cannot make close-range commands aggressive.
+    horizontal_speed_far_mps: float = 0.90
+    horizontal_speed_mid_mps: float = 0.60
+    horizontal_speed_near_mps: float = 0.35
+    horizontal_speed_touchdown_mps: float = 0.20
+
+    # Alignment hysteresis: enter DESCEND only after several strongly aligned
+    # frames, and immediately return to RECENTER when the looser exit limits
+    # are exceeded.
+    alignment_enter_center_error: float = 0.20
+    alignment_enter_bbox_rel_error: float = 0.35
+    alignment_exit_center_error: float = 0.32
+    alignment_exit_bbox_rel_error: float = 0.58
+    alignment_streak_required: int = 5
+
+    lidar_max_range_m: float = 20.0
+    obstacle_emergency_m: float = 0.55
+    obstacle_warning_m: float = 1.20
+
+    good_collision_center_error: float = 0.45
+    good_collision_bbox_rel_error: float = 0.75
+    good_collision_recent_match_steps: int = 4
+    success_base_reward: float = 2500.0
+    success_min_reward: float = 800.0
+    success_max_reward: float = 6000.0
+    wrong_collision_penalty: float = 1500.0
+
+    target_lost_limit_steps: int = 120
+    static_target_actor_name: str = ""
+    static_target_surface_altitude_m: float = 0.0
+
+
+class Agent2LandingEnv(gym.Env):
+    """Bottom-camera landing controller used by AGENT_2 and AGENT_1P2."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, cfg: Agent2Config | None = None):
+        super().__init__()
+        self.cfg = cfg or Agent2Config()
+
+        self.action_space = spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
+        self.observation_space = spaces.Box(-1.0, 1.0, shape=(37,), dtype=np.float32)
+
+        self.client = airsim.MultirotorClient()
+        self.client.confirmConnection()
+
+        self.observation_builder = ObservationBuilder(
+            ObservationBuilderConfig(
+                image_width=self.cfg.image_width,
+                image_height=self.cfg.image_height,
+                max_altitude_m=30.0,
+                max_drone_speed_mps=8.0,
+                max_vertical_speed_mps=5.0,
+                max_obstacle_range_m=self.cfg.lidar_max_range_m,
+                safe_obstacle_distance_m=5.0,
+                max_lost_target_time_s=3.0,
+            )
+        )
+        self.lidar_processor = LidarProcessor(
+            LidarProcessorConfig(max_range_m=self.cfg.lidar_max_range_m)
+        )
+        self.tracker = YoloResNetTracker(
+            yolo_model_path="yolo11s.pt",
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            target_classes=None,
+            yolo_conf=float(self.cfg.yolo_proposal_conf),
+            click_pad=20,
+            min_match_score=0.45,
+            appearance_weight=1.0,
+            motion_weight=0.0,
+            search_window_scale=4.0,
+            use_search_window=False,
+            ema_alpha=1.0,
+            verbose=False,
+        )
+
+        self._original_embedding: Optional[torch.Tensor] = None
+        self._bottom_anchor_embedding: Optional[torch.Tensor] = None
+        self._reference_embeddings: list[torch.Tensor] = []
+        self._target_id = "user_target"
+        self._target_class_id: Optional[int] = None
+        self._last_bbox_xyxy: Optional[np.ndarray] = None
+        self._last_similarity = 0.0
+        self._last_candidate_class_id: Optional[int] = None
+        self._last_candidate_confidence = 0.0
+        self._last_candidate_count = 0
+        self._last_candidate_scores: list[dict[str, float | int]] = []
+        self._prediction_steps = 0
+        self._last_match_step = -999999
+        self._live_match_streak = 0
+        self._last_match_margin = 0.0
+        self._last_spatial_jump_norm = 0.0
+        self._last_match_reject_reason = ""
+
+        self._standalone_initial_pose = None
+        self._attached_from_agent1 = False
+        self._target_actor_name = str(self.cfg.static_target_actor_name or "")
+        # Keep target and drone in the same raw AirSim NED-Z coordinate
+        # system. Height above target is target_z_ned - drone_z_ned.
+        self._target_surface_z_ned = -float(self.cfg.static_target_surface_altitude_m)
+        self._target_surface_altitude_m = float(self.cfg.static_target_surface_altitude_m)
+        self._target_surface_source = "configured_static"
+
+        self._step = 0
+        self._reward_bank = 0.0
+        self._episode_return = 0.0
+        self._prev_action = np.zeros(4, dtype=np.float32)
+        self._prev_relative_height_m: Optional[float] = None
+        self._lost_steps = 0
+        self._collision_timestamp_at_reset = 0
+        self._last_info: dict[str, Any] = {}
+        self._last_vertical_control_state = "HOLD_INIT"
+        self._last_descent_block_reason = "waiting_for_first_control_step"
+        self._last_raw_vz_action = 0.0
+        self._last_requested_vz_mps = 0.0
+        self._last_applied_vz_mps = 0.0
+        self._last_climb_command_blocked = False
+
+        self._last_observation_monotonic: Optional[float] = None
+        self._last_control_had_live_match = False
+        self._last_control_err_x = 0.0
+        self._last_control_err_y = 0.0
+        self._control_img_vel_x = 0.0
+        self._control_img_vel_y = 0.0
+        self._alignment_ready_streak = 0
+        self._descent_alignment_latched = False
+        self._last_horizontal_control_state = "HOLD_INIT"
+        self._last_pd_action_vx = 0.0
+        self._last_pd_action_vy = 0.0
+        self._last_residual_action_vx = 0.0
+        self._last_residual_action_vy = 0.0
+        self._last_horizontal_action_vx = 0.0
+        self._last_horizontal_action_vy = 0.0
+        self._last_horizontal_speed_limit_mps = 0.0
+        self._episode_recenter_steps = 0
+        self._episode_xy_hold_steps = 0
+
+        self._episode_live_match_steps = 0
+        self._episode_predicted_steps = 0
+        self._episode_no_target_steps = 0
+        self._episode_descent_requested_steps = 0
+        self._episode_descent_allowed_steps = 0
+        self._episode_descent_blocked_steps = 0
+        self._episode_climb_command_blocked_steps = 0
+        self._episode_best_center_error = float("inf")
+        self._episode_best_similarity = 0.0
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+    def _set_identity(self, fingerprint: Any, class_id: Any = None) -> None:
+        arr = np.asarray(fingerprint, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            raise ValueError("Agent 2 received an empty target fingerprint.")
+
+        emb = torch.from_numpy(arr).float().to(self.tracker.device)
+        emb = F.normalize(emb, dim=0)
+        self._original_embedding = emb.detach().clone()
+        self._bottom_anchor_embedding = None
+        self._reference_embeddings = [self._original_embedding.detach().clone()]
+        self._target_class_id = None if class_id is None else int(class_id)
+
+        # The internal tracker is used only as a detector/embedding backend.
+        # target_class_id is kept only for diagnostics; it is never a gate.
+        self.tracker.target_embedding = self._original_embedding.detach().clone()
+        self.tracker.target_class_id = self._target_class_id
+        self.tracker.last_bbox = None
+        self.tracker.last_good_bbox = None
+        self.tracker.last_score = 0.0
+        self.tracker.last_mode = "IDLE"
+
+    def _set_bottom_anchor_from_bbox(self, frame: np.ndarray, bbox_xyxy: Any) -> bool:
+        """Create an immutable bottom-view reference for the same user target."""
+        arr = self._validated_xyxy(bbox_xyxy, frame.shape)
+        if arr is None:
+            return False
+
+        # ResNet crop coordinates must be integer pixel indices. Agent 1 stores
+        # handoff boxes as float32, so normalize them at this ownership boundary.
+        bbox_xywh = self._xyxy_to_xywh(arr)
+        emb = self.tracker._embedding_from_bbox(frame, bbox_xywh)
+        if emb is None:
+            return False
+
+        self._bottom_anchor_embedding = emb.detach().clone()
+        self._reference_embeddings = [self._original_embedding.detach().clone()]
+        self._reference_embeddings.append(self._bottom_anchor_embedding.detach().clone())
+        return True
+
+    @staticmethod
+    def _validated_xyxy(bbox_xyxy: Any, frame_shape: tuple[int, ...]) -> Optional[np.ndarray]:
+        if bbox_xyxy is None:
+            return None
+        try:
+            arr = np.asarray(bbox_xyxy, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size < 4 or not np.all(np.isfinite(arr[:4])):
+            return None
+
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in arr[:4]]
+        x1 = float(np.clip(x1, 0.0, max(0.0, float(w - 1))))
+        y1 = float(np.clip(y1, 0.0, max(0.0, float(h - 1))))
+        x2 = float(np.clip(x2, x1 + 1.0, max(x1 + 1.0, float(w))))
+        y2 = float(np.clip(y2, y1 + 1.0, max(y1 + 1.0, float(h))))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return np.asarray([x1, y1, x2, y2], dtype=np.float32)
+
+    @staticmethod
+    def _extract_agent1_handoff_bbox(agent1_env: Any) -> Optional[np.ndarray]:
+        """Read the verified bottom bbox left by Agent 1 without mutating Agent 1."""
+        for name in (
+            "_bottom_stable_bbox_xyxy",
+            "_bottom_bbox_xyxy",
+            "_bottom_last_trusted_raw_bbox_xyxy",
+        ):
+            value = getattr(agent1_env, name, None)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            if arr.size >= 4 and np.all(np.isfinite(arr[:4])):
+                return arr[:4].copy()
+        return None
+
+    def _sync_image_geometry(self, frame: np.ndarray) -> None:
+        """Keep observation normalization aligned with the real AirSim frame."""
+        h, w = frame.shape[:2]
+        if int(self.cfg.image_width) == int(w) and int(self.cfg.image_height) == int(h):
+            return
+        self.cfg.image_width = int(w)
+        self.cfg.image_height = int(h)
+        self.observation_builder.config.image_width = int(w)
+        self.observation_builder.config.image_height = int(h)
+
+    def _select_target_from_bottom_click(self, frame: np.ndarray) -> None:
+        window = "Agent 2 - click static target in BOTTOM camera"
+        selected: dict[str, Any] = {"done": False, "x": 0, "y": 0}
+
+        def on_mouse(event, x, y, _flags, _param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                selected.update(done=True, x=int(x), y=int(y))
+
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window, on_mouse)
+        shown = frame.copy()
+        cv2.putText(
+            shown,
+            "Click the landing target (bottom camera)",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
+
+        while not selected["done"]:
+            cv2.imshow(window, shown)
+            key = cv2.waitKey(20) & 0xFF
+            if key in (27, ord("q")):
+                cv2.destroyWindow(window)
+                raise RuntimeError("Agent-2 target selection was cancelled.")
+
+        bbox = self.tracker.select_target(frame, selected["x"], selected["y"])
+        cv2.destroyWindow(window)
+        if bbox is None or self.tracker.target_embedding is None:
+            raise RuntimeError("Bottom click did not produce a target bbox and fingerprint.")
+
+        fp = self.tracker.target_embedding.detach().cpu().numpy().copy()
+        self._set_identity(fp, self.tracker.target_class_id)
+        self._last_bbox_xyxy = self._xywh_to_xyxy(bbox)
+        self._set_bottom_anchor_from_bbox(frame, self._last_bbox_xyxy)
+        print(
+            f"[AGENT_2] Static target selected: target_id={self._target_id} "
+            f"initial_yolo_class={self._target_class_id} "
+            f"bbox={self._last_bbox_xyxy.astype(int).tolist()}"
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def attach_from_agent1(self, agent1_env: Any, handoff_info: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+        """Attach Agent 2 to the exact physical state left by Agent 1."""
+        self.client = agent1_env.client
+        self.cfg.vehicle_name = str(agent1_env.cfg.vehicle_name)
+        self.cfg.bottom_camera_name = str(getattr(agent1_env.cfg, "downward_camera_name", "bottom_center"))
+        self.cfg.lidar_sensor_name = str(getattr(agent1_env.cfg, "lidar_sensor_name", "LidarSensor1"))
+
+        fingerprint = getattr(agent1_env, "target_fingerprint", None)
+        class_id = getattr(agent1_env, "target_class_id", None)
+        self._set_identity(fingerprint, class_id)
+
+        handoff_bbox = self._extract_agent1_handoff_bbox(agent1_env)
+
+        self._target_actor_name = str(getattr(agent1_env, "train_target_car", "") or "")
+        self._read_target_surface_altitude()
+        self._attached_from_agent1 = True
+        self._reset_runtime_state()
+
+        try:
+            self.client.moveByVelocityBodyFrameAsync(
+                vx=0.0,
+                vy=0.0,
+                vz=0.0,
+                duration=0.10,
+                yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                vehicle_name=self.cfg.vehicle_name,
+            ).join()
+        except Exception:
+            pass
+
+        frame = self._get_bottom_frame()
+        self._sync_image_geometry(frame)
+        validated_handoff_bbox = self._validated_xyxy(handoff_bbox, frame.shape)
+        if validated_handoff_bbox is not None:
+            self._last_bbox_xyxy = validated_handoff_bbox.copy()
+            self._last_match_step = int(self._step)
+            self._last_similarity = 1.0
+            self.tracker.last_bbox = self._xyxy_to_xywh(validated_handoff_bbox)
+            self.tracker.last_good_bbox = self.tracker.last_bbox.copy()
+            self.tracker.last_mode = "HANDOFF_INIT"
+            self._set_bottom_anchor_from_bbox(frame, validated_handoff_bbox)
+
+        obs, info = self._observe(frame=frame)
+        info.update(
+            {
+                "agent": "AGENT_2",
+                "attached_from_agent1": True,
+                "agent1_handoff_reason": str(handoff_info.get("termination_reason", "handoff_success")),
+                "handoff_bbox_transferred": validated_handoff_bbox is not None,
+                "bottom_anchor_created": self._bottom_anchor_embedding is not None,
+            }
+        )
+        print(
+            "[AGENT_1P2] Agent 1 OUT -> Agent 2 IN | "
+            f"target_id={self._target_id} initial_yolo_class={self._target_class_id} "
+            f"bbox_transferred={int(validated_handoff_bbox is not None)} "
+            f"bottom_anchor={int(self._bottom_anchor_embedding is not None)} "
+            f"targetZ_NED={self._target_surface_z_ned:+.3f}m "
+            f"source={self._target_surface_source}"
+        )
+        return obs, info
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._attached_from_agent1 = False
+        self.client.enableApiControl(True, vehicle_name=self.cfg.vehicle_name)
+        self.client.armDisarm(True, vehicle_name=self.cfg.vehicle_name)
+
+        if self._standalone_initial_pose is None:
+            self._standalone_initial_pose = self.client.simGetVehiclePose(vehicle_name=self.cfg.vehicle_name)
+        else:
+            self.client.simSetVehiclePose(
+                self._standalone_initial_pose,
+                True,
+                vehicle_name=self.cfg.vehicle_name,
+            )
+            self.client.moveByVelocityBodyFrameAsync(
+                0.0,
+                0.0,
+                0.0,
+                0.15,
+                yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                vehicle_name=self.cfg.vehicle_name,
+            ).join()
+            time.sleep(0.20)
+
+        self._reset_runtime_state()
+        self._read_target_surface_altitude()
+        frame = self._get_bottom_frame()
+        self._sync_image_geometry(frame)
+        if self._original_embedding is None:
+            self._select_target_from_bottom_click(frame)
+
+        obs, info = self._observe(frame=frame)
+        info.update({"agent": "AGENT_2", "standalone": True, "target_actor_moved": False})
+        print(
+            "[AGENT_2 RESET] target actor untouched | "
+            f"targetZ_NED={self._target_surface_z_ned:+.3f}m source={self._target_surface_source}"
+        )
+        return obs, info
+
+    def _reset_runtime_state(self) -> None:
+        self.observation_builder.reset()
+        self._step = 0
+        self._reward_bank = 0.0
+        self._episode_return = 0.0
+        self._prev_action = np.zeros(4, dtype=np.float32)
+        self._prev_relative_height_m = None
+        self._lost_steps = 0
+        self._prediction_steps = 0
+        self._last_match_step = -999999
+        self._live_match_streak = 0
+        self._last_match_margin = 0.0
+        self._last_spatial_jump_norm = 0.0
+        self._last_match_reject_reason = ""
+        self._last_similarity = 0.0
+        self._last_candidate_class_id = None
+        self._last_candidate_confidence = 0.0
+        self._last_candidate_count = 0
+        self._last_candidate_scores = []
+        self._last_bbox_xyxy = None
+        self._last_info = {}
+        self._last_vertical_control_state = "HOLD_INIT"
+        self._last_descent_block_reason = "waiting_for_first_control_step"
+        self._last_raw_vz_action = 0.0
+        self._last_requested_vz_mps = 0.0
+        self._last_applied_vz_mps = 0.0
+        self._last_climb_command_blocked = False
+        self._last_observation_monotonic = None
+        self._last_control_had_live_match = False
+        self._last_control_err_x = 0.0
+        self._last_control_err_y = 0.0
+        self._control_img_vel_x = 0.0
+        self._control_img_vel_y = 0.0
+        self._alignment_ready_streak = 0
+        self._descent_alignment_latched = False
+        self._last_horizontal_control_state = "HOLD_INIT"
+        self._last_pd_action_vx = 0.0
+        self._last_pd_action_vy = 0.0
+        self._last_residual_action_vx = 0.0
+        self._last_residual_action_vy = 0.0
+        self._last_horizontal_action_vx = 0.0
+        self._last_horizontal_action_vy = 0.0
+        self._last_horizontal_speed_limit_mps = 0.0
+        self._episode_recenter_steps = 0
+        self._episode_xy_hold_steps = 0
+        self._episode_live_match_steps = 0
+        self._episode_predicted_steps = 0
+        self._episode_no_target_steps = 0
+        self._episode_descent_requested_steps = 0
+        self._episode_descent_allowed_steps = 0
+        self._episode_descent_blocked_steps = 0
+        self._episode_climb_command_blocked_steps = 0
+        self._episode_best_center_error = float("inf")
+        self._episode_best_similarity = 0.0
+        try:
+            collision = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
+            self._collision_timestamp_at_reset = int(getattr(collision, "time_stamp", 0) or 0)
+        except Exception:
+            self._collision_timestamp_at_reset = 0
+
+    # ------------------------------------------------------------------
+    # Sensors
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _xywh_to_xyxy(bbox: Any) -> np.ndarray:
+        x, y, w, h = [float(v) for v in bbox[:4]]
+        return np.asarray([x, y, x + max(1.0, w), y + max(1.0, h)], dtype=np.float32)
+
+    @staticmethod
+    def _xyxy_to_xywh(bbox: Any) -> list[int]:
+        x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        x = int(round(x1))
+        y = int(round(y1))
+        w = max(1, int(round(x2 - x1)))
+        h = max(1, int(round(y2 - y1)))
+        return [x, y, w, h]
+
+    def _get_bottom_frame(self) -> np.ndarray:
+        responses = self.client.simGetImages(
+            [airsim.ImageRequest(self.cfg.bottom_camera_name, airsim.ImageType.Scene, False, False)],
+            vehicle_name=self.cfg.vehicle_name,
+        )
+        if not responses or not responses[0].image_data_uint8:
+            return np.zeros((self.cfg.image_height, self.cfg.image_width, 3), dtype=np.uint8)
+        response = responses[0]
+        img = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+        frame = img.reshape(response.height, response.width, 3)
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    def _strict_track(self, frame: np.ndarray) -> tuple[Optional[np.ndarray], float, str]:
+        """Track ``user_target`` using ResNet identity only.
+
+        YOLO is a proposal generator. Its class ID and confidence are recorded
+        for diagnostics, but neither participates in target acceptance after
+        the initial user click/handoff.
+        """
+        references = list(self._reference_embeddings)
+        if not references and self._original_embedding is not None:
+            references = [self._original_embedding]
+        if not references:
+            return None, 0.0, "NO_IDENTITY"
+
+        candidates = self.tracker._detect_candidates(frame)
+        self._last_candidate_count = int(len(candidates))
+        self._last_candidate_scores = []
+
+        if not candidates:
+            self._last_candidate_class_id = None
+            self._last_candidate_confidence = 0.0
+            self._prediction_steps += 1
+            self._live_match_streak = 0
+            self._last_match_margin = 0.0
+            self._last_spatial_jump_norm = 0.0
+            self._last_match_reject_reason = "no_detection"
+            if self._last_bbox_xyxy is not None and self._prediction_steps <= self.cfg.max_prediction_steps:
+                return self._last_bbox_xyxy.copy(), float(self._last_similarity), "PRED_NO_DETECTION"
+            return None, 0.0, "NO_DETECTION"
+
+        best = None
+        best_similarity = -1.0
+        best_anchor_index = -1
+        scored_candidates: list[tuple[float, Any, int]] = []
+
+        for candidate_index, candidate in enumerate(candidates):
+            emb = self.tracker._embedding_from_bbox(frame, candidate.bbox)
+            if emb is None:
+                self._last_candidate_scores.append(
+                    {
+                        "candidate_index": int(candidate_index),
+                        "yolo_class_id": int(candidate.cls_id),
+                        "yolo_confidence": float(candidate.conf),
+                        "resnet_similarity": -1.0,
+                        "best_anchor_index": -1,
+                    }
+                )
+                continue
+
+            anchor_scores = [
+                float(torch.dot(reference, emb).detach().cpu().item())
+                for reference in references
+            ]
+            candidate_similarity = max(anchor_scores)
+            candidate_anchor_index = int(np.argmax(anchor_scores))
+            self._last_candidate_scores.append(
+                {
+                    "candidate_index": int(candidate_index),
+                    "yolo_class_id": int(candidate.cls_id),
+                    "yolo_confidence": float(candidate.conf),
+                    "resnet_similarity": float(candidate_similarity),
+                    "best_anchor_index": int(candidate_anchor_index),
+                }
+            )
+
+            if candidate_similarity > best_similarity:
+                best_similarity = float(candidate_similarity)
+                best = candidate
+                best_anchor_index = candidate_anchor_index
+
+            scored_candidates.append(
+                (float(candidate_similarity), candidate, int(candidate_anchor_index))
+            )
+
+        scored_candidates.sort(key=lambda item: item[0], reverse=True)
+        second_best_similarity = (
+            float(scored_candidates[1][0]) if len(scored_candidates) > 1 else -1.0
+        )
+        match_margin = (
+            float(best_similarity - second_best_similarity)
+            if second_best_similarity >= -0.5
+            else 1.0
+        )
+
+        spatial_jump_norm = 0.0
+        spatial_ok = True
+        if best is not None and self._last_bbox_xyxy is not None:
+            current_xyxy = self._xywh_to_xyxy(best.bbox)
+            h, w = frame.shape[:2]
+            prev_cx = 0.5 * float(self._last_bbox_xyxy[0] + self._last_bbox_xyxy[2])
+            prev_cy = 0.5 * float(self._last_bbox_xyxy[1] + self._last_bbox_xyxy[3])
+            curr_cx = 0.5 * float(current_xyxy[0] + current_xyxy[2])
+            curr_cy = 0.5 * float(current_xyxy[1] + current_xyxy[3])
+            spatial_jump_norm = float(
+                math.hypot(curr_cx - prev_cx, curr_cy - prev_cy)
+                / max(1.0, math.hypot(float(w), float(h)))
+            )
+            spatial_ok = bool(
+                spatial_jump_norm <= float(self.cfg.max_reacquire_center_jump_norm)
+                or best_similarity >= float(self.cfg.high_conf_reacquire_similarity)
+            )
+
+        similarity_ok = bool(best is not None and best_similarity >= self.cfg.min_match_similarity)
+        margin_ok = bool(
+            best is not None
+            and (
+                len(scored_candidates) <= 1
+                or match_margin >= float(self.cfg.min_match_margin)
+                or best_similarity >= float(self.cfg.high_conf_reacquire_similarity)
+            )
+        )
+
+        self._last_match_margin = float(match_margin)
+        self._last_spatial_jump_norm = float(spatial_jump_norm)
+
+        if best is None or not similarity_ok or not margin_ok or not spatial_ok:
+            self._last_candidate_class_id = None if best is None else int(best.cls_id)
+            self._last_candidate_confidence = 0.0 if best is None else float(best.conf)
+            self._last_similarity = max(0.0, float(best_similarity))
+            self._prediction_steps += 1
+            self._live_match_streak = 0
+            if best is None:
+                self._last_match_reject_reason = "no_embedded_candidate"
+            elif not similarity_ok:
+                self._last_match_reject_reason = "low_similarity"
+            elif not margin_ok:
+                self._last_match_reject_reason = "ambiguous_similarity_margin"
+            else:
+                self._last_match_reject_reason = "implausible_spatial_jump"
+            if self._last_bbox_xyxy is not None and self._prediction_steps <= self.cfg.max_prediction_steps:
+                return self._last_bbox_xyxy.copy(), max(0.0, best_similarity), "PRED_REJECTED_MATCH"
+            return None, max(0.0, best_similarity), "REJECTED_MATCH"
+
+        self._prediction_steps = 0
+        self._live_match_streak += 1
+        self._last_match_reject_reason = ""
+        self._last_bbox_xyxy = self._xywh_to_xyxy(best.bbox)
+        self._last_similarity = float(best_similarity)
+        self._last_match_step = int(self._step)
+        self._last_candidate_class_id = int(best.cls_id)
+        self._last_candidate_confidence = float(best.conf)
+
+        # Keep detector metadata for diagnostics only. The identity remains
+        # ``user_target`` and the immutable reference embeddings never change.
+        self.tracker.last_bbox = list(best.bbox)
+        self.tracker.last_good_bbox = list(best.bbox)
+        self.tracker.last_score = float(best_similarity)
+        self.tracker.last_mode = f"MATCH_USER_TARGET_ANCHOR_{best_anchor_index}"
+        return self._last_bbox_xyxy.copy(), float(best_similarity), "MATCH"
+
+    def _get_api_state(self) -> tuple[DroneState, float, Any]:
+        state = self.client.getMultirotorState(vehicle_name=self.cfg.vehicle_name)
+        k = state.kinematics_estimated
+        drone_z_ned = float(k.position.z_val)
+        altitude = max(0.0, -drone_z_ned)
+        velocity = k.linear_velocity
+        angular = k.angular_velocity
+        roll = 0.0
+        pitch = 0.0
+        try:
+            pitch, roll, _yaw = airsim.to_eularian_angles(k.orientation)
+        except Exception:
+            pass
+        drone_state = DroneState(
+            altitude_m=altitude,
+            vx_mps=float(velocity.x_val),
+            vy_mps=float(velocity.y_val),
+            vz_mps=float(velocity.z_val),
+            roll_rad=float(roll),
+            pitch_rad=float(pitch),
+            yaw_rate_radps=float(angular.z_val),
+        )
+        # Both values are raw AirSim NED-Z coordinates. A drone above the
+        # target has a smaller/more-negative Z, so this separation is positive.
+        relative_height = float(self._target_surface_z_ned - drone_z_ned)
+        return drone_state, relative_height, state
+
+    def _read_target_surface_altitude(self) -> None:
+        actor = str(self._target_actor_name or self.cfg.static_target_actor_name or "")
+        if actor:
+            try:
+                pose = self.client.simGetObjectPose(actor)
+                z_ned = float(pose.position.z_val)
+                if np.isfinite(z_ned):
+                    self._target_surface_z_ned = z_ned
+                    # Diagnostic conversion only. Relative height never uses it.
+                    self._target_surface_altitude_m = max(0.0, -z_ned)
+                    self._target_surface_source = "api_object_pose_z_ned"
+                    return
+            except Exception:
+                pass
+        self._target_surface_altitude_m = float(self.cfg.static_target_surface_altitude_m)
+        self._target_surface_z_ned = -self._target_surface_altitude_m
+        self._target_surface_source = "configured_static"
+
+    def _get_obstacles(self, api_altitude_m: float, relative_height_m: float) -> dict[str, Any]:
+        max_d = float(self.cfg.lidar_max_range_m)
+        try:
+            data = self.client.getLidarData(
+                lidar_name=self.cfg.lidar_sensor_name,
+                vehicle_name=self.cfg.vehicle_name,
+            )
+            points = point_cloud_to_array(getattr(data, "point_cloud", []))
+            result = self.lidar_processor.compute_sector_distances(points, altitude_fallback_m=api_altitude_m)
+        except Exception:
+            result = {
+                "front_dist_m": max_d,
+                "front_left_dist_m": max_d,
+                "front_right_dist_m": max_d,
+                "left_dist_m": max_d,
+                "right_dist_m": max_d,
+                "back_dist_m": max_d,
+                "down_dist_m": max(0.0, float(relative_height_m)),
+                "min_obstacle_dist_m": max_d,
+                "lidar_valid": False,
+                "lidar_point_count": 0,
+                "obstacle_source": "api_z_only_fallback",
+            }
+
+        # Vertical observation uses only the API NED separation to the target.
+        result["down_dist_m"] = max(0.0, float(relative_height_m))
+        result["obstacle_source"] = "lidar_horizontal+api_z_vertical"
+        return result
+
+    @staticmethod
+    def _bbox_metrics(bbox_xyxy: Optional[np.ndarray], frame_shape: tuple[int, ...]) -> dict[str, float]:
+        if bbox_xyxy is None:
+            return {
+                "err_x": 0.0,
+                "err_y": 0.0,
+                "center_error": 999.0,
+                "bbox_rel_error": 999.0,
+                "area_norm": 0.0,
+            }
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        err_x = (cx - 0.5 * w) / max(1.0, 0.5 * w)
+        err_y = (cy - 0.5 * h) / max(1.0, 0.5 * h)
+        rel_x = abs(err_x) / max(1e-6, bw / max(1.0, w))
+        rel_y = abs(err_y) / max(1e-6, bh / max(1.0, h))
+        return {
+            "err_x": float(err_x),
+            "err_y": float(err_y),
+            "center_error": float(math.hypot(err_x, err_y)),
+            "bbox_rel_error": float(max(rel_x, rel_y)),
+            "area_norm": float((bw * bh) / max(1.0, w * h)),
+        }
+
+    def _observe(self, frame: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict[str, Any]]:
+        frame = self._get_bottom_frame() if frame is None else frame
+        self._sync_image_geometry(frame)
+        bbox_xyxy, similarity, tracker_mode = self._strict_track(frame)
+        metrics = self._bbox_metrics(bbox_xyxy, frame.shape)
+
+        # The moving platform may change world Z on uneven roads. Refresh its
+        # API pose before every vertical-state calculation. No actor movement is
+        # performed here; this is a read-only query.
+        if self._target_actor_name:
+            self._read_target_surface_altitude()
+
+        drone_state, relative_height, api_state = self._get_api_state()
+        drone_z_ned = float(api_state.kinematics_estimated.position.z_val)
+        obstacle = self._get_obstacles(drone_state.altitude_m, relative_height)
+        obstacle_state = ObstacleState(
+            front_dist_m=float(obstacle["front_dist_m"]),
+            front_left_dist_m=float(obstacle["front_left_dist_m"]),
+            front_right_dist_m=float(obstacle["front_right_dist_m"]),
+            left_dist_m=float(obstacle["left_dist_m"]),
+            right_dist_m=float(obstacle["right_dist_m"]),
+            back_dist_m=float(obstacle["back_dist_m"]),
+            down_dist_m=max(0.0, relative_height),
+            min_obstacle_dist_m=float(obstacle["min_obstacle_dist_m"]),
+        )
+
+        bbox = None
+        if bbox_xyxy is not None:
+            x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+            conf = float(similarity if tracker_mode == "MATCH" else 0.25)
+            bbox = BBox(
+                cx=0.5 * (x1 + x2),
+                cy=0.5 * (y1 + y2),
+                w=max(1.0, x2 - x1),
+                h=max(1.0, y2 - y1),
+                conf=conf,
+            )
+
+        obs, obs_dict = self.observation_builder.build(
+            bbox=bbox,
+            drone_state=drone_state,
+            obstacle_state=obstacle_state,
+            dt=float(self.cfg.cmd_duration_s),
+        )
+
+        live_match = bool(tracker_mode == "MATCH")
+        self._update_control_image_velocity(metrics, live_match)
+        match_recent = bool(
+            self._step - self._last_match_step <= self.cfg.good_collision_recent_match_steps
+        )
+        match_confirmed = bool(
+            live_match
+            and self._live_match_streak >= int(self.cfg.match_confirmation_steps)
+        )
+        if live_match:
+            self._lost_steps = 0
+        else:
+            self._lost_steps += 1
+
+        if live_match:
+            self._episode_live_match_steps += 1
+            self._episode_best_similarity = max(
+                self._episode_best_similarity,
+                float(similarity),
+            )
+            if np.isfinite(metrics["center_error"]):
+                self._episode_best_center_error = min(
+                    self._episode_best_center_error,
+                    float(metrics["center_error"]),
+                )
+        elif tracker_mode.startswith("PRED"):
+            self._episode_predicted_steps += 1
+        else:
+            self._episode_no_target_steps += 1
+
+        info: dict[str, Any] = {
+            "obs_dict": obs_dict,
+            "tracker_mode": tracker_mode,
+            "target_id": self._target_id,
+            "target_class_id": int(self._target_class_id) if self._target_class_id is not None else -1,
+            "initial_yolo_class_id": int(self._target_class_id) if self._target_class_id is not None else -1,
+            "strict_class_gate": False,
+            "identity_judge": "resnet_only",
+            "yolo_proposal_conf_threshold": float(self.cfg.yolo_proposal_conf),
+            "reference_anchor_count": int(len(self._reference_embeddings)),
+            "has_front_anchor": self._original_embedding is not None,
+            "has_bottom_anchor": self._bottom_anchor_embedding is not None,
+            "yolo_candidate_count": int(self._last_candidate_count),
+            "selected_candidate_yolo_class_id": (
+                int(self._last_candidate_class_id)
+                if self._last_candidate_class_id is not None
+                else -1
+            ),
+            "selected_candidate_yolo_confidence": float(self._last_candidate_confidence),
+            "candidate_resnet_scores": list(self._last_candidate_scores),
+            "bottom_match": live_match,
+            # Fresh now means a LIVE ResNet acceptance from the current frame.
+            # Recent history is exposed separately for collision evaluation.
+            "bottom_match_fresh": live_match,
+            "bottom_match_live": live_match,
+            "bottom_match_confirmed": match_confirmed,
+            "bottom_match_recent": match_recent,
+            "bottom_live_match_streak": int(self._live_match_streak),
+            "bottom_match_margin": float(self._last_match_margin),
+            "bottom_spatial_jump_norm": float(self._last_spatial_jump_norm),
+            "bottom_match_reject_reason": self._last_match_reject_reason,
+            "bottom_similarity": float(similarity),
+            "bottom_err_x": metrics["err_x"],
+            "bottom_err_y": metrics["err_y"],
+            "bottom_center_error": metrics["center_error"],
+            "bottom_bbox_rel_err": metrics["bbox_rel_error"],
+            "bottom_bbox_area_norm": metrics["area_norm"],
+            "bottom_img_vel_x_control": float(self._control_img_vel_x),
+            "bottom_img_vel_y_control": float(self._control_img_vel_y),
+            "alignment_ready_streak": int(self._alignment_ready_streak),
+            "descent_alignment_latched": bool(self._descent_alignment_latched),
+            "horizontal_control_state": self._last_horizontal_control_state,
+            "horizontal_pd_action_vx": float(self._last_pd_action_vx),
+            "horizontal_pd_action_vy": float(self._last_pd_action_vy),
+            "horizontal_residual_action_vx": float(self._last_residual_action_vx),
+            "horizontal_residual_action_vy": float(self._last_residual_action_vy),
+            "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
+            "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
+            "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
+            "alt_agl_m": float(drone_state.altitude_m),
+            "drone_z_ned": float(drone_z_ned),
+            "target_surface_z_ned": float(self._target_surface_z_ned),
+            "target_surface_altitude_m": float(self._target_surface_altitude_m),
+            "target_surface_source": self._target_surface_source,
+            "relative_height_to_target_m": float(relative_height),
+            "lidar_vertical_used": False,
+            "obstacle_source": obstacle["obstacle_source"],
+            "lidar_valid": bool(obstacle.get("lidar_valid", False)),
+            "lidar_point_count": int(obstacle.get("lidar_point_count", 0)),
+            "front_dist_m": float(obstacle["front_dist_m"]),
+            "left_dist_m": float(obstacle["left_dist_m"]),
+            "right_dist_m": float(obstacle["right_dist_m"]),
+            "back_dist_m": float(obstacle["back_dist_m"]),
+            "lost_steps": int(self._lost_steps),
+            "reward_bank": float(self._reward_bank),
+            "vertical_control_state": self._last_vertical_control_state,
+            "descent_block_reason": self._last_descent_block_reason,
+            "raw_vz_action": float(self._last_raw_vz_action),
+            "requested_vz_mps": float(self._last_requested_vz_mps),
+            "applied_vz_mps": float(self._last_applied_vz_mps),
+            "climb_command_blocked": bool(self._last_climb_command_blocked),
+        }
+
+        if self.cfg.show_camera:
+            vis = frame.copy()
+            h, w = vis.shape[:2]
+            cv2.drawMarker(vis, (w // 2, h // 2), (0, 255, 0), cv2.MARKER_CROSS, 28, 2)
+            display_mode = tracker_mode
+            if live_match and not match_confirmed:
+                display_mode = (
+                    f"MATCH_PENDING({self._live_match_streak}/"
+                    f"{int(self.cfg.match_confirmation_steps)})"
+                )
+            if bbox_xyxy is not None:
+                x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+                color = (0, 255, 0) if match_confirmed else (0, 255, 255)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(vis, f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f}", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            cv2.putText(
+                vis,
+                f"API height above target={relative_height:.2f}m YOLOcls(diag)={self._last_candidate_class_id}",
+                (15, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                vis,
+                f"Z_CTRL={self._last_vertical_control_state} "
+                f"raw={self._last_raw_vz_action:+.2f} "
+                f"down={self._last_requested_vz_mps:+.2f} applied={self._last_applied_vz_mps:+.2f}",
+                (15, 84),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                vis,
+                f"XY_CTRL={self._last_horizontal_control_state} "
+                f"PD=({self._last_pd_action_vx:+.2f},{self._last_pd_action_vy:+.2f}) "
+                f"RES=({self._last_residual_action_vx:+.2f},{self._last_residual_action_vy:+.2f}) "
+                f"CMD=({self._last_horizontal_action_vx:+.2f},{self._last_horizontal_action_vy:+.2f})",
+                (15, 112),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (0, 255, 255),
+                2,
+            )
+            cv2.imshow("Agent 2 - Bottom Landing", vis)
+            cv2.waitKey(1)
+
+        self._last_info = info
+        return np.asarray(obs, dtype=np.float32), info
+
+    # ------------------------------------------------------------------
+    # Control/reward
+    # ------------------------------------------------------------------
+    def _update_control_image_velocity(self, metrics: dict[str, float], live_match: bool) -> None:
+        """Estimate live target motion using real wall-clock spacing between frames."""
+        now = time.monotonic()
+        if live_match:
+            err_x = float(metrics.get("err_x", 0.0) or 0.0)
+            err_y = float(metrics.get("err_y", 0.0) or 0.0)
+            if self._last_control_had_live_match and self._last_observation_monotonic is not None:
+                dt = float(np.clip(now - self._last_observation_monotonic, 0.03, 1.0))
+                clip_v = float(self.cfg.horizontal_velocity_clip_per_s)
+                raw_vx = float(np.clip((err_x - self._last_control_err_x) / dt, -clip_v, clip_v))
+                raw_vy = float(np.clip((err_y - self._last_control_err_y) / dt, -clip_v, clip_v))
+                alpha = float(np.clip(self.cfg.horizontal_velocity_ema_alpha, 0.0, 1.0))
+                self._control_img_vel_x = float(alpha * raw_vx + (1.0 - alpha) * self._control_img_vel_x)
+                self._control_img_vel_y = float(alpha * raw_vy + (1.0 - alpha) * self._control_img_vel_y)
+            else:
+                self._control_img_vel_x = 0.0
+                self._control_img_vel_y = 0.0
+            self._last_control_err_x = err_x
+            self._last_control_err_y = err_y
+            self._last_control_had_live_match = True
+        else:
+            self._control_img_vel_x = 0.0
+            self._control_img_vel_y = 0.0
+            self._last_control_had_live_match = False
+        self._last_observation_monotonic = now
+
+    def _horizontal_speed_limit(self, info: dict[str, Any]) -> float:
+        """Return a conservative XY speed limit from API height and visual scale."""
+        try:
+            height = float(info.get("relative_height_to_target_m", float("inf")))
+        except (TypeError, ValueError):
+            height = float("inf")
+        try:
+            area = float(info.get("bottom_bbox_area_norm", 0.0))
+        except (TypeError, ValueError):
+            area = 0.0
+
+        if not np.isfinite(height):
+            height_limit = float(self.cfg.horizontal_speed_mid_mps)
+        elif height <= 0.8:
+            height_limit = float(self.cfg.horizontal_speed_touchdown_mps)
+        elif height <= 1.6:
+            height_limit = float(self.cfg.horizontal_speed_near_mps)
+        elif height <= 3.5:
+            height_limit = float(self.cfg.horizontal_speed_mid_mps)
+        else:
+            height_limit = float(self.cfg.horizontal_speed_far_mps)
+
+        if area >= 0.20:
+            area_limit = float(self.cfg.horizontal_speed_touchdown_mps)
+        elif area >= 0.10:
+            area_limit = float(self.cfg.horizontal_speed_near_mps)
+        elif area >= 0.045:
+            area_limit = float(self.cfg.horizontal_speed_mid_mps)
+        else:
+            area_limit = float(self.cfg.horizontal_speed_far_mps)
+
+        return float(max(0.05, min(height_limit, area_limit)))
+
+    def _horizontal_visual_servo(
+        self,
+        raw: np.ndarray,
+        info: dict[str, Any],
+    ) -> tuple[float, float, dict[str, Any]]:
+        """Compute deterministic PD centering plus a bounded PPO residual."""
+        live_match = bool(info.get("bottom_match_live", False))
+        confirmed = bool(info.get("bottom_match_confirmed", False))
+        err_x = float(info.get("bottom_err_x", 0.0) or 0.0)
+        err_y = float(info.get("bottom_err_y", 0.0) or 0.0)
+        vel_x = float(info.get("bottom_img_vel_x_control", getattr(self, "_control_img_vel_x", 0.0)) or 0.0)
+        vel_y = float(info.get("bottom_img_vel_y_control", getattr(self, "_control_img_vel_y", 0.0)) or 0.0)
+        speed_limit = self._horizontal_speed_limit(info)
+
+        if not live_match:
+            self._episode_xy_hold_steps = int(getattr(self, "_episode_xy_hold_steps", 0)) + 1
+            details = {
+                "state": "HOLD_NO_LIVE_MATCH",
+                "pd_ax": 0.0,
+                "pd_ay": 0.0,
+                "residual_ax": 0.0,
+                "residual_ay": 0.0,
+                "final_ax": 0.0,
+                "final_ay": 0.0,
+                "speed_limit_mps": speed_limit,
+            }
+            return 0.0, 0.0, details
+
+        pd_ax = (
+            -float(self.cfg.horizontal_pd_kp_y_to_vx) * err_y
+            -float(self.cfg.horizontal_pd_kd_y_to_vx) * vel_y
+        )
+        pd_ay = (
+            float(self.cfg.horizontal_pd_kp_x_to_vy) * err_x
+            +float(self.cfg.horizontal_pd_kd_x_to_vy) * vel_x
+        )
+
+        if abs(err_y) <= float(self.cfg.horizontal_deadband_error) and abs(vel_y) <= float(self.cfg.horizontal_deadband_velocity):
+            pd_ax = 0.0
+        if abs(err_x) <= float(self.cfg.horizontal_deadband_error) and abs(vel_x) <= float(self.cfg.horizontal_deadband_velocity):
+            pd_ay = 0.0
+
+        pd_max = float(np.clip(self.cfg.horizontal_pd_max_action, 0.05, 1.0))
+        pd_ax = float(np.clip(pd_ax, -pd_max, pd_max))
+        pd_ay = float(np.clip(pd_ay, -pd_max, pd_max))
+
+        residual_max = float(np.clip(self.cfg.horizontal_ppo_residual_max_action, 0.0, 0.30))
+        if confirmed:
+            residual_ax = float(np.clip(float(raw[0]) * residual_max, -residual_max, residual_max))
+            residual_ay = float(np.clip(float(raw[1]) * residual_max, -residual_max, residual_max))
+            state = "PD_PLUS_RESIDUAL"
+        else:
+            residual_ax = 0.0
+            residual_ay = 0.0
+            state = "PD_MATCH_PENDING"
+
+        final_ax = float(np.clip(pd_ax + residual_ax, -1.0, 1.0))
+        final_ay = float(np.clip(pd_ay + residual_ay, -1.0, 1.0))
+        vx = final_ax * speed_limit
+        vy = final_ay * speed_limit
+
+        details = {
+            "state": state,
+            "pd_ax": pd_ax,
+            "pd_ay": pd_ay,
+            "residual_ax": residual_ax,
+            "residual_ay": residual_ay,
+            "final_ax": final_ax,
+            "final_ay": final_ay,
+            "speed_limit_mps": speed_limit,
+        }
+        return float(vx), float(vy), details
+
+    def _horizontal_lidar_guard(self, vx: float, vy: float, info: dict[str, Any]) -> tuple[float, float, list[str]]:
+        reasons: list[str] = []
+        emergency = float(self.cfg.obstacle_emergency_m)
+        warning = float(self.cfg.obstacle_warning_m)
+
+        front = float(info["front_dist_m"])
+        back = float(info["back_dist_m"])
+        left = float(info["left_dist_m"])
+        right = float(info["right_dist_m"])
+
+        if vx > 0 and front < emergency:
+            vx = 0.0
+            reasons.append("front_emergency")
+        elif vx > 0 and front < warning:
+            vx *= max(0.0, (front - emergency) / max(1e-6, warning - emergency))
+            reasons.append("front_slow")
+
+        if vx < 0 and back < emergency:
+            vx = 0.0
+            reasons.append("back_emergency")
+        if vy > 0 and right < emergency:
+            vy = 0.0
+            reasons.append("right_emergency")
+        if vy < 0 and left < emergency:
+            vy = 0.0
+            reasons.append("left_emergency")
+        return float(vx), float(vy), reasons
+
+    def _new_collision(self) -> tuple[bool, str, int]:
+        try:
+            collision = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
+            collided = bool(getattr(collision, "has_collided", False))
+            timestamp = int(getattr(collision, "time_stamp", 0) or 0)
+            object_name = str(getattr(collision, "object_name", "") or "")
+            is_new = bool(collided and (timestamp == 0 or timestamp != self._collision_timestamp_at_reset))
+            return is_new, object_name, timestamp
+        except Exception:
+            return False, "", 0
+
+    def _vertical_control_state(self, info: dict[str, Any]) -> tuple[str, bool, str]:
+        """Alignment-gated descent with hysteresis and recentering."""
+        live_match = bool(info.get("bottom_match_live", False))
+        confirmed = bool(info.get("bottom_match_confirmed", False))
+        similarity = float(info.get("bottom_similarity", 0.0))
+        center_error = float(info.get("bottom_center_error", 999.0))
+        bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
+        streak = int(info.get("bottom_live_match_streak", 0))
+
+        if not live_match:
+            self._alignment_ready_streak = 0
+            self._descent_alignment_latched = False
+            return "HOLD_NO_LIVE_MATCH", False, "target_not_detected_current_frame"
+        if not confirmed or streak < int(self.cfg.descent_min_live_match_streak):
+            self._alignment_ready_streak = 0
+            self._descent_alignment_latched = False
+            return "HOLD_MATCH_CONFIRM", False, "live_match_streak_too_short"
+        if similarity < float(self.cfg.descent_min_similarity):
+            self._alignment_ready_streak = 0
+            self._descent_alignment_latched = False
+            return "HOLD_LOW_SIMILARITY", False, "resnet_similarity_below_descent_threshold"
+
+        if bool(getattr(self, "_descent_alignment_latched", False)):
+            if center_error > float(self.cfg.alignment_exit_center_error):
+                self._alignment_ready_streak = 0
+                self._descent_alignment_latched = False
+                self._episode_recenter_steps = int(getattr(self, "_episode_recenter_steps", 0)) + 1
+                return "RECENTER_XY", False, "center_error_exceeded_descent_exit_limit"
+            if bbox_rel > float(self.cfg.alignment_exit_bbox_rel_error):
+                self._alignment_ready_streak = 0
+                self._descent_alignment_latched = False
+                self._episode_recenter_steps = int(getattr(self, "_episode_recenter_steps", 0)) + 1
+                return "RECENTER_BBOX", False, "bbox_error_exceeded_descent_exit_limit"
+            return "DESCEND_TRACKING", True, ""
+
+        enter_ok = bool(
+            center_error <= float(self.cfg.alignment_enter_center_error)
+            and bbox_rel <= float(self.cfg.alignment_enter_bbox_rel_error)
+        )
+        if enter_ok:
+            self._alignment_ready_streak = int(getattr(self, "_alignment_ready_streak", 0)) + 1
+        else:
+            self._alignment_ready_streak = 0
+
+        required = max(1, int(self.cfg.alignment_streak_required))
+        if self._alignment_ready_streak >= required:
+            self._descent_alignment_latched = True
+            return "DESCEND_TRACKING", True, ""
+        if center_error > float(self.cfg.alignment_enter_center_error):
+            return "ALIGN_CENTER", False, "target_center_error_too_large"
+        if bbox_rel > float(self.cfg.alignment_enter_bbox_rel_error):
+            return "ALIGN_BBOX", False, "target_bbox_relative_error_too_large"
+        return "ALIGN_STABLE_PENDING", False, "alignment_streak_too_short"
+
+    def step(self, action):
+        self._step += 1
+        raw = np.asarray(action, dtype=np.float32).reshape(4)
+        raw = np.clip(raw, -1.0, 1.0)
+
+        # Use the observation already returned by reset()/the previous step for
+        # pre-action safety. Perception is executed exactly once per physical
+        # control step, after the command, so tracker/lost counters and visual
+        # dynamics advance once rather than twice.
+        if not self._last_info:
+            raise RuntimeError("Agent2LandingEnv.step() called before reset()/handoff observation.")
+        pre_info = dict(self._last_info)
+
+        vx, vy, horizontal = self._horizontal_visual_servo(raw, pre_info)
+        self._last_horizontal_control_state = str(horizontal["state"])
+        self._last_pd_action_vx = float(horizontal["pd_ax"])
+        self._last_pd_action_vy = float(horizontal["pd_ay"])
+        self._last_residual_action_vx = float(horizontal["residual_ax"])
+        self._last_residual_action_vy = float(horizontal["residual_ay"])
+        self._last_horizontal_action_vx = float(horizontal["final_ax"])
+        self._last_horizontal_action_vy = float(horizontal["final_ay"])
+        self._last_horizontal_speed_limit_mps = float(horizontal["speed_limit_mps"])
+
+        # Landing-only vertical contract:
+        #   raw_z > 0  -> request descent (positive AirSim NED vz)
+        #   raw_z <= 0 -> hover vertically
+        # A fresh/untrained PPO policy can therefore never escape upward.
+        raw_vz_action = float(raw[2])
+        climb_command_blocked = bool(raw_vz_action < 0.0)
+        requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)
+        vertical_state, descent_allowed, descent_block_reason = self._vertical_control_state(pre_info)
+        descent_requested = bool(requested_vz > 0.0)
+        descent_blocked = bool(descent_requested and not descent_allowed)
+        if descent_allowed:
+            vz = float(requested_vz)
+        else:
+            vz = 0.0
+
+        self._last_vertical_control_state = vertical_state
+        self._last_descent_block_reason = descent_block_reason
+        self._last_raw_vz_action = float(raw_vz_action)
+        self._last_requested_vz_mps = float(requested_vz)
+        self._last_applied_vz_mps = float(vz)
+        self._last_climb_command_blocked = bool(climb_command_blocked)
+
+        if climb_command_blocked:
+            self._episode_climb_command_blocked_steps += 1
+        if descent_requested:
+            self._episode_descent_requested_steps += 1
+            if descent_blocked:
+                self._episode_descent_blocked_steps += 1
+            else:
+                self._episode_descent_allowed_steps += 1
+        yaw_rate = float(np.clip(raw[3], -0.20, 0.20)) * self.cfg.yaw_scale_dps
+        vx, vy, guard_reasons = self._horizontal_lidar_guard(vx, vy, pre_info)
+
+        # Final invariant at the AirSim boundary: Agent 2 can never transmit a
+        # negative NED vz. Even a future upstream regression cannot command up.
+        vz = max(0.0, float(vz))
+        self._last_applied_vz_mps = float(vz)
+
+        self.client.moveByVelocityBodyFrameAsync(
+            vx=vx,
+            vy=vy,
+            vz=vz,
+            duration=float(self.cfg.cmd_duration_s),
+            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate),
+            vehicle_name=self.cfg.vehicle_name,
+        ).join()
+
+        obs, info = self._observe()
+        collision_now, collision_object, collision_timestamp = self._new_collision()
+
+        center_error = float(info["bottom_center_error"])
+        bbox_rel = float(info["bottom_bbox_rel_err"])
+        relative_height = float(info["relative_height_to_target_m"])
+        visible = bool(info["bottom_match_live"])
+
+        center_score = 0.0 if not np.isfinite(center_error) or center_error > 2.0 else math.exp(-4.0 * center_error)
+        center_bank = 8.0 * center_score if visible else 0.0
+        progress_bank = 0.0
+        if self._prev_relative_height_m is not None and visible:
+            descent_progress = float(self._prev_relative_height_m - relative_height)
+            if descent_progress > 0.0 and center_error <= 0.45:
+                progress_bank = min(12.0, 80.0 * descent_progress)
+        smooth_bank = -0.15 * float(np.linalg.norm(raw - self._prev_action))
+        shaping = float(center_bank + progress_bank + smooth_bank)
+        self._reward_bank += max(0.0, shaping)
+
+        done = False
+        reason = ""
+        reward = 0.0
+        good_xy = bool(
+            bool(info.get("bottom_match_recent", False))
+            and center_error <= self.cfg.good_collision_center_error
+            and bbox_rel <= self.cfg.good_collision_bbox_rel_error
+        )
+
+        if collision_now:
+            done = True
+            if good_xy:
+                reason = "landing_collision_success"
+                reward = float(np.clip(
+                    self.cfg.success_base_reward + self._reward_bank,
+                    self.cfg.success_min_reward,
+                    self.cfg.success_max_reward,
+                ))
+                # Calibrate in raw AirSim NED-Z, the same coordinate used by
+                # the drone state. No abs()/sign conversion is involved.
+                self._target_surface_z_ned = float(info["drone_z_ned"])
+                self._target_surface_altitude_m = max(0.0, -self._target_surface_z_ned)
+                self._target_surface_source = "verified_collision_api_z_ned"
+            else:
+                reason = "landing_collision_bad_xy"
+                reward = -float(self.cfg.wrong_collision_penalty)
+        elif self._step >= int(self.cfg.max_episode_steps):
+            done = True
+            reason = "landing_timeout_no_collision"
+            reward = 0.0
+        elif self._lost_steps >= int(self.cfg.target_lost_limit_steps):
+            done = True
+            reason = "landing_target_lost"
+            reward = 0.0
+
+        self._episode_return += float(reward)
+        self._prev_action = raw.copy()
+        self._prev_relative_height_m = relative_height
+        info.update(
+            {
+                "agent": "AGENT_2",
+                "raw_action": raw.copy(),
+                "commanded_vx_mps": vx,
+                "commanded_vy_mps": vy,
+                "commanded_vz_mps": vz,
+                "raw_vz_action": raw_vz_action,
+                "requested_vz_mps": requested_vz,
+                "applied_vz_mps": vz,
+                "climb_command_blocked": bool(climb_command_blocked),
+                "vertical_control_state": vertical_state,
+                "descent_allowed": bool(descent_allowed),
+                "descent_requested": bool(descent_requested),
+                "descent_blocked": bool(descent_blocked),
+                "descent_block_reason": descent_block_reason,
+                "commanded_yaw_rate_dps": yaw_rate,
+                "horizontal_guard_reasons": guard_reasons,
+                "horizontal_control_state": self._last_horizontal_control_state,
+                "horizontal_pd_action_vx": float(self._last_pd_action_vx),
+                "horizontal_pd_action_vy": float(self._last_pd_action_vy),
+                "horizontal_residual_action_vx": float(self._last_residual_action_vx),
+                "horizontal_residual_action_vy": float(self._last_residual_action_vy),
+                "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
+                "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
+                "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
+                "alignment_ready_streak": int(getattr(self, "_alignment_ready_streak", 0)),
+                "descent_alignment_latched": bool(getattr(self, "_descent_alignment_latched", False)),
+                "reward_bank": float(self._reward_bank),
+                "landing_shaping_bank_delta": shaping,
+                "collision_new": collision_now,
+                "collision_object_name": collision_object,
+                "collision_timestamp": collision_timestamp,
+                "collision_good_xy": good_xy,
+                "termination_reason": reason,
+                "episode_return": float(self._episode_return),
+            }
+        )
+
+        if done:
+            total_perception = max(
+                1,
+                self._episode_live_match_steps
+                + self._episode_predicted_steps
+                + self._episode_no_target_steps,
+            )
+            live_pct = 100.0 * self._episode_live_match_steps / total_perception
+            pred_pct = 100.0 * self._episode_predicted_steps / total_perception
+            lost_pct = 100.0 * self._episode_no_target_steps / total_perception
+            best_center = (
+                self._episode_best_center_error
+                if np.isfinite(self._episode_best_center_error)
+                else 999.0
+            )
+            print(
+                f"[A2 EP] steps={self._step} result={reason or 'running'} "
+                f"reward={reward:+.1f} bank={self._reward_bank:+.1f} "
+                f"live={live_pct:.1f}% pred={pred_pct:.1f}% lost={lost_pct:.1f}% "
+                f"xy={self._last_horizontal_control_state} recenter={int(getattr(self, '_episode_recenter_steps', 0))} "
+                f"xyHold={int(getattr(self, '_episode_xy_hold_steps', 0))} "
+                f"descent={self._episode_descent_allowed_steps}/"
+                f"{self._episode_descent_requested_steps} "
+                f"blocked={self._episode_descent_blocked_steps} "
+                f"climbBlocked={self._episode_climb_command_blocked_steps} "
+                f"centerFinal={center_error:.3f} centerBest={best_center:.3f} "
+                f"simBest={self._episode_best_similarity:.3f} "
+                f"collision={collision_object or 'none'}"
+            )
+
+        return obs, float(reward), bool(done), False, info
+
+    def close(self):
+        try:
+            cv2.destroyWindow("Agent 2 - Bottom Landing")
+        except Exception:
+            pass
