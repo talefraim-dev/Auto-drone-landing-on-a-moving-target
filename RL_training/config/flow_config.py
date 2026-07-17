@@ -15,7 +15,7 @@ AGENT_1P2:
 
 TRAINING_MODE = "AGENT_1P2"
 
-TOTAL_AGENT2_TIMESTEPS = 10_240
+TOTAL_AGENT2_TIMESTEPS = 2_048
 CHECKPOINT_FREQUENCY = 2_048
 
 # Agent 1 checkpoint selection. Leave empty to select the checkpoint with the
@@ -26,7 +26,7 @@ AGENT_1_PREPARE_MAX_ATTEMPTS = 3
 AGENT_1_PREPARE_MAX_STEPS_PER_ATTEMPT = 700
 
 # Agent 2 resume policy.
-RESUME_AGENT_2 = False
+RESUME_AGENT_2 = True
 
 # Standalone AGENT_2 does not move/reset the target actor. When the actor name
 # is known, it may be supplied here only to READ its API Z. Empty means that

@@ -192,6 +192,11 @@ class DiagnosticSession:
             "descent_allowed", "descent_blocked", "cmd_vx", "cmd_vy", "cmd_vz",
             "cmd_yaw_rate", "actual_vx",
             "actual_vy", "actual_vz", "collision", "collision_object",
+            "collision_success_path", "collision_live_match_at_contact",
+            "collision_alignment_latch_age", "collision_last_verified_center_error",
+            "collision_last_verified_bbox_rel_error", "collision_last_verified_similarity",
+            "collision_object_matches_target", "expected_collision_object_name",
+            "collision_reject_reason",
         ]
         self.timeline = csv.DictWriter(self.timeline_fp, fieldnames=self.timeline_fields)
         self.timeline.writeheader()
@@ -335,6 +340,15 @@ class DiagnosticSession:
             "actual_vz": actual.get("vz", ""),
             "collision": first_value(info, "collision_new", "collision", "has_collided", default=""),
             "collision_object": first_value(info, "collision_object_name", "collision_object", default=""),
+            "collision_success_path": first_value(info, "collision_alignment_success_path", default=""),
+            "collision_live_match_at_contact": first_value(info, "collision_live_match_at_contact", default=""),
+            "collision_alignment_latch_age": first_value(info, "collision_alignment_latch_age", default=""),
+            "collision_last_verified_center_error": first_value(info, "collision_last_verified_center_error", default=""),
+            "collision_last_verified_bbox_rel_error": first_value(info, "collision_last_verified_bbox_rel_error", default=""),
+            "collision_last_verified_similarity": first_value(info, "collision_last_verified_similarity", default=""),
+            "collision_object_matches_target": first_value(info, "collision_object_matches_target", default=""),
+            "expected_collision_object_name": first_value(info, "expected_collision_object_name", default=""),
+            "collision_reject_reason": first_value(info, "collision_reject_reason", default=""),
         }
         try:
             self.timeline.writerow(row)

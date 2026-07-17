@@ -111,9 +111,41 @@ class Agent2Config:
     obstacle_emergency_m: float = 0.55
     obstacle_warning_m: float = 1.20
 
+    # Touchdown reward classification uses only evidence from the collision
+    # frame. A target collision is successful when either a centered LIVE
+    # bottom-camera match exists, or the current bottom image itself looks like
+    # the selected target directly under the camera. Historical latches remain
+    # diagnostic only and cannot grant terminal reward.
     good_collision_center_error: float = 0.45
     good_collision_bbox_rel_error: float = 0.75
     good_collision_recent_match_steps: int = 4
+    collision_latch_max_age_steps: int = 6
+    collision_latch_center_error: float = 0.10
+    collision_latch_bbox_rel_error: float = 0.15
+    collision_latch_min_similarity: float = 0.65
+
+    # Direct contact-frame appearance test. Several centered crops are compared
+    # with the immutable bottom-view target anchor. Corner crops act as a
+    # current-frame floor/background control. A high absolute similarity or a
+    # clear center-over-corners margin is required.
+    contact_appearance_center_crop_scales: tuple[float, ...] = (0.35, 0.50, 0.70, 0.90, 1.00)
+    contact_appearance_corner_crop_scale: float = 0.35
+    contact_appearance_min_similarity: float = 0.60
+    contact_appearance_strong_similarity: float = 0.72
+    contact_appearance_min_center_margin: float = 0.03
+
+    # Authorized-descent state is retained only for diagnostics. It no longer
+    # participates in touchdown success classification.
+    authorized_descent_min_vz_mps: float = 1.0e-4
+    authorized_descent_extreme_live_center_error: float = 0.55
+
+    # The first verified, aligned, non-ground touchdown auto-locks the AirSim
+    # collision object name (for example Porsche_BP_C_1). Later rewards require
+    # the same object. This prevents Floor_0/terrain contacts from becoming
+    # successes while avoiding a hard-coded Unreal actor name.
+    collision_object_auto_lock: bool = True
+    collision_ground_tokens: tuple[str, ...] = ("floor", "ground", "landscape", "terrain")
+
     success_base_reward: float = 2500.0
     success_min_reward: float = 800.0
     success_max_reward: float = 6000.0
@@ -203,6 +235,34 @@ class Agent2LandingEnv(gym.Env):
         self._prev_relative_height_m: Optional[float] = None
         self._lost_steps = 0
         self._collision_timestamp_at_reset = 0
+
+        # Strict visual-alignment latch used only for touchdown classification.
+        # It is reset every episode; the expected collision object may persist
+        # after being safely auto-locked from a verified target touchdown.
+        self._last_verified_alignment_step = -999999
+        self._last_verified_alignment_center_error = 999.0
+        self._last_verified_alignment_bbox_rel_error = 999.0
+        self._last_verified_alignment_similarity = 0.0
+
+        # Physical descent authorization evidence. Unlike the visual latch,
+        # this is refreshed only when a non-zero descent command is actually
+        # sent after passing the full vertical safety gate.
+        self._authorized_descent_latched = False
+        self._last_authorized_descent_step = -999999
+        self._last_authorized_descent_center_error = 999.0
+        self._last_authorized_descent_bbox_rel_error = 999.0
+        self._last_authorized_descent_similarity = 0.0
+        self._last_authorized_descent_vz_mps = 0.0
+        self._authorized_descent_invalidated_reason = "never_authorized"
+
+        self._expected_collision_object_name = ""
+        self._expected_collision_object_source = "unlocked"
+
+        # Most recent raw bottom-camera frame. It is used only when AirSim
+        # reports a new collision, so contact appearance adds no per-step
+        # inference cost.
+        self._last_bottom_frame: Optional[np.ndarray] = None
+
         self._last_info: dict[str, Any] = {}
         self._last_vertical_control_state = "HOLD_INIT"
         self._last_descent_block_reason = "waiting_for_first_control_step"
@@ -489,6 +549,17 @@ class Agent2LandingEnv(gym.Env):
         self._lost_steps = 0
         self._prediction_steps = 0
         self._last_match_step = -999999
+        self._last_verified_alignment_step = -999999
+        self._last_verified_alignment_center_error = 999.0
+        self._last_verified_alignment_bbox_rel_error = 999.0
+        self._last_verified_alignment_similarity = 0.0
+        self._authorized_descent_latched = False
+        self._last_authorized_descent_step = -999999
+        self._last_authorized_descent_center_error = 999.0
+        self._last_authorized_descent_bbox_rel_error = 999.0
+        self._last_authorized_descent_similarity = 0.0
+        self._last_authorized_descent_vz_mps = 0.0
+        self._authorized_descent_invalidated_reason = "never_authorized"
         self._live_match_streak = 0
         self._last_match_margin = 0.0
         self._last_spatial_jump_norm = 0.0
@@ -499,6 +570,7 @@ class Agent2LandingEnv(gym.Env):
         self._last_candidate_count = 0
         self._last_candidate_scores = []
         self._last_bbox_xyxy = None
+        self._last_bottom_frame = None
         self._last_info = {}
         self._last_vertical_control_state = "HOLD_INIT"
         self._last_descent_block_reason = "waiting_for_first_control_step"
@@ -822,6 +894,7 @@ class Agent2LandingEnv(gym.Env):
     def _observe(self, frame: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict[str, Any]]:
         frame = self._get_bottom_frame() if frame is None else frame
         self._sync_image_geometry(frame)
+        self._last_bottom_frame = frame.copy()
         bbox_xyxy, similarity, tracker_mode = self._strict_track(frame)
         metrics = self._bbox_metrics(bbox_xyxy, frame.shape)
 
@@ -1183,13 +1256,389 @@ class Agent2LandingEnv(gym.Env):
             reasons.append("left_emergency")
         return float(vx), float(vy), reasons
 
+    @staticmethod
+    def _scaled_frame_crop(
+        frame: np.ndarray,
+        scale: float,
+        anchor_x: float,
+        anchor_y: float,
+    ) -> Optional[np.ndarray]:
+        """Return an image crop centered at a normalized anchor position."""
+        if frame is None or frame.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        scale = float(np.clip(scale, 0.05, 1.0))
+        crop_w = max(3, int(round(w * scale)))
+        crop_h = max(3, int(round(h * scale)))
+        cx = float(np.clip(anchor_x, 0.0, 1.0)) * float(w)
+        cy = float(np.clip(anchor_y, 0.0, 1.0)) * float(h)
+        x1 = int(round(cx - 0.5 * crop_w))
+        y1 = int(round(cy - 0.5 * crop_h))
+        x1 = max(0, min(x1, w - crop_w))
+        y1 = max(0, min(y1, h - crop_h))
+        crop = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+        if crop.size == 0:
+            return None
+        return crop
+
+    def _appearance_similarity_to_bottom_anchor(self, crop: np.ndarray) -> float:
+        """Compare one current-frame crop with the immutable bottom anchor."""
+        reference = self._bottom_anchor_embedding
+        if reference is None:
+            # Standalone Agent-2 clicks the target from the bottom camera, so
+            # its original embedding is a valid fallback when no explicit
+            # handoff bottom anchor exists.
+            reference = self._original_embedding
+        if reference is None:
+            return 0.0
+        embedding = self.tracker._embedding_from_crop(crop)
+        if embedding is None:
+            return 0.0
+        ref = F.normalize(reference.reshape(-1), dim=0)
+        emb = F.normalize(embedding.reshape(-1), dim=0)
+        return float(torch.dot(ref, emb).detach().cpu().item())
+
+    def _contact_appearance_evidence(self) -> dict[str, Any]:
+        """Measure whether the selected target is under the bottom camera now.
+
+        This uses only the collision-frame image. Center crops are target
+        candidates; same-frame corner crops are background controls. This
+        distinguishes a top touchdown from a side impact where the camera sees
+        mostly floor beneath the drone.
+        """
+        frame = self._last_bottom_frame
+        if frame is None or frame.size == 0:
+            return {
+                "valid": False,
+                "center_similarity": 0.0,
+                "corner_similarity": 0.0,
+                "center_margin": 0.0,
+                "best_center_scale": 0.0,
+                "reason": "missing_collision_frame",
+            }
+        if self._bottom_anchor_embedding is None and self._original_embedding is None:
+            return {
+                "valid": False,
+                "center_similarity": 0.0,
+                "corner_similarity": 0.0,
+                "center_margin": 0.0,
+                "best_center_scale": 0.0,
+                "reason": "missing_target_anchor",
+            }
+
+        center_scores: list[tuple[float, float]] = []
+        for scale in self.cfg.contact_appearance_center_crop_scales:
+            crop = self._scaled_frame_crop(frame, float(scale), 0.5, 0.5)
+            if crop is None:
+                continue
+            center_scores.append((float(scale), self._appearance_similarity_to_bottom_anchor(crop)))
+
+        corner_scale = float(self.cfg.contact_appearance_corner_crop_scale)
+        corner_scores: list[float] = []
+        # Anchors place each control crop inside a corner without going outside
+        # the frame. They deliberately avoid the image center.
+        offset = 0.5 * corner_scale
+        for ax, ay in (
+            (offset, offset),
+            (1.0 - offset, offset),
+            (offset, 1.0 - offset),
+            (1.0 - offset, 1.0 - offset),
+        ):
+            crop = self._scaled_frame_crop(frame, corner_scale, ax, ay)
+            if crop is None:
+                continue
+            corner_scores.append(self._appearance_similarity_to_bottom_anchor(crop))
+
+        if not center_scores:
+            return {
+                "valid": False,
+                "center_similarity": 0.0,
+                "corner_similarity": max(corner_scores, default=0.0),
+                "center_margin": 0.0,
+                "best_center_scale": 0.0,
+                "reason": "no_valid_center_crop",
+            }
+
+        best_scale, best_center = max(center_scores, key=lambda item: item[1])
+        best_corner = max(corner_scores, default=0.0)
+        margin = float(best_center - best_corner)
+        absolute_ok = best_center >= float(self.cfg.contact_appearance_min_similarity)
+        strong_ok = best_center >= float(self.cfg.contact_appearance_strong_similarity)
+        contrast_ok = margin >= float(self.cfg.contact_appearance_min_center_margin)
+        valid = bool(absolute_ok and (strong_ok or contrast_ok))
+
+        if not absolute_ok:
+            reason = "center_similarity_below_threshold"
+        elif not strong_ok and not contrast_ok:
+            reason = "center_not_stronger_than_background"
+        else:
+            reason = ""
+
+        return {
+            "valid": valid,
+            "center_similarity": float(best_center),
+            "corner_similarity": float(best_corner),
+            "center_margin": margin,
+            "best_center_scale": float(best_scale),
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _normalized_collision_object_name(value: str) -> str:
+        return str(value or "").strip().casefold()
+
+    def _is_ground_collision_object(self, object_name: str) -> bool:
+        normalized = self._normalized_collision_object_name(object_name)
+        if not normalized:
+            return True
+        return any(
+            str(token).strip().casefold() in normalized
+            for token in self.cfg.collision_ground_tokens
+            if str(token).strip()
+        )
+
+    def _update_verified_alignment_latch(self, info: dict[str, Any]) -> None:
+        """Store only a strict, confirmed LIVE alignment from this frame."""
+        live_match = bool(info.get("bottom_match_live", False))
+        confirmed = bool(info.get("bottom_match_confirmed", False))
+        center_error = float(info.get("bottom_center_error", 999.0))
+        bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
+        similarity = float(info.get("bottom_similarity", 0.0))
+        strict_alignment = bool(
+            live_match
+            and confirmed
+            and np.isfinite(center_error)
+            and np.isfinite(bbox_rel)
+            and np.isfinite(similarity)
+            and center_error <= float(self.cfg.collision_latch_center_error)
+            and bbox_rel <= float(self.cfg.collision_latch_bbox_rel_error)
+            and similarity >= float(self.cfg.collision_latch_min_similarity)
+        )
+        if not strict_alignment:
+            return
+        self._last_verified_alignment_step = int(self._step)
+        self._last_verified_alignment_center_error = float(center_error)
+        self._last_verified_alignment_bbox_rel_error = float(bbox_rel)
+        self._last_verified_alignment_similarity = float(similarity)
+
+    def _record_authorized_descent(
+        self,
+        pre_info: dict[str, Any],
+        descent_allowed: bool,
+        applied_vz_mps: float,
+    ) -> None:
+        """Latch only an actual descent command that passed the safety gate."""
+        vz = float(applied_vz_mps)
+        if not bool(descent_allowed) or vz <= float(self.cfg.authorized_descent_min_vz_mps):
+            return
+
+        center_error = float(pre_info.get("bottom_center_error", 999.0))
+        bbox_rel = float(pre_info.get("bottom_bbox_rel_err", 999.0))
+        similarity = float(pre_info.get("bottom_similarity", 0.0))
+        live_match = bool(pre_info.get("bottom_match_live", False))
+        confirmed = bool(pre_info.get("bottom_match_confirmed", False))
+
+        # This is intentionally redundant with _vertical_control_state(). It
+        # prevents a future caller from creating physical authorization without
+        # current, confirmed visual evidence.
+        valid_evidence = bool(
+            live_match
+            and confirmed
+            and np.isfinite(center_error)
+            and np.isfinite(bbox_rel)
+            and np.isfinite(similarity)
+            and center_error <= float(self.cfg.alignment_exit_center_error)
+            and bbox_rel <= float(self.cfg.alignment_exit_bbox_rel_error)
+            and similarity >= float(self.cfg.descent_min_similarity)
+        )
+        if not valid_evidence:
+            return
+
+        self._authorized_descent_latched = True
+        self._last_authorized_descent_step = int(self._step)
+        self._last_authorized_descent_center_error = float(center_error)
+        self._last_authorized_descent_bbox_rel_error = float(bbox_rel)
+        self._last_authorized_descent_similarity = float(similarity)
+        self._last_authorized_descent_vz_mps = float(vz)
+        self._authorized_descent_invalidated_reason = ""
+
+    def _update_authorized_descent_latch_after_observation(
+        self,
+        info: dict[str, Any],
+    ) -> None:
+        """Keep episode-level descent authorization until reset.
+
+        Close to contact, visual detections can disappear or become geometrically
+        unreliable. Therefore age and intermediate visual drift no longer erase
+        evidence that a real, alignment-authorized descent command occurred.
+        A clearly off-center LIVE frame is evaluated only at collision time.
+        """
+        _ = info
+        return
+
+    def _collision_reward_decision(
+        self,
+        info: dict[str, Any],
+        collision_object: str,
+        collision_now: bool = False,
+    ) -> dict[str, Any]:
+        """Classify touchdown from current collision-frame evidence only.
+
+        Historical visual latches and prior descent authorization are logged for
+        diagnosis, but they cannot grant terminal reward. Success requires a
+        target-object collision plus either a centered LIVE bottom-camera match
+        or direct target appearance under the camera in the current frame.
+        """
+        live_match = bool(info.get("bottom_match_live", False))
+        center_error = float(info.get("bottom_center_error", 999.0))
+        bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
+        similarity = float(info.get("bottom_similarity", 0.0))
+
+        live_alignment = bool(
+            live_match
+            and np.isfinite(center_error)
+            and np.isfinite(bbox_rel)
+            and center_error <= float(self.cfg.good_collision_center_error)
+            and bbox_rel <= float(self.cfg.good_collision_bbox_rel_error)
+        )
+
+        # Direct image evidence is evaluated only on a real collision step.
+        # This avoids extra ResNet inference during normal control.
+        if collision_now:
+            contact = self._contact_appearance_evidence()
+        else:
+            contact = {
+                "valid": False,
+                "center_similarity": 0.0,
+                "corner_similarity": 0.0,
+                "center_margin": 0.0,
+                "best_center_scale": 0.0,
+                "reason": "not_a_collision_step",
+            }
+
+        if live_alignment:
+            success_path = "LIVE_MATCH"
+        elif bool(contact["valid"]):
+            success_path = "CONTACT_APPEARANCE"
+        else:
+            success_path = "NONE"
+
+        # Historical values remain in the output for comparison with v6-v9.
+        last_verified_step = int(getattr(self, "_last_verified_alignment_step", -999999))
+        last_verified_center = float(
+            getattr(self, "_last_verified_alignment_center_error", 999.0)
+        )
+        last_verified_bbox_rel = float(
+            getattr(self, "_last_verified_alignment_bbox_rel_error", 999.0)
+        )
+        last_verified_similarity = float(
+            getattr(self, "_last_verified_alignment_similarity", 0.0)
+        )
+        latch_age = int(self._step - last_verified_step)
+
+        last_authorized_step = int(
+            getattr(self, "_last_authorized_descent_step", -999999)
+        )
+        authorized_age = int(self._step - last_authorized_step)
+        last_authorized_center = float(
+            getattr(self, "_last_authorized_descent_center_error", 999.0)
+        )
+        last_authorized_bbox_rel = float(
+            getattr(self, "_last_authorized_descent_bbox_rel_error", 999.0)
+        )
+        last_authorized_similarity = float(
+            getattr(self, "_last_authorized_descent_similarity", 0.0)
+        )
+        last_authorized_vz = float(
+            getattr(self, "_last_authorized_descent_vz_mps", 0.0)
+        )
+
+        normalized_object = self._normalized_collision_object_name(collision_object)
+        ground_contact = self._is_ground_collision_object(collision_object)
+        object_matches_target = False
+        object_lock_created = False
+
+        current_bottom_evidence = success_path != "NONE"
+        expected_name = str(getattr(self, "_expected_collision_object_name", "") or "")
+        expected_normalized = self._normalized_collision_object_name(expected_name)
+        object_lock_eligible = bool(current_bottom_evidence)
+        if current_bottom_evidence and normalized_object and not ground_contact:
+            if expected_normalized:
+                object_matches_target = normalized_object == expected_normalized
+            elif bool(self.cfg.collision_object_auto_lock) and object_lock_eligible:
+                self._expected_collision_object_name = str(collision_object)
+                self._expected_collision_object_source = "current_bottom_evidence_touchdown"
+                object_matches_target = True
+                object_lock_created = True
+
+        if not collision_now:
+            reject_reason = ""
+        elif ground_contact:
+            reject_reason = "ground_or_terrain_collision"
+        elif not normalized_object:
+            reject_reason = "empty_collision_object"
+        elif not current_bottom_evidence:
+            reject_reason = str(contact.get("reason", "bottom_target_not_verified")) or "bottom_target_not_verified"
+        elif not object_matches_target:
+            reject_reason = "collision_object_mismatch"
+        else:
+            reject_reason = ""
+
+        return {
+            "success": bool(collision_now and current_bottom_evidence and object_matches_target),
+            "success_path": success_path,
+            "live_match_at_collision": live_match,
+            "live_center_error": center_error,
+            "live_bbox_rel_error": bbox_rel,
+            "live_similarity": similarity,
+            "contact_appearance_valid": bool(contact["valid"]),
+            "contact_center_similarity": float(contact["center_similarity"]),
+            "contact_corner_similarity": float(contact["corner_similarity"]),
+            "contact_center_margin": float(contact["center_margin"]),
+            "contact_best_center_scale": float(contact["best_center_scale"]),
+            "contact_appearance_reason": str(contact["reason"]),
+            "alignment_latch_age": latch_age,
+            "last_verified_center_error": last_verified_center,
+            "last_verified_bbox_rel_error": last_verified_bbox_rel,
+            "last_verified_similarity": last_verified_similarity,
+            "authorized_descent_latched": bool(
+                getattr(self, "_authorized_descent_latched", False)
+            ),
+            "authorized_descent_latch_age": authorized_age,
+            "last_authorized_descent_center_error": last_authorized_center,
+            "last_authorized_descent_bbox_rel_error": last_authorized_bbox_rel,
+            "last_authorized_descent_similarity": last_authorized_similarity,
+            "last_authorized_descent_vz_mps": last_authorized_vz,
+            "authorized_descent_invalidated_reason": "diagnostic_only",
+            "collision_object_matches_target": bool(object_matches_target),
+            "collision_object_lock_created": bool(object_lock_created),
+            "collision_object_lock_eligible": bool(object_lock_eligible),
+            "expected_collision_object_name": str(
+                getattr(self, "_expected_collision_object_name", "") or ""
+            ),
+            "expected_collision_object_source": str(
+                getattr(self, "_expected_collision_object_source", "unlocked") or "unlocked"
+            ),
+            "collision_ground_contact": bool(ground_contact),
+            "reject_reason": reject_reason,
+        }
+
     def _new_collision(self) -> tuple[bool, str, int]:
+        """Return a collision only when it is new relative to the episode reset."""
         try:
-            collision = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
+            collision = self.client.simGetCollisionInfo(
+                vehicle_name=self.cfg.vehicle_name
+            )
             collided = bool(getattr(collision, "has_collided", False))
             timestamp = int(getattr(collision, "time_stamp", 0) or 0)
             object_name = str(getattr(collision, "object_name", "") or "")
-            is_new = bool(collided and (timestamp == 0 or timestamp != self._collision_timestamp_at_reset))
+            is_new = bool(
+                collided
+                and (
+                    timestamp == 0
+                    or timestamp != self._collision_timestamp_at_reset
+                )
+            )
             return is_new, object_name, timestamp
         except Exception:
             return False, "", 0
@@ -1308,6 +1757,7 @@ class Agent2LandingEnv(gym.Env):
         # negative NED vz. Even a future upstream regression cannot command up.
         vz = max(0.0, float(vz))
         self._last_applied_vz_mps = float(vz)
+        self._record_authorized_descent(pre_info, descent_allowed, vz)
 
         self.client.moveByVelocityBodyFrameAsync(
             vx=vx,
@@ -1337,14 +1787,20 @@ class Agent2LandingEnv(gym.Env):
         shaping = float(center_bank + progress_bank + smooth_bank)
         self._reward_bank += max(0.0, shaping)
 
+        # Update touchdown evidence before evaluating a collision from this
+        # physical step. The visual latch covers a short detector gap; the
+        # physical flag records that an ACTUAL, alignment-authorized descent
+        # occurred at least once in the current episode.
+        self._update_verified_alignment_latch(info)
+        self._update_authorized_descent_latch_after_observation(info)
+        collision_decision = self._collision_reward_decision(
+            info, collision_object, collision_now=collision_now
+        )
+
         done = False
         reason = ""
         reward = 0.0
-        good_xy = bool(
-            bool(info.get("bottom_match_recent", False))
-            and center_error <= self.cfg.good_collision_center_error
-            and bbox_rel <= self.cfg.good_collision_bbox_rel_error
-        )
+        good_xy = bool(collision_decision["success"])
 
         if collision_now:
             done = True
@@ -1360,6 +1816,9 @@ class Agent2LandingEnv(gym.Env):
                 self._target_surface_z_ned = float(info["drone_z_ned"])
                 self._target_surface_altitude_m = max(0.0, -self._target_surface_z_ned)
                 self._target_surface_source = "verified_collision_api_z_ned"
+            elif collision_decision["success_path"] != "NONE":
+                reason = "landing_collision_wrong_object"
+                reward = -float(self.cfg.wrong_collision_penalty)
             else:
                 reason = "landing_collision_bad_xy"
                 reward = -float(self.cfg.wrong_collision_penalty)
@@ -1409,6 +1868,30 @@ class Agent2LandingEnv(gym.Env):
                 "collision_object_name": collision_object,
                 "collision_timestamp": collision_timestamp,
                 "collision_good_xy": good_xy,
+                "collision_alignment_success_path": collision_decision["success_path"],
+                "collision_live_match_at_contact": collision_decision["live_match_at_collision"],
+                "collision_contact_appearance_valid": collision_decision["contact_appearance_valid"],
+                "collision_contact_center_similarity": collision_decision["contact_center_similarity"],
+                "collision_contact_corner_similarity": collision_decision["contact_corner_similarity"],
+                "collision_contact_center_margin": collision_decision["contact_center_margin"],
+                "collision_contact_best_center_scale": collision_decision["contact_best_center_scale"],
+                "collision_contact_appearance_reason": collision_decision["contact_appearance_reason"],
+                "collision_alignment_latch_age": collision_decision["alignment_latch_age"],
+                "collision_last_verified_center_error": collision_decision["last_verified_center_error"],
+                "collision_last_verified_bbox_rel_error": collision_decision["last_verified_bbox_rel_error"],
+                "collision_last_verified_similarity": collision_decision["last_verified_similarity"],
+                "collision_authorized_descent_latched": collision_decision["authorized_descent_latched"],
+                "collision_authorized_descent_latch_age": collision_decision["authorized_descent_latch_age"],
+                "collision_last_authorized_descent_center_error": collision_decision["last_authorized_descent_center_error"],
+                "collision_last_authorized_descent_bbox_rel_error": collision_decision["last_authorized_descent_bbox_rel_error"],
+                "collision_last_authorized_descent_similarity": collision_decision["last_authorized_descent_similarity"],
+                "collision_last_authorized_descent_vz_mps": collision_decision["last_authorized_descent_vz_mps"],
+                "collision_authorized_descent_invalidated_reason": collision_decision["authorized_descent_invalidated_reason"],
+                "collision_object_matches_target": collision_decision["collision_object_matches_target"],
+                "collision_object_lock_created": collision_decision["collision_object_lock_created"],
+                "expected_collision_object_name": collision_decision["expected_collision_object_name"],
+                "expected_collision_object_source": collision_decision["expected_collision_object_source"],
+                "collision_reject_reason": collision_decision["reject_reason"],
                 "termination_reason": reason,
                 "episode_return": float(self._episode_return),
             }
@@ -1441,7 +1924,27 @@ class Agent2LandingEnv(gym.Env):
                 f"climbBlocked={self._episode_climb_command_blocked_steps} "
                 f"centerFinal={center_error:.3f} centerBest={best_center:.3f} "
                 f"simBest={self._episode_best_similarity:.3f} "
-                f"collision={collision_object or 'none'}"
+                f"collision={collision_object or 'none'} "
+                f"liveAtTouch={int(bool(collision_decision['live_match_at_collision']))} "
+                f"contact={int(bool(collision_decision['contact_appearance_valid']))} "
+                f"contactSim={float(collision_decision['contact_center_similarity']):.3f} "
+                f"cornerSim={float(collision_decision['contact_corner_similarity']):.3f} "
+                f"contactMargin={float(collision_decision['contact_center_margin']):+.3f} "
+                f"contactScale={float(collision_decision['contact_best_center_scale']):.2f} "
+                f"latchAge={int(collision_decision['alignment_latch_age'])} "
+                f"lastCenter={float(collision_decision['last_verified_center_error']):.3f} "
+                f"lastBBoxRel={float(collision_decision['last_verified_bbox_rel_error']):.3f} "
+                f"lastSim={float(collision_decision['last_verified_similarity']):.3f} "
+                f"authAge={int(collision_decision['authorized_descent_latch_age'])} "
+                f"authCenter={float(collision_decision['last_authorized_descent_center_error']):.3f} "
+                f"authBBoxRel={float(collision_decision['last_authorized_descent_bbox_rel_error']):.3f} "
+                f"authSim={float(collision_decision['last_authorized_descent_similarity']):.3f} "
+                f"authVz={float(collision_decision['last_authorized_descent_vz_mps']):.3f} "
+                f"authActive={int(bool(collision_decision['authorized_descent_latched']))} "
+                f"successPath={collision_decision['success_path']} "
+                f"targetCollision={int(bool(collision_decision['collision_object_matches_target']))} "
+                f"reject={collision_decision['reject_reason'] or 'none'} "
+                f"authReject={collision_decision['authorized_descent_invalidated_reason'] or 'none'}"
             )
 
         return obs, float(reward), bool(done), False, info
