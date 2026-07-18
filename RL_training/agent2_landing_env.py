@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import gymnasium as gym
@@ -91,6 +91,18 @@ class Agent2Config:
     horizontal_velocity_ema_alpha: float = 0.35
     horizontal_velocity_clip_per_s: float = 4.0
 
+    # Moving-target velocity feed-forward. The actor pose is sampled read-only
+    # from AirSim, converted from world NED XY into the drone body frame, and
+    # added to the visual centering correction. This does not change the PPO
+    # observation or action spaces.
+    target_velocity_feedforward_enabled: bool = True
+    target_velocity_feedforward_gain: float = 1.0
+    target_velocity_ema_alpha: float = 0.35
+    target_velocity_max_valid_mps: float = 8.0
+    target_velocity_stale_after_s: float = 1.0
+    horizontal_total_speed_max_mps: float = 6.0
+    horizontal_velocity_hold_max_s: float = 1.0
+
     # Speed shrinks near touchdown. The final limit also considers bbox area,
     # so a wrong actor-Z estimate cannot make close-range commands aggressive.
     horizontal_speed_far_mps: float = 0.90
@@ -152,6 +164,22 @@ class Agent2Config:
     wrong_collision_penalty: float = 1500.0
 
     target_lost_limit_steps: int = 120
+
+    # In AGENT_1P2, a sustained absence of a LIVE bottom-camera match requests
+    # a same-episode return to Agent 1. A short grace window handles detector
+    # gaps; near contact, direct bottom-image appearance can suppress a false
+    # recovery request when the target fills the frame.
+    recovery_no_live_match_timeout_s: float = 1.0
+    recovery_no_live_match_min_steps: int = 2
+    recovery_contact_guard_max_height_m: float = 0.75
+    # Contact appearance may postpone recovery only briefly. It must never
+    # create a low-altitude hover deadlock after the target has really escaped.
+    recovery_contact_guard_max_no_live_s: float = 1.50
+    # In AGENT_1P2 v12, Agent 2 never owns XY/Yaw and never requests a
+    # recovery handoff. It continuously owns only Z while Agent 1 remains
+    # active on both cameras.
+    parallel_dual_agent_mode: bool = False
+
     static_target_actor_name: str = ""
     static_target_surface_altitude_m: float = 0.0
 
@@ -277,6 +305,17 @@ class Agent2LandingEnv(gym.Env):
         self._last_control_err_y = 0.0
         self._control_img_vel_x = 0.0
         self._control_img_vel_y = 0.0
+        self._target_pose_xy: Optional[tuple[float, float]] = None
+        self._target_pose_monotonic: Optional[float] = None
+        self._target_velocity_world_x_mps = 0.0
+        self._target_velocity_world_y_mps = 0.0
+        self._target_velocity_body_vx_mps = 0.0
+        self._target_velocity_body_vy_mps = 0.0
+        self._target_velocity_speed_mps = 0.0
+        self._target_velocity_valid = False
+        self._target_velocity_age_s = float("inf")
+        self._non_live_started_monotonic: Optional[float] = None
+        self._non_live_duration_s = 0.0
         self._alignment_ready_streak = 0
         self._descent_alignment_latched = False
         self._last_horizontal_control_state = "HOLD_INIT"
@@ -287,6 +326,13 @@ class Agent2LandingEnv(gym.Env):
         self._last_horizontal_action_vx = 0.0
         self._last_horizontal_action_vy = 0.0
         self._last_horizontal_speed_limit_mps = 0.0
+        self._last_velocity_ff_vx_mps = 0.0
+        self._last_velocity_ff_vy_mps = 0.0
+        self._last_horizontal_correction_vx_mps = 0.0
+        self._last_horizontal_correction_vy_mps = 0.0
+        self._last_horizontal_command_vx_mps = 0.0
+        self._last_horizontal_command_vy_mps = 0.0
+        self._last_horizontal_total_speed_limit_mps = 0.0
         self._episode_recenter_steps = 0
         self._episode_xy_hold_steps = 0
 
@@ -299,6 +345,37 @@ class Agent2LandingEnv(gym.Env):
         self._episode_climb_command_blocked_steps = 0
         self._episode_best_center_error = float("inf")
         self._episode_best_similarity = 0.0
+
+        # Optional single-command executor supplied by Agent1P2Env. When set,
+        # Agent 2 computes only the gated Z command; the executor runs frozen
+        # Agent 1 and transmits the fused XY/Yaw/Z command exactly once.
+        self._external_command_executor: Optional[
+            Callable[[float], dict[str, Any]]
+        ] = None
+        self._last_external_command_info: dict[str, Any] = {}
+
+    def set_external_command_executor(
+        self,
+        executor: Optional[Callable[[float], dict[str, Any]]],
+    ) -> None:
+        self._external_command_executor = executor
+
+    def get_target_velocity_feedforward_body(self) -> tuple[float, float, bool]:
+        """Return the current filtered target velocity in drone body axes."""
+        valid = bool(
+            self.cfg.target_velocity_feedforward_enabled
+            and self._target_velocity_valid
+            and self._target_velocity_age_s
+            <= float(self.cfg.target_velocity_stale_after_s)
+        )
+        if not valid:
+            return 0.0, 0.0, False
+        gain = float(self.cfg.target_velocity_feedforward_gain)
+        return (
+            float(self._target_velocity_body_vx_mps) * gain,
+            float(self._target_velocity_body_vy_mps) * gain,
+            True,
+        )
 
     # ------------------------------------------------------------------
     # Identity
@@ -491,12 +568,124 @@ class Agent2LandingEnv(gym.Env):
             }
         )
         print(
-            "[AGENT_1P2] Agent 1 OUT -> Agent 2 IN | "
+            "[AGENT_1P2] Landing Z authority enabled; Agent 1 remains active | "
             f"target_id={self._target_id} initial_yolo_class={self._target_class_id} "
             f"bbox_transferred={int(validated_handoff_bbox is not None)} "
             f"bottom_anchor={int(self._bottom_anchor_embedding is not None)} "
             f"targetZ_NED={self._target_surface_z_ned:+.3f}m "
             f"source={self._target_surface_source}"
+        )
+        return obs, info
+
+    def reattach_after_recovery(
+        self,
+        agent1_env: Any,
+        handoff_info: dict[str, Any],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Return control to Agent 2 after Agent 1 reacquires the same target.
+
+        The physical world, target identity, PPO episode counters, reward bank,
+        and expected collision object are preserved. Only short-term landing
+        perception/control state is cleared so stale PRED/Kalman data cannot
+        leak across the recovery boundary.
+        """
+        saved_progress = {
+            "step": int(self._step),
+            "reward_bank": float(self._reward_bank),
+            "episode_return": float(self._episode_return),
+            "collision_timestamp": int(self._collision_timestamp_at_reset),
+            "live_steps": int(self._episode_live_match_steps),
+            "pred_steps": int(self._episode_predicted_steps),
+            "none_steps": int(self._episode_no_target_steps),
+            "descent_requested": int(self._episode_descent_requested_steps),
+            "descent_allowed": int(self._episode_descent_allowed_steps),
+            "descent_blocked": int(self._episode_descent_blocked_steps),
+            "climb_blocked": int(self._episode_climb_command_blocked_steps),
+            "best_center": float(self._episode_best_center_error),
+            "best_similarity": float(self._episode_best_similarity),
+            "recenter_steps": int(self._episode_recenter_steps),
+            "xy_hold_steps": int(self._episode_xy_hold_steps),
+        }
+
+        self.client = agent1_env.client
+        self.cfg.vehicle_name = str(agent1_env.cfg.vehicle_name)
+        self.cfg.bottom_camera_name = str(
+            getattr(agent1_env.cfg, "downward_camera_name", "bottom_center")
+        )
+        self.cfg.lidar_sensor_name = str(
+            getattr(agent1_env.cfg, "lidar_sensor_name", "LidarSensor1")
+        )
+
+        if self._original_embedding is None:
+            self._set_identity(
+                getattr(agent1_env, "target_fingerprint", None),
+                getattr(agent1_env, "target_class_id", None),
+            )
+
+        handoff_bbox = self._extract_agent1_handoff_bbox(agent1_env)
+        self._target_actor_name = str(getattr(agent1_env, "train_target_car", "") or "")
+        self._attached_from_agent1 = True
+        self._reset_runtime_state()
+
+        self._step = saved_progress["step"]
+        self._reward_bank = saved_progress["reward_bank"]
+        self._episode_return = saved_progress["episode_return"]
+        self._collision_timestamp_at_reset = saved_progress["collision_timestamp"]
+        self._episode_live_match_steps = saved_progress["live_steps"]
+        self._episode_predicted_steps = saved_progress["pred_steps"]
+        self._episode_no_target_steps = saved_progress["none_steps"]
+        self._episode_descent_requested_steps = saved_progress["descent_requested"]
+        self._episode_descent_allowed_steps = saved_progress["descent_allowed"]
+        self._episode_descent_blocked_steps = saved_progress["descent_blocked"]
+        self._episode_climb_command_blocked_steps = saved_progress["climb_blocked"]
+        self._episode_best_center_error = saved_progress["best_center"]
+        self._episode_best_similarity = saved_progress["best_similarity"]
+        self._episode_recenter_steps = saved_progress["recenter_steps"]
+        self._episode_xy_hold_steps = saved_progress["xy_hold_steps"]
+
+        try:
+            self.client.moveByVelocityBodyFrameAsync(
+                vx=0.0,
+                vy=0.0,
+                vz=0.0,
+                duration=0.10,
+                yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                vehicle_name=self.cfg.vehicle_name,
+            ).join()
+        except Exception:
+            pass
+
+        frame = self._get_bottom_frame()
+        self._sync_image_geometry(frame)
+        validated_handoff_bbox = self._validated_xyxy(handoff_bbox, frame.shape)
+        if validated_handoff_bbox is not None:
+            self._last_bbox_xyxy = validated_handoff_bbox.copy()
+            self._last_match_step = int(self._step)
+            self._last_similarity = 1.0
+            self.tracker.last_bbox = self._xyxy_to_xywh(validated_handoff_bbox)
+            self.tracker.last_good_bbox = self.tracker.last_bbox.copy()
+            self.tracker.last_mode = "RECOVERY_HANDOFF_INIT"
+            if self._bottom_anchor_embedding is None:
+                self._set_bottom_anchor_from_bbox(frame, validated_handoff_bbox)
+
+        self._read_target_surface_altitude()
+        obs, info = self._observe(frame=frame)
+        info.update(
+            {
+                "agent": "AGENT_2",
+                "reattached_after_recovery": True,
+                "agent1_recovery_handoff_reason": str(
+                    handoff_info.get("termination_reason", "handoff_success")
+                ),
+                "handoff_bbox_transferred": validated_handoff_bbox is not None,
+                "bottom_anchor_preserved": self._bottom_anchor_embedding is not None,
+            }
+        )
+        print(
+            "[AGENT_1P2] Agent 1 RECOVERY OUT -> Agent 2 BACK IN | "
+            f"agent2_step={self._step} bbox_transferred="
+            f"{int(validated_handoff_bbox is not None)} "
+            f"targetSpeed={self._target_velocity_speed_mps:.2f}m/s"
         )
         return obs, info
 
@@ -584,6 +773,9 @@ class Agent2LandingEnv(gym.Env):
         self._last_control_err_y = 0.0
         self._control_img_vel_x = 0.0
         self._control_img_vel_y = 0.0
+        self._reset_target_motion_estimator()
+        self._non_live_started_monotonic = None
+        self._non_live_duration_s = 0.0
         self._alignment_ready_streak = 0
         self._descent_alignment_latched = False
         self._last_horizontal_control_state = "HOLD_INIT"
@@ -594,6 +786,13 @@ class Agent2LandingEnv(gym.Env):
         self._last_horizontal_action_vx = 0.0
         self._last_horizontal_action_vy = 0.0
         self._last_horizontal_speed_limit_mps = 0.0
+        self._last_velocity_ff_vx_mps = 0.0
+        self._last_velocity_ff_vy_mps = 0.0
+        self._last_horizontal_correction_vx_mps = 0.0
+        self._last_horizontal_correction_vy_mps = 0.0
+        self._last_horizontal_command_vx_mps = 0.0
+        self._last_horizontal_command_vy_mps = 0.0
+        self._last_horizontal_total_speed_limit_mps = 0.0
         self._episode_recenter_steps = 0
         self._episode_xy_hold_steps = 0
         self._episode_live_match_steps = 0
@@ -818,9 +1017,12 @@ class Agent2LandingEnv(gym.Env):
 
     def _read_target_surface_altitude(self) -> None:
         actor = str(self._target_actor_name or self.cfg.static_target_actor_name or "")
+        previous_z = float(self._target_surface_z_ned)
+        previous_source = str(self._target_surface_source)
         if actor:
             try:
                 pose = self.client.simGetObjectPose(actor)
+                self._update_target_velocity_from_pose(pose)
                 z_ned = float(pose.position.z_val)
                 if np.isfinite(z_ned):
                     self._target_surface_z_ned = z_ned
@@ -829,10 +1031,148 @@ class Agent2LandingEnv(gym.Env):
                     self._target_surface_source = "api_object_pose_z_ned"
                     return
             except Exception:
-                pass
+                self._target_velocity_valid = False
+
+            # A single read failure must not replace a previously valid moving
+            # platform Z with the configured ground fallback. Keep the last
+            # valid API/collision value until the actor query succeeds again.
+            if (
+                np.isfinite(previous_z)
+                and (
+                    previous_source.startswith("api_object_pose_z_ned")
+                    or previous_source.startswith("verified_collision_api_z_ned")
+                )
+            ):
+                self._target_surface_z_ned = previous_z
+                self._target_surface_altitude_m = max(0.0, -previous_z)
+                self._target_surface_source = f"{previous_source.split('_stale')[0]}_stale"
+                return
+
         self._target_surface_altitude_m = float(self.cfg.static_target_surface_altitude_m)
         self._target_surface_z_ned = -self._target_surface_altitude_m
         self._target_surface_source = "configured_static"
+
+    def _reset_target_motion_estimator(self) -> None:
+        self._target_pose_xy = None
+        self._target_pose_monotonic = None
+        self._target_velocity_world_x_mps = 0.0
+        self._target_velocity_world_y_mps = 0.0
+        self._target_velocity_body_vx_mps = 0.0
+        self._target_velocity_body_vy_mps = 0.0
+        self._target_velocity_speed_mps = 0.0
+        self._target_velocity_valid = False
+        self._target_velocity_age_s = float("inf")
+
+    def _update_target_velocity_from_pose(
+        self,
+        pose: Any,
+        now: Optional[float] = None,
+    ) -> None:
+        """Estimate target world-NED XY velocity from consecutive actor poses."""
+        if not bool(self.cfg.target_velocity_feedforward_enabled):
+            self._target_velocity_valid = False
+            return
+
+        try:
+            x = float(pose.position.x_val)
+            y = float(pose.position.y_val)
+        except Exception:
+            self._target_velocity_valid = False
+            return
+        if not np.isfinite(x) or not np.isfinite(y):
+            self._target_velocity_valid = False
+            return
+
+        sample_time = float(time.monotonic() if now is None else now)
+        previous_xy = self._target_pose_xy
+        previous_time = self._target_pose_monotonic
+        self._target_pose_xy = (x, y)
+        self._target_pose_monotonic = sample_time
+
+        if previous_xy is None or previous_time is None:
+            self._target_velocity_valid = False
+            self._target_velocity_age_s = 0.0
+            return
+
+        dt = float(sample_time - previous_time)
+        if not np.isfinite(dt) or dt < 0.02 or dt > 3.0:
+            self._target_velocity_valid = False
+            self._target_velocity_age_s = 0.0
+            return
+
+        raw_vx = float((x - previous_xy[0]) / dt)
+        raw_vy = float((y - previous_xy[1]) / dt)
+        raw_speed = float(math.hypot(raw_vx, raw_vy))
+        if (
+            not np.isfinite(raw_speed)
+            or raw_speed > float(self.cfg.target_velocity_max_valid_mps)
+        ):
+            # A reset/teleport must never become a feed-forward speed command.
+            self._target_velocity_valid = False
+            self._target_velocity_world_x_mps = 0.0
+            self._target_velocity_world_y_mps = 0.0
+            self._target_velocity_speed_mps = 0.0
+            self._target_velocity_age_s = 0.0
+            return
+
+        alpha = float(np.clip(self.cfg.target_velocity_ema_alpha, 0.0, 1.0))
+        if not self._target_velocity_valid:
+            filtered_vx = raw_vx
+            filtered_vy = raw_vy
+        else:
+            filtered_vx = (
+                alpha * raw_vx
+                + (1.0 - alpha) * float(self._target_velocity_world_x_mps)
+            )
+            filtered_vy = (
+                alpha * raw_vy
+                + (1.0 - alpha) * float(self._target_velocity_world_y_mps)
+            )
+
+        self._target_velocity_world_x_mps = float(filtered_vx)
+        self._target_velocity_world_y_mps = float(filtered_vy)
+        self._target_velocity_speed_mps = float(math.hypot(filtered_vx, filtered_vy))
+        self._target_velocity_valid = True
+        self._target_velocity_age_s = 0.0
+
+    def _update_target_body_velocity(self, api_state: Any) -> None:
+        """Convert target world velocity into the current drone body frame."""
+        now = time.monotonic()
+        if self._target_pose_monotonic is None:
+            age = float("inf")
+        else:
+            age = max(0.0, float(now - self._target_pose_monotonic))
+        self._target_velocity_age_s = age
+
+        valid = bool(
+            self.cfg.target_velocity_feedforward_enabled
+            and self._target_velocity_valid
+            and age <= float(self.cfg.target_velocity_stale_after_s)
+        )
+        if not valid:
+            self._target_velocity_body_vx_mps = 0.0
+            self._target_velocity_body_vy_mps = 0.0
+            self._target_velocity_valid = False
+            return
+
+        yaw = 0.0
+        try:
+            _pitch, _roll, yaw = airsim.to_eularian_angles(
+                api_state.kinematics_estimated.orientation
+            )
+        except Exception:
+            yaw = 0.0
+
+        cos_yaw = math.cos(float(yaw))
+        sin_yaw = math.sin(float(yaw))
+        world_vx = float(self._target_velocity_world_x_mps)
+        world_vy = float(self._target_velocity_world_y_mps)
+        self._target_velocity_body_vx_mps = float(
+            cos_yaw * world_vx + sin_yaw * world_vy
+        )
+        self._target_velocity_body_vy_mps = float(
+            -sin_yaw * world_vx + cos_yaw * world_vy
+        )
 
     def _get_obstacles(self, api_altitude_m: float, relative_height_m: float) -> dict[str, Any]:
         max_d = float(self.cfg.lidar_max_range_m)
@@ -905,6 +1245,7 @@ class Agent2LandingEnv(gym.Env):
             self._read_target_surface_altitude()
 
         drone_state, relative_height, api_state = self._get_api_state()
+        self._update_target_body_velocity(api_state)
         drone_z_ned = float(api_state.kinematics_estimated.position.z_val)
         obstacle = self._get_obstacles(drone_state.altitude_m, relative_height)
         obstacle_state = ObstacleState(
@@ -946,10 +1287,19 @@ class Agent2LandingEnv(gym.Env):
             live_match
             and self._live_match_streak >= int(self.cfg.match_confirmation_steps)
         )
+        perception_now = time.monotonic()
         if live_match:
             self._lost_steps = 0
+            self._non_live_started_monotonic = None
+            self._non_live_duration_s = 0.0
         else:
             self._lost_steps += 1
+            if self._non_live_started_monotonic is None:
+                self._non_live_started_monotonic = perception_now
+            self._non_live_duration_s = max(
+                0.0,
+                float(perception_now - self._non_live_started_monotonic),
+            )
 
         if live_match:
             self._episode_live_match_steps += 1
@@ -1016,6 +1366,20 @@ class Agent2LandingEnv(gym.Env):
             "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
             "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
             "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
+            "target_velocity_valid": bool(self._target_velocity_valid),
+            "target_velocity_age_s": float(self._target_velocity_age_s),
+            "target_velocity_world_x_mps": float(self._target_velocity_world_x_mps),
+            "target_velocity_world_y_mps": float(self._target_velocity_world_y_mps),
+            "target_velocity_body_vx_mps": float(self._target_velocity_body_vx_mps),
+            "target_velocity_body_vy_mps": float(self._target_velocity_body_vy_mps),
+            "target_velocity_speed_mps": float(self._target_velocity_speed_mps),
+            "horizontal_velocity_ff_vx_mps": float(self._last_velocity_ff_vx_mps),
+            "horizontal_velocity_ff_vy_mps": float(self._last_velocity_ff_vy_mps),
+            "horizontal_correction_vx_mps": float(self._last_horizontal_correction_vx_mps),
+            "horizontal_correction_vy_mps": float(self._last_horizontal_correction_vy_mps),
+            "horizontal_command_vx_mps": float(self._last_horizontal_command_vx_mps),
+            "horizontal_command_vy_mps": float(self._last_horizontal_command_vy_mps),
+            "horizontal_total_speed_limit_mps": float(self._last_horizontal_total_speed_limit_mps),
             "alt_agl_m": float(drone_state.altitude_m),
             "drone_z_ned": float(drone_z_ned),
             "target_surface_z_ned": float(self._target_surface_z_ned),
@@ -1031,6 +1395,7 @@ class Agent2LandingEnv(gym.Env):
             "right_dist_m": float(obstacle["right_dist_m"]),
             "back_dist_m": float(obstacle["back_dist_m"]),
             "lost_steps": int(self._lost_steps),
+            "bottom_no_live_duration_s": float(self._non_live_duration_s),
             "reward_bank": float(self._reward_bank),
             "vertical_control_state": self._last_vertical_control_state,
             "descent_block_reason": self._last_descent_block_reason,
@@ -1082,6 +1447,18 @@ class Agent2LandingEnv(gym.Env):
                 f"RES=({self._last_residual_action_vx:+.2f},{self._last_residual_action_vy:+.2f}) "
                 f"CMD=({self._last_horizontal_action_vx:+.2f},{self._last_horizontal_action_vy:+.2f})",
                 (15, 112),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                vis,
+                f"TARGET_VEL={'VALID' if self._target_velocity_valid else 'WAIT'} "
+                f"body=({self._target_velocity_body_vx_mps:+.2f},"
+                f"{self._target_velocity_body_vy_mps:+.2f})m/s "
+                f"lost={self._lost_steps}/{self._non_live_duration_s:.1f}s",
+                (15, 140),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
                 (0, 255, 255),
@@ -1160,61 +1537,139 @@ class Agent2LandingEnv(gym.Env):
         raw: np.ndarray,
         info: dict[str, Any],
     ) -> tuple[float, float, dict[str, Any]]:
-        """Compute deterministic PD centering plus a bounded PPO residual."""
+        """Combine target-speed feed-forward, visual PD, and PPO residual."""
         live_match = bool(info.get("bottom_match_live", False))
         confirmed = bool(info.get("bottom_match_confirmed", False))
         err_x = float(info.get("bottom_err_x", 0.0) or 0.0)
         err_y = float(info.get("bottom_err_y", 0.0) or 0.0)
-        vel_x = float(info.get("bottom_img_vel_x_control", getattr(self, "_control_img_vel_x", 0.0)) or 0.0)
-        vel_y = float(info.get("bottom_img_vel_y_control", getattr(self, "_control_img_vel_y", 0.0)) or 0.0)
-        speed_limit = self._horizontal_speed_limit(info)
+        vel_x = float(
+            info.get(
+                "bottom_img_vel_x_control",
+                getattr(self, "_control_img_vel_x", 0.0),
+            )
+            or 0.0
+        )
+        vel_y = float(
+            info.get(
+                "bottom_img_vel_y_control",
+                getattr(self, "_control_img_vel_y", 0.0),
+            )
+            or 0.0
+        )
+        correction_speed_limit = self._horizontal_speed_limit(info)
+
+        velocity_valid = bool(info.get("target_velocity_valid", False))
+        ff_gain = float(self.cfg.target_velocity_feedforward_gain)
+        ff_vx = (
+            ff_gain * float(info.get("target_velocity_body_vx_mps", 0.0) or 0.0)
+            if velocity_valid
+            else 0.0
+        )
+        ff_vy = (
+            ff_gain * float(info.get("target_velocity_body_vy_mps", 0.0) or 0.0)
+            if velocity_valid
+            else 0.0
+        )
+        ff_speed = float(math.hypot(ff_vx, ff_vy))
+        max_total = max(0.10, float(self.cfg.horizontal_total_speed_max_mps))
+        total_speed_limit = float(
+            min(max_total, max(correction_speed_limit, ff_speed + correction_speed_limit))
+        )
+
+        def clip_vector(vx: float, vy: float, limit: float) -> tuple[float, float]:
+            magnitude = float(math.hypot(vx, vy))
+            if magnitude <= max(1.0e-9, limit):
+                return float(vx), float(vy)
+            scale = float(limit / magnitude)
+            return float(vx * scale), float(vy * scale)
 
         if not live_match:
-            self._episode_xy_hold_steps = int(getattr(self, "_episode_xy_hold_steps", 0)) + 1
+            self._episode_xy_hold_steps = int(
+                getattr(self, "_episode_xy_hold_steps", 0)
+            ) + 1
+            no_live_duration_s = float(
+                info.get("bottom_no_live_duration_s", 0.0) or 0.0
+            )
+            velocity_hold = bool(
+                velocity_valid
+                and no_live_duration_s <= float(
+                    self.cfg.horizontal_velocity_hold_max_s
+                )
+            )
+            if velocity_hold:
+                vx, vy = clip_vector(ff_vx, ff_vy, total_speed_limit)
+                state = "VELOCITY_HOLD_NO_LIVE_MATCH"
+            else:
+                vx, vy = 0.0, 0.0
+                state = "HOLD_NO_LIVE_MATCH"
             details = {
-                "state": "HOLD_NO_LIVE_MATCH",
+                "state": state,
                 "pd_ax": 0.0,
                 "pd_ay": 0.0,
                 "residual_ax": 0.0,
                 "residual_ay": 0.0,
                 "final_ax": 0.0,
                 "final_ay": 0.0,
-                "speed_limit_mps": speed_limit,
+                "speed_limit_mps": correction_speed_limit,
+                "ff_vx_mps": float(ff_vx if velocity_hold else 0.0),
+                "ff_vy_mps": float(ff_vy if velocity_hold else 0.0),
+                "correction_vx_mps": 0.0,
+                "correction_vy_mps": 0.0,
+                "command_vx_mps": float(vx),
+                "command_vy_mps": float(vy),
+                "total_speed_limit_mps": total_speed_limit,
             }
-            return 0.0, 0.0, details
+            return float(vx), float(vy), details
 
         pd_ax = (
             -float(self.cfg.horizontal_pd_kp_y_to_vx) * err_y
-            -float(self.cfg.horizontal_pd_kd_y_to_vx) * vel_y
+            - float(self.cfg.horizontal_pd_kd_y_to_vx) * vel_y
         )
         pd_ay = (
             float(self.cfg.horizontal_pd_kp_x_to_vy) * err_x
-            +float(self.cfg.horizontal_pd_kd_x_to_vy) * vel_x
+            + float(self.cfg.horizontal_pd_kd_x_to_vy) * vel_x
         )
 
-        if abs(err_y) <= float(self.cfg.horizontal_deadband_error) and abs(vel_y) <= float(self.cfg.horizontal_deadband_velocity):
+        if (
+            abs(err_y) <= float(self.cfg.horizontal_deadband_error)
+            and abs(vel_y) <= float(self.cfg.horizontal_deadband_velocity)
+        ):
             pd_ax = 0.0
-        if abs(err_x) <= float(self.cfg.horizontal_deadband_error) and abs(vel_x) <= float(self.cfg.horizontal_deadband_velocity):
+        if (
+            abs(err_x) <= float(self.cfg.horizontal_deadband_error)
+            and abs(vel_x) <= float(self.cfg.horizontal_deadband_velocity)
+        ):
             pd_ay = 0.0
 
         pd_max = float(np.clip(self.cfg.horizontal_pd_max_action, 0.05, 1.0))
         pd_ax = float(np.clip(pd_ax, -pd_max, pd_max))
         pd_ay = float(np.clip(pd_ay, -pd_max, pd_max))
 
-        residual_max = float(np.clip(self.cfg.horizontal_ppo_residual_max_action, 0.0, 0.30))
+        residual_max = float(
+            np.clip(self.cfg.horizontal_ppo_residual_max_action, 0.0, 0.30)
+        )
         if confirmed:
-            residual_ax = float(np.clip(float(raw[0]) * residual_max, -residual_max, residual_max))
-            residual_ay = float(np.clip(float(raw[1]) * residual_max, -residual_max, residual_max))
-            state = "PD_PLUS_RESIDUAL"
+            residual_ax = float(
+                np.clip(float(raw[0]) * residual_max, -residual_max, residual_max)
+            )
+            residual_ay = float(
+                np.clip(float(raw[1]) * residual_max, -residual_max, residual_max)
+            )
+            state = "VELOCITY_FF_PD_PLUS_RESIDUAL"
         else:
             residual_ax = 0.0
             residual_ay = 0.0
-            state = "PD_MATCH_PENDING"
+            state = "VELOCITY_FF_PD_MATCH_PENDING"
 
         final_ax = float(np.clip(pd_ax + residual_ax, -1.0, 1.0))
         final_ay = float(np.clip(pd_ay + residual_ay, -1.0, 1.0))
-        vx = final_ax * speed_limit
-        vy = final_ay * speed_limit
+        correction_vx = float(final_ax * correction_speed_limit)
+        correction_vy = float(final_ay * correction_speed_limit)
+        vx, vy = clip_vector(
+            ff_vx + correction_vx,
+            ff_vy + correction_vy,
+            total_speed_limit,
+        )
 
         details = {
             "state": state,
@@ -1224,7 +1679,14 @@ class Agent2LandingEnv(gym.Env):
             "residual_ay": residual_ay,
             "final_ax": final_ax,
             "final_ay": final_ay,
-            "speed_limit_mps": speed_limit,
+            "speed_limit_mps": correction_speed_limit,
+            "ff_vx_mps": ff_vx,
+            "ff_vy_mps": ff_vy,
+            "correction_vx_mps": correction_vx,
+            "correction_vy_mps": correction_vy,
+            "command_vx_mps": vx,
+            "command_vy_mps": vy,
+            "total_speed_limit_mps": total_speed_limit,
         }
         return float(vx), float(vy), details
 
@@ -1476,6 +1938,56 @@ class Agent2LandingEnv(gym.Env):
         _ = info
         return
 
+    def _recovery_request_decision(
+        self,
+        info: dict[str, Any],
+        collision_now: bool,
+    ) -> dict[str, Any]:
+        """Decide whether AGENT_1P2 must return control to Agent 1."""
+        result = {
+            "requested": False,
+            "reason": "",
+            "contact_guard_active": False,
+            "contact_guard_similarity": 0.0,
+            "contact_guard_margin": 0.0,
+        }
+        if collision_now or not self._attached_from_agent1:
+            return result
+        if bool(info.get("bottom_match_live", False)):
+            return result
+
+        lost_steps = int(info.get("lost_steps", 0) or 0)
+        no_live_duration_s = float(
+            info.get("bottom_no_live_duration_s", 0.0) or 0.0
+        )
+        if lost_steps < int(self.cfg.recovery_no_live_match_min_steps):
+            return result
+        if no_live_duration_s < float(self.cfg.recovery_no_live_match_timeout_s):
+            return result
+
+        relative_height = float(info.get("relative_height_to_target_m", float("inf")))
+        if (
+            relative_height <= float(self.cfg.recovery_contact_guard_max_height_m)
+            and no_live_duration_s
+            <= float(self.cfg.recovery_contact_guard_max_no_live_s)
+        ):
+            contact = self._contact_appearance_evidence()
+            result["contact_guard_similarity"] = float(contact["center_similarity"])
+            result["contact_guard_margin"] = float(contact["center_margin"])
+            if bool(contact["valid"]):
+                # This is only a short collision/contact grace period. Descent
+                # remains blocked without LIVE MATCH, and after the grace limit
+                # Agent 1 recovery is requested even if appearance stays high.
+                result["contact_guard_active"] = True
+                return result
+
+        result["requested"] = True
+        result["reason"] = (
+            f"bottom_live_match_missing_{no_live_duration_s:.2f}s_"
+            f"{lost_steps}_steps"
+        )
+        return result
+
     def _collision_reward_decision(
         self,
         info: dict[str, Any],
@@ -1719,6 +2231,15 @@ class Agent2LandingEnv(gym.Env):
         self._last_horizontal_action_vx = float(horizontal["final_ax"])
         self._last_horizontal_action_vy = float(horizontal["final_ay"])
         self._last_horizontal_speed_limit_mps = float(horizontal["speed_limit_mps"])
+        self._last_velocity_ff_vx_mps = float(horizontal["ff_vx_mps"])
+        self._last_velocity_ff_vy_mps = float(horizontal["ff_vy_mps"])
+        self._last_horizontal_correction_vx_mps = float(horizontal["correction_vx_mps"])
+        self._last_horizontal_correction_vy_mps = float(horizontal["correction_vy_mps"])
+        self._last_horizontal_command_vx_mps = float(horizontal["command_vx_mps"])
+        self._last_horizontal_command_vy_mps = float(horizontal["command_vy_mps"])
+        self._last_horizontal_total_speed_limit_mps = float(
+            horizontal["total_speed_limit_mps"]
+        )
 
         # Landing-only vertical contract:
         #   raw_z > 0  -> request descent (positive AirSim NED vz)
@@ -1759,14 +2280,31 @@ class Agent2LandingEnv(gym.Env):
         self._last_applied_vz_mps = float(vz)
         self._record_authorized_descent(pre_info, descent_allowed, vz)
 
-        self.client.moveByVelocityBodyFrameAsync(
-            vx=vx,
-            vy=vy,
-            vz=vz,
-            duration=float(self.cfg.cmd_duration_s),
-            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate),
-            vehicle_name=self.cfg.vehicle_name,
-        ).join()
+        external_info: dict[str, Any] = {}
+        if self._external_command_executor is not None:
+            # Agent 1 owns XY/Yaw and sends the only physical command. Agent 2
+            # contributes only its already-gated Z command.
+            external_info = dict(self._external_command_executor(vz) or {})
+            self._last_external_command_info = external_info
+            vx = float(external_info.get("agent1_commanded_vx_mps", 0.0))
+            vy = float(external_info.get("agent1_commanded_vy_mps", 0.0))
+            vz = max(
+                0.0,
+                float(external_info.get("agent1_commanded_vz_mps", vz)),
+            )
+            yaw_rate = float(
+                external_info.get("agent1_commanded_yaw_rate_dps", 0.0)
+            )
+        else:
+            self.client.moveByVelocityBodyFrameAsync(
+                vx=vx,
+                vy=vy,
+                vz=vz,
+                duration=float(self.cfg.cmd_duration_s),
+                yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate),
+                vehicle_name=self.cfg.vehicle_name,
+            ).join()
+            self._last_external_command_info = {}
 
         obs, info = self._observe()
         collision_now, collision_object, collision_timestamp = self._new_collision()
@@ -1783,7 +2321,13 @@ class Agent2LandingEnv(gym.Env):
             descent_progress = float(self._prev_relative_height_m - relative_height)
             if descent_progress > 0.0 and center_error <= 0.45:
                 progress_bank = min(12.0, 80.0 * descent_progress)
-        smooth_bank = -0.15 * float(np.linalg.norm(raw - self._prev_action))
+        if bool(self.cfg.parallel_dual_agent_mode):
+            # XY/Yaw actions remain in the 4-D space only for checkpoint
+            # compatibility, but they are masked physically. Do not shape the
+            # landing policy with action dimensions it does not own.
+            smooth_bank = -0.15 * abs(float(raw[2] - self._prev_action[2]))
+        else:
+            smooth_bank = -0.15 * float(np.linalg.norm(raw - self._prev_action))
         shaping = float(center_bank + progress_bank + smooth_bank)
         self._reward_bank += max(0.0, shaping)
 
@@ -1796,6 +2340,26 @@ class Agent2LandingEnv(gym.Env):
         collision_decision = self._collision_reward_decision(
             info, collision_object, collision_now=collision_now
         )
+        if bool(self.cfg.parallel_dual_agent_mode):
+            recovery_decision = {
+                "requested": False,
+                "reason": "parallel_agent1_continuous",
+                "contact_guard_active": False,
+                "contact_guard_similarity": 0.0,
+                "contact_guard_margin": 0.0,
+            }
+        else:
+            recovery_decision = self._recovery_request_decision(
+                info, collision_now
+            )
+        if bool(recovery_decision["requested"]):
+            print(
+                "[A2 RECOVERY REQUEST] "
+                f"reason={recovery_decision['reason']} "
+                f"height={relative_height:.2f}m "
+                f"noLive={self._non_live_duration_s:.2f}s "
+                f"targetSpeed={self._target_velocity_speed_mps:.2f}m/s"
+            )
 
         done = False
         reason = ""
@@ -1826,7 +2390,10 @@ class Agent2LandingEnv(gym.Env):
             done = True
             reason = "landing_timeout_no_collision"
             reward = 0.0
-        elif self._lost_steps >= int(self.cfg.target_lost_limit_steps):
+        elif (
+            not bool(self.cfg.parallel_dual_agent_mode)
+            and self._lost_steps >= int(self.cfg.target_lost_limit_steps)
+        ):
             done = True
             reason = "landing_target_lost"
             reward = 0.0
@@ -1838,6 +2405,20 @@ class Agent2LandingEnv(gym.Env):
             {
                 "agent": "AGENT_2",
                 "raw_action": raw.copy(),
+                "parallel_dual_agent": bool(self.cfg.parallel_dual_agent_mode),
+                "xy_yaw_owner": "AGENT_1" if bool(self.cfg.parallel_dual_agent_mode) else "AGENT_2",
+                "z_owner": "AGENT_2",
+                "agent2_xy_yaw_masked": bool(self.cfg.parallel_dual_agent_mode),
+                "parallel_agent1_tracking_mode": str(external_info.get("agent1_tracking_mode", "")),
+                "parallel_agent1_active_camera": str(external_info.get("agent1_active_camera", "")),
+                "parallel_agent1_camera_authority": str(external_info.get("agent1_camera_authority", "")),
+                "parallel_agent1_fusion_has_target": bool(external_info.get("agent1_fusion_has_target", False)),
+                "parallel_agent1_bottom_match": bool(external_info.get("agent1_bottom_match", False)),
+                "parallel_target_velocity_ff_valid": bool(external_info.get("target_velocity_ff_valid", False)),
+                "parallel_target_velocity_ff_vx_mps": float(external_info.get("target_velocity_ff_vx_mps", 0.0)),
+                "parallel_target_velocity_ff_vy_mps": float(external_info.get("target_velocity_ff_vy_mps", 0.0)),
+                "parallel_target_velocity_ff_blocked_by_safety": bool(external_info.get("target_velocity_ff_blocked_by_safety", False)),
+                "parallel_physical_steps": int(external_info.get("parallel_physical_steps", 0)),
                 "commanded_vx_mps": vx,
                 "commanded_vy_mps": vy,
                 "commanded_vz_mps": vz,
@@ -1860,6 +2441,23 @@ class Agent2LandingEnv(gym.Env):
                 "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
                 "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
                 "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
+                "target_velocity_valid": bool(self._target_velocity_valid),
+                "target_velocity_age_s": float(self._target_velocity_age_s),
+                "target_velocity_world_x_mps": float(self._target_velocity_world_x_mps),
+                "target_velocity_world_y_mps": float(self._target_velocity_world_y_mps),
+                "target_velocity_body_vx_mps": float(self._target_velocity_body_vx_mps),
+                "target_velocity_body_vy_mps": float(self._target_velocity_body_vy_mps),
+                "target_velocity_speed_mps": float(self._target_velocity_speed_mps),
+                "horizontal_velocity_ff_vx_mps": float(self._last_velocity_ff_vx_mps),
+                "horizontal_velocity_ff_vy_mps": float(self._last_velocity_ff_vy_mps),
+                "horizontal_correction_vx_mps": float(self._last_horizontal_correction_vx_mps),
+                "horizontal_correction_vy_mps": float(self._last_horizontal_correction_vy_mps),
+                "horizontal_total_speed_limit_mps": float(self._last_horizontal_total_speed_limit_mps),
+                "recovery_requested": bool(recovery_decision["requested"]),
+                "recovery_request_reason": str(recovery_decision["reason"]),
+                "recovery_contact_guard_active": bool(recovery_decision["contact_guard_active"]),
+                "recovery_contact_guard_similarity": float(recovery_decision["contact_guard_similarity"]),
+                "recovery_contact_guard_margin": float(recovery_decision["contact_guard_margin"]),
                 "alignment_ready_streak": int(getattr(self, "_alignment_ready_streak", 0)),
                 "descent_alignment_latched": bool(getattr(self, "_descent_alignment_latched", False)),
                 "reward_bank": float(self._reward_bank),
@@ -1924,6 +2522,11 @@ class Agent2LandingEnv(gym.Env):
                 f"climbBlocked={self._episode_climb_command_blocked_steps} "
                 f"centerFinal={center_error:.3f} centerBest={best_center:.3f} "
                 f"simBest={self._episode_best_similarity:.3f} "
+                f"A1cam={external_info.get('agent1_active_camera', 'n/a')} "
+                f"A1mode={external_info.get('agent1_tracking_mode', 'n/a')} "
+                f"A1fusion={int(bool(external_info.get('agent1_fusion_has_target', False)))} "
+                f"FF=({float(external_info.get('target_velocity_ff_vx_mps', 0.0)):+.2f},"
+                f"{float(external_info.get('target_velocity_ff_vy_mps', 0.0)):+.2f}) "
                 f"collision={collision_object or 'none'} "
                 f"liveAtTouch={int(bool(collision_decision['live_match_at_collision']))} "
                 f"contact={int(bool(collision_decision['contact_appearance_valid']))} "
@@ -1948,6 +2551,11 @@ class Agent2LandingEnv(gym.Env):
             )
 
         return obs, float(reward), bool(done), False, info
+
+    def register_recovery_penalty(self, penalty: float) -> None:
+        """Keep Agent-2 episode diagnostics consistent with wrapper rewards."""
+        value = max(0.0, float(penalty))
+        self._episode_return -= value
 
     def close(self):
         try:

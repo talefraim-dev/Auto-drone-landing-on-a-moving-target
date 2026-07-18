@@ -427,6 +427,49 @@ class DroneEnv(gym.Env):
         self._last_yaw_rate_cmd_dps = 0.0
         self._effective_yaw_delta_deg = 0.0
 
+        # Parallel dual-agent control. Agent 1 keeps full ownership of XY/Yaw
+        # and both camera trackers. Agent 2 may override only NED-Z and provide
+        # a target-velocity feed-forward term. The override is applied at the
+        # single AirSim command boundary, so two agents never send competing
+        # physical commands in the same control step.
+        self._parallel_dual_agent_mode = False
+        self._parallel_external_vz_mps = 0.0
+        self._parallel_feedforward_vx_mps = 0.0
+        self._parallel_feedforward_vy_mps = 0.0
+        self._parallel_horizontal_speed_limit_mps = 6.0
+        self._last_parallel_feedforward_vx_mps = 0.0
+        self._last_parallel_feedforward_vy_mps = 0.0
+        self._last_parallel_z_override_mps = 0.0
+        self._last_parallel_feedforward_blocked_by_safety = False
+
+    def set_parallel_dual_agent_mode(self, enabled: bool) -> None:
+        """Enable continuous Agent-1 tracking after landing authority begins."""
+        self._parallel_dual_agent_mode = bool(enabled)
+        if not self._parallel_dual_agent_mode:
+            self._parallel_external_vz_mps = 0.0
+            self._parallel_feedforward_vx_mps = 0.0
+            self._parallel_feedforward_vy_mps = 0.0
+
+    def set_parallel_control_overrides(
+        self,
+        vz_mps: float,
+        feedforward_vx_mps: float = 0.0,
+        feedforward_vy_mps: float = 0.0,
+        horizontal_speed_limit_mps: float = 6.0,
+    ) -> None:
+        """Set the command components owned by Agent 2/shared target motion.
+
+        Values are body-frame m/s. Agent 1 still computes its normal tracking
+        correction and yaw command; these terms are fused immediately before
+        the one AirSim command is transmitted.
+        """
+        self._parallel_external_vz_mps = max(0.0, float(vz_mps))
+        self._parallel_feedforward_vx_mps = float(feedforward_vx_mps)
+        self._parallel_feedforward_vy_mps = float(feedforward_vy_mps)
+        self._parallel_horizontal_speed_limit_mps = max(
+            0.1, float(horizontal_speed_limit_mps)
+        )
+
     @staticmethod
     def _deg(rad: float) -> float:
         return float(rad * 180.0 / np.pi)
@@ -2495,6 +2538,9 @@ class DroneEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        options = dict(options or {})
+        preserve_world_state = bool(options.get("preserve_world_state", False))
+        recovery_mode = bool(options.get("recovery_mode", False))
 
         self.episode_id += 1
         self.step_in_episode = 0
@@ -2614,27 +2660,48 @@ class DroneEnv(gym.Env):
         # ------------------------------------------------------------------
         # 1. Reset drone / AirSim vehicle.
         # ------------------------------------------------------------------
-        self.client.reset()
-        time.sleep(float(self.cfg.reset_settle_sec))
-
-        self.client.enableApiControl(True, vehicle_name=self.cfg.vehicle_name)
-        self.client.armDisarm(True, vehicle_name=self.cfg.vehicle_name)
-
-        if bool(getattr(self.cfg, "reset_start_airborne_with_pose", True)):
-            self._force_airborne_start_pose()
+        if preserve_world_state:
+            # Recovery reset: clear only Agent-1 runtime/tracker state. The
+            # drone pose, moving target pose, and world clock remain untouched.
+            self.client.enableApiControl(True, vehicle_name=self.cfg.vehicle_name)
+            self.client.armDisarm(True, vehicle_name=self.cfg.vehicle_name)
+            self._airborne_reset_completed = True
+            try:
+                self.client.moveByVelocityBodyFrameAsync(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.10,
+                    yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                    vehicle_name=self.cfg.vehicle_name,
+                ).join()
+            except Exception:
+                pass
+            print(
+                "[A1 RECOVERY RESET] preserving current drone and moving-target poses"
+            )
         else:
-            self.client.takeoffAsync(vehicle_name=self.cfg.vehicle_name).join()
+            self.client.reset()
             time.sleep(float(self.cfg.reset_settle_sec))
 
-            # AirSim uses NED coordinates: negative Z means up.
-            self.client.moveToZAsync(
-                z=-float(self.cfg.reset_takeoff_altitude_m),
-                velocity=float(self.cfg.reset_move_to_z_velocity),
-                vehicle_name=self.cfg.vehicle_name,
-            ).join()
+            self.client.enableApiControl(True, vehicle_name=self.cfg.vehicle_name)
+            self.client.armDisarm(True, vehicle_name=self.cfg.vehicle_name)
 
-            time.sleep(float(self.cfg.reset_settle_sec))
-            self._airborne_reset_completed = True  # regular takeoff path
+            if bool(getattr(self.cfg, "reset_start_airborne_with_pose", True)):
+                self._force_airborne_start_pose()
+            else:
+                self.client.takeoffAsync(vehicle_name=self.cfg.vehicle_name).join()
+                time.sleep(float(self.cfg.reset_settle_sec))
+
+                # AirSim uses NED coordinates: negative Z means up.
+                self.client.moveToZAsync(
+                    z=-float(self.cfg.reset_takeoff_altitude_m),
+                    velocity=float(self.cfg.reset_move_to_z_velocity),
+                    vehicle_name=self.cfg.vehicle_name,
+                ).join()
+
+                time.sleep(float(self.cfg.reset_settle_sec))
+                self._airborne_reset_completed = True  # regular takeoff path
 
         # Store initial yaw after takeoff/altitude stabilization.
         # Strict fine-tuning can terminate the episode if the drone drifts too
@@ -2651,7 +2718,13 @@ class DroneEnv(gym.Env):
         # tracker frame. This prints before/target/after so we can verify that
         # the reset really affected the visible actor.
         # ------------------------------------------------------------------
-        self._reset_target_car_debug(settle_sec=0.10)
+        if preserve_world_state:
+            print(
+                "[A1 RECOVERY RESET] target actor untouched | "
+                f"name={self.train_target_car}"
+            )
+        else:
+            self._reset_target_car_debug(settle_sec=0.10)
 
         # ------------------------------------------------------------------
         # 3. Get a fresh frame after the car reset.
@@ -2815,10 +2888,13 @@ class DroneEnv(gym.Env):
         self._prev_bbox_conf = float(obs_dict.get("bbox_conf", 0.0))
 
         if self.cfg.print_reset:
-            print(f"[RESET] Episode {self.episode_id}")
+            suffix = " [RECOVERY_PRESERVE_WORLD]" if preserve_world_state else ""
+            print(f"[RESET] Episode {self.episode_id}{suffix}")
 
         info = {
             "obs_dict": obs_dict,
+            "preserved_world_state": bool(preserve_world_state),
+            "recovery_mode": bool(recovery_mode),
             "front_camera_name": str(getattr(self.cfg, "front_camera_name", "front_center")),
             "downward_camera_name": str(getattr(self.cfg, "downward_camera_name", "bottom_center")),
             "front_full_tracker_updates": int(getattr(self, "_front_full_tracker_updates", 0)),
@@ -3359,6 +3435,69 @@ class DroneEnv(gym.Env):
 
         self._last_raw_action[:] = raw_action
         self._last_safe_action[:] = safe_action
+
+        # Parallel fusion is applied only here, after Agent 1 completed all of
+        # its normal visual tracking, safety filtering and yaw logic. Agent 1
+        # owns XY/Yaw; Agent 2 owns Z. The moving-target feed-forward is added
+        # to Agent 1's relative-position correction so the drone matches the
+        # vehicle's velocity instead of permanently chasing from behind.
+        if bool(getattr(self, "_parallel_dual_agent_mode", False)):
+            ff_vx = float(getattr(self, "_parallel_feedforward_vx_mps", 0.0))
+            ff_vy = float(getattr(self, "_parallel_feedforward_vy_mps", 0.0))
+            safety_reasons_lower = [
+                str(reason).lower()
+                for reason in safety_info.get("safety_reasons", [])
+            ]
+            ff_blocked_by_safety = any(
+                token in reason
+                for reason in safety_reasons_lower
+                for token in ("obstacle", "horizontal", "lidar")
+            )
+            if ff_blocked_by_safety:
+                ff_vx = 0.0
+                ff_vy = 0.0
+            vx_cmd = float(vx_cmd + ff_vx)
+            vy_cmd = float(vy_cmd + ff_vy)
+
+            horizontal_limit = max(
+                0.1,
+                float(
+                    getattr(
+                        self,
+                        "_parallel_horizontal_speed_limit_mps",
+                        6.0,
+                    )
+                ),
+            )
+            horizontal_speed = float(np.hypot(vx_cmd, vy_cmd))
+            if horizontal_speed > horizontal_limit:
+                scale = horizontal_limit / max(horizontal_speed, 1.0e-6)
+                vx_cmd *= scale
+                vy_cmd *= scale
+
+            # Z authority is exclusive: no Agent-1 altitude-hold or chase
+            # command is allowed to overwrite the landing controller.
+            vz_cmd = max(
+                0.0,
+                float(getattr(self, "_parallel_external_vz_mps", 0.0)),
+            )
+            self._last_parallel_feedforward_vx_mps = ff_vx
+            self._last_parallel_feedforward_vy_mps = ff_vy
+            self._last_parallel_z_override_mps = float(vz_cmd)
+            self._last_parallel_feedforward_blocked_by_safety = bool(
+                ff_blocked_by_safety
+            )
+        else:
+            self._last_parallel_feedforward_vx_mps = 0.0
+            self._last_parallel_feedforward_vy_mps = 0.0
+            self._last_parallel_z_override_mps = 0.0
+            self._last_parallel_feedforward_blocked_by_safety = False
+
+        # Persist the actual command for the wrapper and diagnostics.
+        self._last_commanded_vx_mps = float(vx_cmd)
+        self._last_commanded_vy_mps = float(vy_cmd)
+        self._last_commanded_vz_mps = float(vz_cmd)
+        self._last_commanded_yaw_rate_dps = float(yaw_rate_cmd)
 
         self.client.moveByVelocityBodyFrameAsync(
             vx=vx_cmd,
@@ -3910,6 +4049,25 @@ class DroneEnv(gym.Env):
         if not done and self.step_in_episode >= int(self.cfg.max_episode_steps):
             done = True
             term_reason = "episode_timeout"
+
+        # In parallel mode, Agent 1 is a continuous controller rather than a
+        # finite preparation episode. Landing-ready, temporary target loss,
+        # non-match and the original tracking timeout must not eject it from the
+        # command loop. True physical/safety failures remain visible.
+        if bool(getattr(self, "_parallel_dual_agent_mode", False)) and term_reason in {
+            "handoff_success",
+            "yaw_deviation_too_large",
+            "target_lost_too_long",
+            "non_match_too_long",
+            "best_distance_not_improved_too_long",
+            "distance_damage_too_large",
+            "altitude_too_low",
+            "altitude_too_high",
+            "episode_timeout",
+            "focused_centered_yaw_hard_fail",
+        }:
+            done = False
+            term_reason = ""
 
         current_has_target = bool(float(obs_dict.get("has_target", 0.0)) > 0.5)
         current_tracking_mode = str(tracking_mode or "LOST")
@@ -4550,6 +4708,15 @@ class DroneEnv(gym.Env):
             "safety_reasons": safety_info.get("safety_reasons", []),
             "raw_action": raw_action.copy(),
             "safe_action": safe_action.copy(),
+            "parallel_dual_agent_mode": bool(getattr(self, "_parallel_dual_agent_mode", False)),
+            "commanded_vx_mps": float(getattr(self, "_last_commanded_vx_mps", 0.0)),
+            "commanded_vy_mps": float(getattr(self, "_last_commanded_vy_mps", 0.0)),
+            "commanded_vz_mps": float(getattr(self, "_last_commanded_vz_mps", 0.0)),
+            "commanded_yaw_rate_dps": float(getattr(self, "_last_commanded_yaw_rate_dps", 0.0)),
+            "parallel_target_velocity_ff_vx_mps": float(getattr(self, "_last_parallel_feedforward_vx_mps", 0.0)),
+            "parallel_target_velocity_ff_vy_mps": float(getattr(self, "_last_parallel_feedforward_vy_mps", 0.0)),
+            "parallel_agent2_vz_override_mps": float(getattr(self, "_last_parallel_z_override_mps", 0.0)),
+            "parallel_target_velocity_ff_blocked_by_safety": bool(getattr(self, "_last_parallel_feedforward_blocked_by_safety", False)),
             "reward_parts": reward_parts,
             "pitch_deg": float(getattr(self, "_last_pitch_deg", 0.0)),
             "pitch_rate_dps": float(getattr(self, "_last_pitch_rate_dps", 0.0)),

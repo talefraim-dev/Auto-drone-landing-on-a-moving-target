@@ -49,6 +49,12 @@ def _train_agent2(mode: str) -> None:
             max_steps_per_attempt=int(flow.AGENT_1_PREPARE_MAX_STEPS_PER_ATTEMPT),
             agent2_config=cfg,
             device=device,
+            target_velocity_feedforward_gain=float(
+                flow.PARALLEL_TARGET_VELOCITY_FEEDFORWARD_GAIN
+            ),
+            horizontal_total_speed_max_mps=float(
+                flow.PARALLEL_HORIZONTAL_TOTAL_SPEED_MAX_MPS
+            ),
         )
     else:
         env_raw = Agent2LandingEnv(cfg=cfg)
@@ -94,10 +100,13 @@ def _train_agent2(mode: str) -> None:
 
     print("=" * 92)
     print(f"[FLOW] TRAINING_MODE    : {mode}")
-    print("[FLOW] Agent 1 runtime  : original DroneEnv + exact checkpoint snapshot")
-    print("[FLOW] Agent 2 runtime  : independent bottom-camera environment")
-    print("[FLOW] Vertical source  : AirSim API Z only")
-    print("[FLOW] LiDAR            : horizontal obstacle sectors only")
+    print("[FLOW] Agent 1 runtime  : always active, frozen, front+bottom fusion")
+    print("[FLOW] Agent 1 owns     : XY + Yaw + target-velocity matching")
+    print("[FLOW] Agent 2 runtime  : always active landing controller")
+    print("[FLOW] Agent 2 owns     : Z only (AirSim API NED-Z)")
+    print("[FLOW] AirSim commands  : exactly one fused command per step")
+    print("[FLOW] Lost bottom view : descent blocked; Agent 1 keeps chasing/searching")
+    print("[FLOW] Recovery cycles  : removed")
     print("[FLOW] Reward           : landing-only, collision-gated")
     print("=" * 92)
 
