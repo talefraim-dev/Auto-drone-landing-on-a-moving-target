@@ -1,0 +1,752 @@
+--- landing_anchor_baseline/RL_training/agent2_landing_env.py	2026-07-19 18:22:03.000000000 +0000
++++ landing_anchor_work/RL_training/agent2_landing_env.py	2026-07-19 19:54:59.631526542 +0000
+@@ -227,6 +227,21 @@
+     control_bbox_outlier_size_ratio: float = 0.40
+     control_bbox_edge_margin_px: float = 6.0
+ 
++    # Stable semantic landing point. The detector bbox continues to serve
++    # identity and optical-flow ROI selection, while XY control, landing lock
++    # and touchdown validation use a virtual full-target anchor. When the car is
++    # clipped by an image edge, its hidden extent is reconstructed from the last
++    # reliable full-target aspect/size instead of treating the visible crop
++    # center as the physical roof center.
++    landing_anchor_enabled: bool = True
++    landing_anchor_u: float = 0.50
++    landing_anchor_v: float = 0.50
++    landing_anchor_size_ema_alpha: float = 0.45
++    landing_anchor_aspect_ema_alpha: float = 0.20
++    landing_anchor_center_alpha: float = 0.90
++    landing_anchor_edge_center_alpha: float = 0.98
++    landing_anchor_max_outside_frame_ratio: float = 0.75
++
+     # Controlled descent during horizontal catch-up. Catch-up is not itself a
+     # vertical hazard: when the target is a confirmed LIVE match, remains well
+     # inside the bottom image, and its predicted image motion is not diverging,
+@@ -403,6 +418,14 @@
+         self._control_bbox_history: list[np.ndarray] = []
+         self._control_bbox_outlier_suppressed = False
+         self._control_bbox_filter_mode = "INIT"
++        self._landing_anchor_px: Optional[np.ndarray] = None
++        self._landing_anchor_virtual_bbox_xyxy: Optional[np.ndarray] = None
++        self._landing_anchor_full_size_px: Optional[np.ndarray] = None
++        self._landing_anchor_aspect_ratio: Optional[float] = None
++        self._landing_anchor_reference_size_px: Optional[np.ndarray] = None
++        self._landing_anchor_reference_height_m: Optional[float] = None
++        self._landing_anchor_mode = "INIT"
++        self._landing_anchor_edge_flags = "NONE"
+         self._last_bottom_observation_monotonic = 0.0
+         self._last_similarity = 0.0
+         self._last_candidate_class_id: Optional[int] = None
+@@ -930,21 +953,59 @@
+         else:
+             mode = "LOST"
+ 
++        anchor_px = info.get("bottom_landing_anchor_px", None)
++        if anchor_px is not None:
++            try:
++                anchor_px = np.asarray(anchor_px, dtype=np.float32).reshape(-1)[:2].copy()
++                if anchor_px.size < 2 or not np.all(np.isfinite(anchor_px)):
++                    anchor_px = None
++            except Exception:
++                anchor_px = None
++
++        # Agent 1's debug window displays this exact shared frame. Draw the
++        # semantic point here so no Agent-1 runtime file needs to change: green
++        # remains the visible bbox diagnostic, magenta is the actual XY/landing
++        # control anchor.
++        shared_frame = (
++            None if self._last_bottom_frame is None else self._last_bottom_frame.copy()
++        )
++        if shared_frame is not None and anchor_px is not None:
++            fh, fw = shared_frame.shape[:2]
++            ax = int(round(float(anchor_px[0])))
++            ay = int(round(float(anchor_px[1])))
++            marker = cv2.MARKER_CROSS
++            if not (0 <= ax < fw and 0 <= ay < fh):
++                ax = int(np.clip(ax, 0, max(0, fw - 1)))
++                ay = int(np.clip(ay, 0, max(0, fh - 1)))
++                marker = cv2.MARKER_TILTED_CROSS
++            cv2.drawMarker(
++                shared_frame,
++                (ax, ay),
++                (255, 0, 255),
++                marker,
++                30,
++                3,
++            )
++
+         return {
+             "source": "AGENT2_SHARED_BOTTOM",
+             "source_monotonic": float(
+                 getattr(self, "_last_bottom_observation_monotonic", 0.0)
+                 or time.monotonic()
+             ),
+-            "frame_bgr": (
+-                None if self._last_bottom_frame is None else self._last_bottom_frame
+-            ),
++            "frame_bgr": shared_frame,
+             "match": live,
+             "confirmed": bool(info.get("bottom_match_confirmed", False)),
+             "recent": recent,
+             "mode": mode,
+             "raw_mode": tracker_mode or "AGENT2",
+             "bbox_xyxy": bbox,
++            "landing_anchor_px": (
++                None if anchor_px is None else [float(anchor_px[0]), float(anchor_px[1])]
++            ),
++            "landing_anchor_mode": str(
++                info.get("bottom_landing_anchor_mode", "NONE") or "NONE"
++            ),
+             "similarity": float(info.get("bottom_similarity", 0.0) or 0.0),
+             "err_x": float(info.get("bottom_err_x", 0.0) or 0.0),
+             "err_y": float(info.get("bottom_err_y", 0.0) or 0.0),
+@@ -1488,6 +1549,14 @@
+         self._control_bbox_history = []
+         self._control_bbox_outlier_suppressed = False
+         self._control_bbox_filter_mode = "INIT"
++        self._landing_anchor_px = None
++        self._landing_anchor_virtual_bbox_xyxy = None
++        self._landing_anchor_full_size_px = None
++        self._landing_anchor_aspect_ratio = None
++        self._landing_anchor_reference_size_px = None
++        self._landing_anchor_reference_height_m = None
++        self._landing_anchor_mode = "INIT"
++        self._landing_anchor_edge_flags = "NONE"
+         self._last_bottom_observation_monotonic = 0.0
+         self._last_bottom_frame = None
+         self._last_info = {}
+@@ -2349,15 +2418,15 @@
+                 and self._previous_relative_position_body is not None
+                 and self._previous_motion_gray is not None
+             ):
+-                prev_metrics = self._bbox_metrics(
+-                    self._previous_motion_bbox_xyxy,
+-                    self._previous_motion_gray.shape,
+-                )
++                # Differentiate the semantic landing anchor, not the visible
++                # bbox center. The visible bbox is still used below as the LK
++                # optical-flow ROI. This prevents edge clipping from appearing
++                # as false target motion.
+                 bbox_vel_x_norm = float(
+-                    (err_x - float(prev_metrics["err_x"])) / dt
++                    (err_x - float(self._last_control_err_x)) / dt
+                 )
+                 bbox_vel_y_norm = float(
+-                    (err_y - float(prev_metrics["err_y"])) / dt
++                    (err_y - float(self._last_control_err_y)) / dt
+                 )
+                 flow_vel_x_norm, flow_vel_y_norm, flow_count, flow_confidence = (
+                     self._optical_flow_velocity_norm(
+@@ -2819,6 +2888,271 @@
+         self._control_bbox_xyxy = filtered_xyxy.copy()
+         return filtered_xyxy
+ 
++    def _update_landing_anchor_geometry(
++        self,
++        *,
++        raw_bbox_xyxy: Optional[np.ndarray],
++        control_bbox_xyxy: Optional[np.ndarray],
++        frame_shape: tuple[int, ...],
++        live_match: bool,
++        relative_height_m: float,
++    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
++        """Return a stable roof anchor and virtual full-target bbox.
++
++        YOLO boxes describe only the visible part of an object. Near touchdown,
++        a moving car commonly crosses an image edge, so the visible bbox center
++        drifts toward the remaining crop even though the physical car center did
++        not move by the same amount. This method preserves a full-target size and
++        aspect estimate from unclipped LIVE frames, reconstructs the hidden
++        extent at an edge, and lets the semantic landing point move outside the
++        image when that is where the car center actually lies.
++
++        The returned virtual bbox is used only for geometry. Identity crops and
++        optical flow continue to consume the validated visible control bbox.
++        """
++        control = self._validated_xyxy(control_bbox_xyxy, frame_shape)
++        raw = self._validated_xyxy(raw_bbox_xyxy, frame_shape)
++        if control is None:
++            self._landing_anchor_mode = "HOLD_NO_BBOX"
++            return (
++                None if self._landing_anchor_px is None else self._landing_anchor_px.copy(),
++                None
++                if self._landing_anchor_virtual_bbox_xyxy is None
++                else self._landing_anchor_virtual_bbox_xyxy.copy(),
++            )
++
++        if not bool(self.cfg.landing_anchor_enabled):
++            cxcywh = self._xyxy_to_cxcywh(control)
++            self._landing_anchor_px = cxcywh[0:2].astype(np.float32)
++            self._landing_anchor_full_size_px = cxcywh[2:4].astype(np.float32)
++            self._landing_anchor_virtual_bbox_xyxy = control.copy()
++            self._landing_anchor_mode = "DISABLED_BBOX_CENTER"
++            self._landing_anchor_edge_flags = "NONE"
++            return self._landing_anchor_px.copy(), control.copy()
++
++        if not bool(live_match):
++            self._landing_anchor_mode = "HOLD_PRED"
++            return (
++                None if self._landing_anchor_px is None else self._landing_anchor_px.copy(),
++                None
++                if self._landing_anchor_virtual_bbox_xyxy is None
++                else self._landing_anchor_virtual_bbox_xyxy.copy(),
++            )
++
++        visible = control if raw is None else raw
++        h, w = frame_shape[:2]
++        edge_margin = max(1.0, float(self.cfg.control_bbox_edge_margin_px))
++        left = bool(float(visible[0]) <= edge_margin)
++        top = bool(float(visible[1]) <= edge_margin)
++        right = bool(float(visible[2]) >= float(w) - edge_margin)
++        bottom = bool(float(visible[3]) >= float(h) - edge_margin)
++        edge_clipped = bool(left or top or right or bottom)
++        edge_flags = "".join(
++            name for name, active in (("L", left), ("T", top), ("R", right), ("B", bottom)) if active
++        ) or "NONE"
++
++        control_cxcywh = self._xyxy_to_cxcywh(control)
++        visible_cxcywh = self._xyxy_to_cxcywh(visible)
++        control_center = control_cxcywh[0:2].astype(np.float64)
++        control_size = np.maximum(control_cxcywh[2:4].astype(np.float64), 2.0)
++        visible_size = np.maximum(visible_cxcywh[2:4].astype(np.float64), 2.0)
++
++        if self._landing_anchor_full_size_px is None:
++            self._landing_anchor_full_size_px = control_size.astype(np.float32)
++        if self._landing_anchor_aspect_ratio is None:
++            self._landing_anchor_aspect_ratio = float(
++                np.clip(control_size[0] / max(2.0, control_size[1]), 0.05, 20.0)
++            )
++
++        aspect = float(self._landing_anchor_aspect_ratio)
++        full_size_prev = np.maximum(
++            np.asarray(self._landing_anchor_full_size_px, dtype=np.float64), 2.0
++        )
++
++        if not edge_clipped:
++            size_measurement = control_size
++            size_alpha = float(np.clip(self.cfg.landing_anchor_size_ema_alpha, 0.0, 1.0))
++            full_size = size_alpha * size_measurement + (1.0 - size_alpha) * full_size_prev
++            measured_aspect = float(
++                np.clip(full_size[0] / max(2.0, full_size[1]), 0.05, 20.0)
++            )
++            aspect_alpha = float(
++                np.clip(self.cfg.landing_anchor_aspect_ema_alpha, 0.0, 1.0)
++            )
++            aspect = float(
++                aspect_alpha * measured_aspect
++                + (1.0 - aspect_alpha) * aspect
++            )
++            full_center = control_center
++            self._landing_anchor_reference_size_px = full_size.astype(np.float32)
++            if np.isfinite(relative_height_m) and float(relative_height_m) > 0.05:
++                self._landing_anchor_reference_height_m = float(relative_height_m)
++            mode = "TRACK_FULL"
++        else:
++            horizontal_unclipped = bool(not left and not right)
++            vertical_unclipped = bool(not top and not bottom)
++            candidate_size = full_size_prev.copy()
++
++            if horizontal_unclipped:
++                candidate_size[0] = visible_size[0]
++                candidate_size[1] = max(visible_size[1], candidate_size[0] / max(aspect, 1.0e-6))
++            elif vertical_unclipped:
++                candidate_size[1] = visible_size[1]
++                candidate_size[0] = max(visible_size[0], candidate_size[1] * aspect)
++            elif (
++                self._landing_anchor_reference_size_px is not None
++                and self._landing_anchor_reference_height_m is not None
++                and np.isfinite(relative_height_m)
++                and float(relative_height_m) > 0.05
++            ):
++                scale = float(
++                    np.clip(
++                        float(self._landing_anchor_reference_height_m)
++                        / float(relative_height_m),
++                        0.70,
++                        3.00,
++                    )
++                )
++                candidate_size = (
++                    np.asarray(self._landing_anchor_reference_size_px, dtype=np.float64)
++                    * scale
++                )
++
++            candidate_size = np.maximum(candidate_size, visible_size)
++            # At an edge, shrinking is usually clipping rather than a real target
++            # scale change. Follow growth quickly and shrink only weakly.
++            growth = candidate_size >= full_size_prev
++            alpha_grow = float(
++                np.clip(max(0.65, self.cfg.landing_anchor_size_ema_alpha), 0.0, 1.0)
++            )
++            alpha_shrink = float(
++                np.clip(min(0.15, self.cfg.landing_anchor_size_ema_alpha), 0.0, 1.0)
++            )
++            size_alpha = np.where(growth, alpha_grow, alpha_shrink)
++            full_size = size_alpha * candidate_size + (1.0 - size_alpha) * full_size_prev
++            full_size = np.maximum(full_size, visible_size)
++
++            u = float(np.clip(self.cfg.landing_anchor_u, 0.0, 1.0))
++            v = float(np.clip(self.cfg.landing_anchor_v, 0.0, 1.0))
++            previous_anchor = (
++                None
++                if self._landing_anchor_px is None
++                else np.asarray(self._landing_anchor_px, dtype=np.float64)
++            )
++            previous_full_center = (
++                control_center
++                if previous_anchor is None
++                else previous_anchor
++                - np.asarray([(u - 0.5) * full_size[0], (v - 0.5) * full_size[1]])
++            )
++
++            if left and not right:
++                full_cx = float(visible[2]) - 0.5 * float(full_size[0])
++            elif right and not left:
++                full_cx = float(visible[0]) + 0.5 * float(full_size[0])
++            elif not left and not right:
++                full_cx = float(control_center[0])
++            else:
++                full_cx = float(previous_full_center[0])
++
++            if top and not bottom:
++                full_cy = float(visible[3]) - 0.5 * float(full_size[1])
++            elif bottom and not top:
++                full_cy = float(visible[1]) + 0.5 * float(full_size[1])
++            elif not top and not bottom:
++                full_cy = float(control_center[1])
++            else:
++                full_cy = float(previous_full_center[1])
++
++            full_center = np.asarray([full_cx, full_cy], dtype=np.float64)
++            mode = f"EDGE_RECON_{edge_flags}"
++
++        self._landing_anchor_aspect_ratio = float(aspect)
++        self._landing_anchor_full_size_px = np.asarray(full_size, dtype=np.float32)
++        self._landing_anchor_edge_flags = edge_flags
++
++        u = float(np.clip(self.cfg.landing_anchor_u, 0.0, 1.0))
++        v = float(np.clip(self.cfg.landing_anchor_v, 0.0, 1.0))
++        measured_anchor = np.asarray(
++            [
++                float(full_center[0]) + (u - 0.5) * float(full_size[0]),
++                float(full_center[1]) + (v - 0.5) * float(full_size[1]),
++            ],
++            dtype=np.float64,
++        )
++        alpha = float(
++            np.clip(
++                self.cfg.landing_anchor_edge_center_alpha
++                if edge_clipped
++                else self.cfg.landing_anchor_center_alpha,
++                0.0,
++                1.0,
++            )
++        )
++        if self._landing_anchor_px is None:
++            anchor = measured_anchor
++        else:
++            anchor = (
++                alpha * measured_anchor
++                + (1.0 - alpha)
++                * np.asarray(self._landing_anchor_px, dtype=np.float64)
++            )
++
++        outside = max(0.0, float(self.cfg.landing_anchor_max_outside_frame_ratio))
++        anchor[0] = float(np.clip(anchor[0], -outside * w, (1.0 + outside) * w))
++        anchor[1] = float(np.clip(anchor[1], -outside * h, (1.0 + outside) * h))
++        virtual_center = anchor - np.asarray(
++            [(u - 0.5) * full_size[0], (v - 0.5) * full_size[1]],
++            dtype=np.float64,
++        )
++        virtual_bbox = np.asarray(
++            [
++                virtual_center[0] - 0.5 * full_size[0],
++                virtual_center[1] - 0.5 * full_size[1],
++                virtual_center[0] + 0.5 * full_size[0],
++                virtual_center[1] + 0.5 * full_size[1],
++            ],
++            dtype=np.float32,
++        )
++
++        self._landing_anchor_px = anchor.astype(np.float32)
++        self._landing_anchor_virtual_bbox_xyxy = virtual_bbox.copy()
++        self._landing_anchor_mode = mode
++        return self._landing_anchor_px.copy(), virtual_bbox.copy()
++
++    def _landing_anchor_metrics(
++        self,
++        *,
++        anchor_px: Optional[np.ndarray],
++        virtual_bbox_xyxy: Optional[np.ndarray],
++        visible_bbox_xyxy: Optional[np.ndarray],
++        frame_shape: tuple[int, ...],
++    ) -> dict[str, float]:
++        """Compute controller geometry from the semantic anchor."""
++        if anchor_px is None or virtual_bbox_xyxy is None:
++            return self._bbox_metrics(visible_bbox_xyxy, frame_shape)
++        h, w = frame_shape[:2]
++        anchor = np.asarray(anchor_px, dtype=np.float64).reshape(-1)
++        virtual = np.asarray(virtual_bbox_xyxy, dtype=np.float64).reshape(-1)
++        if anchor.size < 2 or virtual.size < 4 or not np.all(np.isfinite(anchor[:2])):
++            return self._bbox_metrics(visible_bbox_xyxy, frame_shape)
++        full_w = max(2.0, float(virtual[2] - virtual[0]))
++        full_h = max(2.0, float(virtual[3] - virtual[1]))
++        err_x = (float(anchor[0]) - 0.5 * w) / max(1.0, 0.5 * w)
++        err_y = (float(anchor[1]) - 0.5 * h) / max(1.0, 0.5 * h)
++        rel_x = abs(err_x) / max(1.0e-6, full_w / max(1.0, w))
++        rel_y = abs(err_y) / max(1.0e-6, full_h / max(1.0, h))
++        visible_metrics = self._bbox_metrics(visible_bbox_xyxy, frame_shape)
++        return {
++            "err_x": float(err_x),
++            "err_y": float(err_y),
++            "center_error": float(math.hypot(err_x, err_y)),
++            "bbox_rel_error": float(max(rel_x, rel_y)),
++            # Preserve the existing visual-scale speed schedule. Only the center
++            # reference changes; target area still comes from the visible bbox.
++            "area_norm": float(visible_metrics["area_norm"]),
++        }
++
+     @staticmethod
+     def _bbox_metrics(bbox_xyxy: Optional[np.ndarray], frame_shape: tuple[int, ...]) -> dict[str, float]:
+         if bbox_xyxy is None:
+@@ -2858,7 +3192,6 @@
+             live_match=live_match,
+             frame_shape=frame.shape,
+         )
+-        metrics = self._bbox_metrics(bbox_xyxy, frame.shape)
+         self._last_bottom_observation_monotonic = float(time.monotonic())
+ 
+         # The moving platform may change world Z on uneven roads. Refresh its
+@@ -2868,6 +3201,21 @@
+             self._read_target_surface_altitude()
+ 
+         drone_state, relative_height, api_state = self._get_api_state()
++        landing_anchor_px, virtual_target_bbox_xyxy = (
++            self._update_landing_anchor_geometry(
++                raw_bbox_xyxy=raw_bbox_xyxy,
++                control_bbox_xyxy=bbox_xyxy,
++                frame_shape=frame.shape,
++                live_match=live_match,
++                relative_height_m=relative_height,
++            )
++        )
++        metrics = self._landing_anchor_metrics(
++            anchor_px=landing_anchor_px,
++            virtual_bbox_xyxy=virtual_target_bbox_xyxy,
++            visible_bbox_xyxy=bbox_xyxy,
++            frame_shape=frame.shape,
++        )
+         self._update_visual_target_motion(
+             frame=frame,
+             bbox_xyxy=bbox_xyxy,
+@@ -2893,9 +3241,14 @@
+         if bbox_xyxy is not None:
+             x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+             conf = float(similarity if tracker_mode == "MATCH" else 0.25)
++            obs_cx = 0.5 * (x1 + x2)
++            obs_cy = 0.5 * (y1 + y2)
++            if landing_anchor_px is not None:
++                obs_cx = float(landing_anchor_px[0])
++                obs_cy = float(landing_anchor_px[1])
+             bbox = BBox(
+-                cx=0.5 * (x1 + x2),
+-                cy=0.5 * (y1 + y2),
++                cx=obs_cx,
++                cy=obs_cy,
+                 w=max(1.0, x2 - x1),
+                 h=max(1.0, y2 - y1),
+                 conf=conf,
+@@ -2997,6 +3350,22 @@
+                 if bbox_xyxy is None
+                 else [float(v) for v in np.asarray(bbox_xyxy).reshape(-1)[:4]]
+             ),
++            "bottom_landing_anchor_enabled": bool(self.cfg.landing_anchor_enabled),
++            "bottom_landing_anchor_mode": str(self._landing_anchor_mode),
++            "bottom_landing_anchor_edge_flags": str(self._landing_anchor_edge_flags),
++            "bottom_landing_anchor_px": (
++                None
++                if landing_anchor_px is None
++                else [float(v) for v in np.asarray(landing_anchor_px).reshape(-1)[:2]]
++            ),
++            "bottom_virtual_target_bbox_xyxy": (
++                None
++                if virtual_target_bbox_xyxy is None
++                else [
++                    float(v)
++                    for v in np.asarray(virtual_target_bbox_xyxy).reshape(-1)[:4]
++                ]
++            ),
+             "bottom_err_x": metrics["err_x"],
+             "bottom_err_y": metrics["err_y"],
+             "bottom_center_error": metrics["center_error"],
+@@ -3136,10 +3505,34 @@
+                 x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
+                 color = (0, 255, 0) if match_confirmed else (0, 255, 255)
+                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
++            if landing_anchor_px is not None:
++                anchor_x = int(round(float(landing_anchor_px[0])))
++                anchor_y = int(round(float(landing_anchor_px[1])))
++                if 0 <= anchor_x < w and 0 <= anchor_y < h:
++                    cv2.drawMarker(
++                        vis,
++                        (anchor_x, anchor_y),
++                        (255, 0, 255),
++                        cv2.MARKER_CROSS,
++                        34,
++                        3,
++                    )
++                else:
++                    edge_x = int(np.clip(anchor_x, 0, max(0, w - 1)))
++                    edge_y = int(np.clip(anchor_y, 0, max(0, h - 1)))
++                    cv2.drawMarker(
++                        vis,
++                        (edge_x, edge_y),
++                        (255, 0, 255),
++                        cv2.MARKER_TILTED_CROSS,
++                        30,
++                        3,
++                    )
+             cv2.putText(
+                 vis,
+                 f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f} "
+-                f"bboxFilter={self._control_bbox_filter_mode}",
++                f"bboxFilter={self._control_bbox_filter_mode} "
++                f"anchor={self._landing_anchor_mode}",
+                 (15, 28),
+                 cv2.FONT_HERSHEY_SIMPLEX,
+                 0.65,
+--- /dev/null	2026-07-19 11:47:16.064033255 +0000
++++ landing_anchor_work/RL_training/test_agent2_landing_anchor.py	2026-07-19 19:58:47.005254473 +0000
+@@ -0,0 +1,232 @@
++"""Focused regression tests for stable full-target landing-anchor geometry."""
++from __future__ import annotations
++
++import numpy as np
++
++from test_agent2_reward_controller_progress_fix import Agent2Config, Agent2LandingEnv
++
++
++def _env() -> Agent2LandingEnv:
++    env = Agent2LandingEnv.__new__(Agent2LandingEnv)
++    env.cfg = Agent2Config(show_camera=False)
++    env._landing_anchor_px = None
++    env._landing_anchor_virtual_bbox_xyxy = None
++    env._landing_anchor_full_size_px = None
++    env._landing_anchor_aspect_ratio = None
++    env._landing_anchor_reference_size_px = None
++    env._landing_anchor_reference_height_m = None
++    env._landing_anchor_mode = "INIT"
++    env._landing_anchor_edge_flags = "NONE"
++    return env
++
++
++def _center(box: np.ndarray) -> np.ndarray:
++    box = np.asarray(box, dtype=np.float64)
++    return np.asarray([0.5 * (box[0] + box[2]), 0.5 * (box[1] + box[3])])
++
++
++def test_full_target_anchor_equals_full_bbox_center() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    full = np.asarray([500.0, 200.0, 700.0, 800.0], dtype=np.float32)
++    anchor, virtual = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=full,
++        control_bbox_xyxy=full,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++    assert anchor is not None and virtual is not None
++    assert np.allclose(anchor, _center(full), atol=1.0)
++    assert np.allclose(virtual, full, atol=1.0)
++    assert env._landing_anchor_mode == "TRACK_FULL"
++
++
++def test_top_edge_crop_reconstructs_hidden_vehicle_center() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    full = np.asarray([500.0, 200.0, 700.0, 800.0], dtype=np.float32)
++    env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=full,
++        control_bbox_xyxy=full,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++
++    # At lower altitude the car is larger and its front half has crossed the top
++    # edge. The visible crop center is y=175, but the full-car center is above it.
++    edge = np.asarray([450.0, 0.0, 750.0, 350.0], dtype=np.float32)
++    anchor, virtual = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=edge,
++        control_bbox_xyxy=edge,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=1.8,
++    )
++    assert anchor is not None and virtual is not None
++    visible_center_y = float(_center(edge)[1])
++    assert float(anchor[1]) < visible_center_y - 120.0, (anchor, edge, virtual)
++    assert float(virtual[1]) < 0.0
++    assert env._landing_anchor_mode == "EDGE_RECON_T"
++    assert env._landing_anchor_edge_flags == "T"
++
++
++def test_controller_metrics_use_anchor_not_visible_crop_center() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    full = np.asarray([500.0, 200.0, 700.0, 800.0], dtype=np.float32)
++    env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=full,
++        control_bbox_xyxy=full,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++    edge = np.asarray([450.0, 0.0, 750.0, 350.0], dtype=np.float32)
++    anchor, virtual = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=edge,
++        control_bbox_xyxy=edge,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=1.8,
++    )
++    anchor_metrics = env._landing_anchor_metrics(
++        anchor_px=anchor,
++        virtual_bbox_xyxy=virtual,
++        visible_bbox_xyxy=edge,
++        frame_shape=shape,
++    )
++    visible_metrics = env._bbox_metrics(edge, shape)
++    assert anchor_metrics["err_y"] < visible_metrics["err_y"] - 0.35
++    # Existing visible-area speed scheduling is intentionally preserved.
++    assert abs(anchor_metrics["area_norm"] - visible_metrics["area_norm"]) < 1.0e-9
++
++
++def test_pred_gap_holds_last_semantic_anchor() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    full = np.asarray([500.0, 200.0, 700.0, 800.0], dtype=np.float32)
++    anchor0, virtual0 = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=full,
++        control_bbox_xyxy=full,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++    anchor1, virtual1 = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=None,
++        control_bbox_xyxy=full,
++        frame_shape=shape,
++        live_match=False,
++        relative_height_m=3.0,
++    )
++    assert np.allclose(anchor1, anchor0)
++    assert np.allclose(virtual1, virtual0)
++    assert env._landing_anchor_mode == "HOLD_PRED"
++
++
++def test_non_edge_anchor_follows_verified_motion_without_bbox_center_freeze() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    first = np.asarray([500.0, 200.0, 700.0, 800.0], dtype=np.float32)
++    anchor0, _ = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=first,
++        control_bbox_xyxy=first,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++    moved = first + np.asarray([20.0, -30.0, 20.0, -30.0], dtype=np.float32)
++    anchor1, _ = env._update_landing_anchor_geometry(
++        raw_bbox_xyxy=moved,
++        control_bbox_xyxy=moved,
++        frame_shape=shape,
++        live_match=True,
++        relative_height_m=3.0,
++    )
++    applied = np.asarray(anchor1) - np.asarray(anchor0)
++    assert applied[0] >= 17.0
++    assert applied[1] <= -25.0
++
++
++
++def test_edge_crossing_tracks_true_full_center_continuously() -> None:
++    env = _env()
++    shape = (1000, 1400, 3)
++    errors = []
++    anchor_values = []
++    for true_cy in (600.0, 500.0, 400.0, 300.0, 200.0, 100.0, 0.0, -100.0):
++        full = np.asarray(
++            [500.0, true_cy - 300.0, 700.0, true_cy + 300.0],
++            dtype=np.float32,
++        )
++        visible = full.copy()
++        visible[0] = max(0.0, visible[0])
++        visible[1] = max(0.0, visible[1])
++        visible[2] = min(float(shape[1]), visible[2])
++        visible[3] = min(float(shape[0]), visible[3])
++        anchor, _ = env._update_landing_anchor_geometry(
++            raw_bbox_xyxy=visible,
++            control_bbox_xyxy=visible,
++            frame_shape=shape,
++            live_match=True,
++            relative_height_m=2.0,
++        )
++        anchor_values.append(float(anchor[1]))
++        errors.append(abs(float(anchor[1]) - true_cy))
++
++    assert max(errors) < 15.0, (errors, anchor_values)
++    assert all(
++        later < earlier
++        for earlier, later in zip(anchor_values, anchor_values[1:])
++    )
++
++def test_parallel_snapshot_exports_semantic_anchor() -> None:
++    env = _env()
++    env._last_info = {
++        "bottom_match_live": True,
++        "bottom_match_recent": True,
++        "bottom_match_confirmed": True,
++        "bottom_similarity": 0.95,
++        "bottom_landing_anchor_px": [620.0, -25.0],
++        "bottom_landing_anchor_mode": "EDGE_RECON_T",
++        "bottom_err_x": -0.1,
++        "bottom_err_y": -1.05,
++    }
++    env._control_bbox_xyxy = np.asarray([450.0, 0.0, 750.0, 350.0], dtype=np.float32)
++    env._last_bbox_xyxy = env._control_bbox_xyxy.copy()
++    env._last_bottom_frame = None
++    env._last_bottom_observation_monotonic = 1.0
++    snapshot = env.get_parallel_bottom_perception_snapshot()
++    assert snapshot["landing_anchor_mode"] == "EDGE_RECON_T"
++    assert np.allclose(snapshot["landing_anchor_px"], [620.0, -25.0])
++    assert snapshot["err_y"] < -1.0
++
++
++def test_shared_debug_frame_marks_anchor_without_mutating_raw_frame() -> None:
++    env = _env()
++    raw_frame = np.zeros((120, 160, 3), dtype=np.uint8)
++    env._last_bottom_frame = raw_frame
++    env._last_bottom_observation_monotonic = 1.0
++    env._control_bbox_xyxy = np.asarray([40.0, 20.0, 120.0, 100.0], dtype=np.float32)
++    env._last_bbox_xyxy = env._control_bbox_xyxy.copy()
++    env._last_info = {
++        "bottom_match_live": True,
++        "bottom_match_recent": True,
++        "bottom_match_confirmed": True,
++        "bottom_similarity": 0.95,
++        "bottom_landing_anchor_px": [80.0, 60.0],
++        "bottom_landing_anchor_mode": "TRACK_FULL",
++    }
++    snapshot = env.get_parallel_bottom_perception_snapshot()
++    assert snapshot["frame_bgr"] is not raw_frame
++    assert np.count_nonzero(snapshot["frame_bgr"]) > 0
++    assert np.count_nonzero(raw_frame) == 0
++
++
++if __name__ == "__main__":
++    tests = [name for name in globals() if name.startswith("test_")]
++    for name in tests:
++        globals()[name]()
++    print(f"PASS: {len(tests)} landing-anchor tests")

@@ -66,6 +66,7 @@ class EnvConfig:
     command_bridge_lost_max_speed_mps: float = 0.45
     command_bridge_bottom_max_speed_mps: float = 0.70
     command_bridge_landing_max_speed_mps: float = 0.38
+    command_bridge_landing_catchup_max_speed_mps: float = 0.70
     command_bridge_velocity_ema_alpha: float = 0.65
     command_bridge_min_speed_mps: float = 0.03
     command_bridge_attitude_soft_limit_deg: float = 10.0
@@ -75,16 +76,12 @@ class EnvConfig:
     # 0.10 s pulse is not immediately cancelled by the XY bridge.
     command_bridge_zero_vertical_velocity: bool = True
     command_bridge_parallel_vertical_enabled: bool = True
-    command_bridge_parallel_vertical_max_mps: float = 0.35
+    command_bridge_parallel_vertical_max_mps: float = 0.40
     command_bridge_parallel_vertical_min_mps: float = 1.0e-4
     # Physical down-LiDAR safety is applied after Agent-2 Z ownership. When the
     # safety filter requests a near-ground descent limit, cap both the pulse and
     # its bridge to this conservative NED-Z speed.
-    parallel_vertical_near_ground_max_mps: float = 0.12
-    # Physical down-LiDAR safety is applied after Agent-2 Z ownership. When the
-    # safety filter requests a near-ground descent limit, cap both the pulse and
-    # its bridge to this conservative NED-Z speed.
-    parallel_vertical_near_ground_max_mps: float = 0.12
+    parallel_vertical_near_ground_max_mps: float = 0.18
     command_bridge_zero_yaw_rate: bool = True
 
     # -----------------------------

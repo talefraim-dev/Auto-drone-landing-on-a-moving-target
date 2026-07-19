@@ -96,6 +96,36 @@ def _train_agent2(mode: str) -> None:
         cfg.catchup_descent_max_metric_outward_speed_mps = float(
             flow.PARALLEL_CATCHUP_DESCENT_MAX_METRIC_OUTWARD_SPEED_MPS
         )
+        cfg.dense_reward_enabled = bool(flow.AGENT2_DENSE_REWARD_ENABLED)
+        cfg.dense_reward_alignment_center_error = float(
+            flow.AGENT2_DENSE_REWARD_ALIGNMENT_CENTER_ERROR
+        )
+        cfg.dense_reward_descent_progress_per_m = float(
+            flow.AGENT2_DENSE_REWARD_DESCENT_PROGRESS_PER_M
+        )
+        cfg.dense_reward_near_touch_height_m = float(
+            flow.AGENT2_DENSE_REWARD_NEAR_TOUCH_HEIGHT_M
+        )
+        cfg.dense_reward_near_touch_multiplier = float(
+            flow.AGENT2_DENSE_REWARD_NEAR_TOUCH_MULTIPLIER
+        )
+        cfg.dense_reward_max_progress_m_per_step = float(
+            flow.AGENT2_DENSE_REWARD_MAX_PROGRESS_M_PER_STEP
+        )
+        cfg.dense_reward_landing_lock_time_penalty = float(
+            flow.AGENT2_DENSE_REWARD_LANDING_LOCK_TIME_PENALTY
+        )
+        cfg.dense_reward_hesitation_penalty = float(
+            flow.AGENT2_DENSE_REWARD_HESITATION_PENALTY
+        )
+        cfg.dense_reward_min_descent_action_when_aligned = float(
+            flow.AGENT2_DENSE_REWARD_MIN_DESCENT_ACTION_WHEN_ALIGNED
+        )
+        cfg.dense_reward_unsafe_descent_penalty = float(
+            flow.AGENT2_DENSE_REWARD_UNSAFE_DESCENT_PENALTY
+        )
+        cfg.timeout_penalty = float(flow.AGENT2_TIMEOUT_PENALTY)
+        cfg.target_lost_penalty = float(flow.AGENT2_TARGET_LOST_PENALTY)
         cfg.predictive_metric_kp_position_per_s = float(
             flow.PARALLEL_BOTTOM_METRIC_KP
         )
@@ -148,6 +178,15 @@ def _train_agent2(mode: str) -> None:
             ),
             bottom_pd_correction_gain=float(
                 flow.PARALLEL_BOTTOM_PD_CORRECTION_GAIN
+            ),
+            landing_bridge_max_speed_mps=float(
+                flow.PARALLEL_LANDING_BRIDGE_MAX_SPEED_MPS
+            ),
+            landing_catchup_bridge_max_speed_mps=float(
+                flow.PARALLEL_LANDING_CATCHUP_BRIDGE_MAX_SPEED_MPS
+            ),
+            near_ground_descent_max_mps=float(
+                flow.PARALLEL_NEAR_GROUND_DESCENT_MAX_MPS
             ),
         )
     else:
@@ -233,7 +272,10 @@ def _train_agent2(mode: str) -> None:
     print("[FLOW] Appearance bank   : immutable identity + bounded adaptive landing views")
     print("[FLOW] Touchdown gate   : bad LIVE centering cannot use appearance fallback")
     print("[FLOW] Recovery cycles  : removed")
-    print("[FLOW] Reward           : landing-only, collision-gated")
+    print(
+        "[FLOW] Reward           : aligned Z progress + anti-hover shaping; "
+        "collision-gated terminal bonus/penalty"
+    )
     print("=" * 92)
 
     try:

@@ -197,20 +197,20 @@ def main() -> None:
     assert len(env._reference_embeddings) == 2
     print("PASS: float32 handoff bbox becomes integer ResNet crop coordinates.")
 
-    # Verify protected trackers/config remain unchanged and the authorized DroneEnv fix is present.
+    # Verify the authorized VRAM guard and protected runtime/config hashes.
     expected = {
-        "drone_env.py": "82f4bc21fadc96de1ad3e2a4cb75ff752bc9f7269b14c2fd776082941236115d",
-        "object_tracker.py": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
-        "resnet_yolo_tracker.py": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
+        "drone_env.py": "3aeb74111db5494cd99834294bf545d3869f4c901360a33cb8fa7297e0d15d94",
+        "object_tracker.py": "46151e360d825a4fea9c8f015829e0028d5e020eb3e13f9b94cf773ec232e28f",
+        "resnet_yolo_tracker.py": "fe5ebf4eb1eedbf2ce32cde568c2e318a270b5770e636087563339f9d43b5407",
         "config/tracking_config.py": "a3282379e9b83f4aa4b3f265a4a85b5f8a266b6c34b1c4730a4d07cec3c26b5a",
-        "Run_train.py": "a766c20e091bfc573c64f865f9ab8cf55cfa055cfcc6ad28fbd0560f5c96b823",
+        "Run_train.py": "559ca133d5cb35feb655b3f599dd50dc41db5407cc9ca72468c38aa5cb2d652c",
     }
     import hashlib
 
     for rel, wanted in expected.items():
         got = hashlib.sha256(Path(rel).read_bytes()).hexdigest()
         assert got == wanted, f"Agent-1 baseline changed: {rel}: {got} != {wanted}"
-    print("PASS: protected runtime hashes and authorized DroneEnv hash match this package.")
+    print("PASS: authorized VRAM guard and protected runtime hashes match this package.")
 
 
 if __name__ == "__main__":

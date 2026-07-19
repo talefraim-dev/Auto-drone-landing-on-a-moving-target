@@ -17,7 +17,8 @@ Expected input:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import threading
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -42,6 +43,34 @@ except Exception as exc:
     _TORCHVISION_IMPORT_ERROR = exc
 else:
     _TORCHVISION_IMPORT_ERROR = None
+
+
+
+
+# All trackers use the same frozen ImageNet ResNet18. Sharing this stateless
+# feature extractor avoids allocating an identical CUDA model for the front,
+# bottom and Agent-2 trackers. The cache is process-local and guarded because
+# environment construction may evolve to use worker threads later.
+_SHARED_RESNET_MODELS: Dict[str, torch.nn.Module] = {}
+_SHARED_RESNET_LOCK = threading.Lock()
+_CUDA_REID_DISABLED_AFTER_OOM = False
+_CUDA_YOLO_DISABLED_AFTER_OOM = False
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "out of memory" in text
+        or "cudaerrormemoryallocation" in text
+        or "cuda error: out of memory" in text
+    )
+
+
+def _canonical_device_name(device: str) -> str:
+    try:
+        return str(torch.device(device))
+    except Exception:
+        return str(device)
 
 
 BBox = List[int]  # [x, y, w, h]
@@ -123,7 +152,10 @@ class YoloResNetTracker:
         if torchvision is None or transforms is None:
             raise ImportError(f"Could not import torchvision: {_TORCHVISION_IMPORT_ERROR}")
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        requested_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = _canonical_device_name(requested_device)
+        self.detector_device = self.device
+        self._detector_cpu_fallback_used = False
         self.verbose = verbose
         self.yolo = YOLO(yolo_model_path)
         self.yolo_conf = float(yolo_conf)
@@ -150,7 +182,8 @@ class YoloResNetTracker:
         if self.verbose:
             print(f"[YOLO+RESNET] device={self.device}, yolo_model={yolo_model_path}")
 
-    def _build_resnet_feature_extractor(self) -> torch.nn.Module:
+    @staticmethod
+    def _new_resnet18() -> torch.nn.Module:
         try:
             weights = torchvision.models.ResNet18_Weights.DEFAULT
             model = torchvision.models.resnet18(weights=weights)
@@ -162,10 +195,66 @@ class YoloResNetTracker:
                 print("[WARN] Falling back to random weights. Tracking quality will be poor.")
                 model = torchvision.models.resnet18(weights=None)
         model.fc = torch.nn.Identity()
-        model.eval().to(self.device)
-        for p in model.parameters():
-            p.requires_grad = False
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad = False
         return model
+
+    def _build_resnet_feature_extractor(self) -> torch.nn.Module:
+        global _CUDA_REID_DISABLED_AFTER_OOM
+
+        requested = _canonical_device_name(self.device)
+
+        with _SHARED_RESNET_LOCK:
+            if requested.startswith("cuda") and _CUDA_REID_DISABLED_AFTER_OOM:
+                self.device = "cpu"
+                cached_cpu = _SHARED_RESNET_MODELS.get("cpu")
+                if cached_cpu is not None:
+                    return cached_cpu
+                model = self._new_resnet18().to("cpu")
+                _SHARED_RESNET_MODELS["cpu"] = model
+                return model
+
+            cached = _SHARED_RESNET_MODELS.get(requested)
+            if cached is not None:
+                return cached
+
+            model = self._new_resnet18()
+            actual = requested
+            try:
+                model = model.to(requested)
+            except Exception as exc:
+                if not requested.startswith("cuda") or not _is_cuda_oom(exc):
+                    raise
+
+                # Unreal Engine can consume most laptop VRAM. A ReID CUDA OOM
+                # must not abort the whole flight: keep control logic untouched
+                # and move only the frozen embedding extractor to CPU.
+                _CUDA_REID_DISABLED_AFTER_OOM = True
+                self.device = "cpu"
+                actual = "cpu"
+                del model
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+                cached_cpu = _SHARED_RESNET_MODELS.get(actual)
+                if cached_cpu is not None:
+                    print(
+                        "[VRAM GUARD] CUDA OOM while loading ResNet18; "
+                        "reusing shared CPU ReID extractor."
+                    )
+                    return cached_cpu
+
+                model = self._new_resnet18().to(actual)
+                print(
+                    "[VRAM GUARD] CUDA OOM while loading ResNet18; "
+                    "using shared CPU ReID extractor. Flight control is unchanged."
+                )
+
+            _SHARED_RESNET_MODELS[actual] = model
+            return model
 
     def _build_preprocess(self):
         return transforms.Compose([
@@ -191,8 +280,47 @@ class YoloResNetTracker:
         return self._embedding_from_crop(crop)
 
     def _detect_candidates(self, frame_bgr: np.ndarray) -> List[Candidate]:
+        global _CUDA_YOLO_DISABLED_AFTER_OOM
+
         h_img, w_img = frame_bgr.shape[:2]
-        results = self.yolo.predict(frame_bgr, conf=self.yolo_conf, verbose=False)
+        if str(self.detector_device).startswith("cuda") and _CUDA_YOLO_DISABLED_AFTER_OOM:
+            self.detector_device = "cpu"
+            self._detector_cpu_fallback_used = True
+
+        try:
+            results = self.yolo.predict(
+                frame_bgr,
+                conf=self.yolo_conf,
+                verbose=False,
+                device=self.detector_device,
+            )
+        except Exception as exc:
+            if (
+                self._detector_cpu_fallback_used
+                or not str(self.detector_device).startswith("cuda")
+                or not _is_cuda_oom(exc)
+            ):
+                raise
+
+            # Retry once on CPU if the first YOLO CUDA allocation cannot fit
+            # beside Unreal. Other trackers then avoid repeating the same OOM.
+            _CUDA_YOLO_DISABLED_AFTER_OOM = True
+            self._detector_cpu_fallback_used = True
+            self.detector_device = "cpu"
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            print(
+                "[VRAM GUARD] CUDA OOM during YOLO inference; "
+                "retrying visual detection on CPU."
+            )
+            results = self.yolo.predict(
+                frame_bgr,
+                conf=self.yolo_conf,
+                verbose=False,
+                device="cpu",
+            )
         candidates: List[Candidate] = []
         if not results:
             return candidates

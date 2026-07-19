@@ -443,6 +443,7 @@ class DroneEnv(gym.Env):
         self._parallel_horizontal_speed_limit_mps = 6.0
         self._parallel_bottom_guidance_active = False
         self._parallel_bottom_measurement_live = False
+        self._parallel_bottom_predictive_catchup = False
         self._parallel_reacquire_climb_active = False
         self._last_parallel_feedforward_vx_mps = 0.0
         self._last_parallel_feedforward_vy_mps = 0.0
@@ -496,6 +497,7 @@ class DroneEnv(gym.Env):
             self._parallel_agent1_xy_weight = 1.0
             self._parallel_bottom_guidance_active = False
             self._parallel_bottom_measurement_live = False
+            self._parallel_bottom_predictive_catchup = False
             self._parallel_reacquire_climb_active = False
             self._parallel_fused_prev_vx_mps = 0.0
             self._parallel_fused_prev_vy_mps = 0.0
@@ -605,6 +607,24 @@ class DroneEnv(gym.Env):
     def _command_bridge_speed_limit(self, tracking_mode: str) -> float:
         stage = str(getattr(self, "_speed_stage", "CHASE_FAST") or "CHASE_FAST")
         if stage == "BOTTOM_LANDING_READY":
+            # Landing-ready normally keeps the measured-velocity bridge gentle.
+            # If the verified LIVE bottom controller is still in predictive
+            # catch-up, however, 0.38 m/s can be lower than the platform speed
+            # itself and lets the target escape. Temporarily retain the same
+            # bounded bridge authority used by BOTTOM_VELOCITY_MATCH, then
+            # return automatically to the strict landing cap when catch-up ends.
+            live_catchup = bool(
+                getattr(self, "_parallel_bottom_measurement_live", False)
+                and getattr(self, "_parallel_bottom_predictive_catchup", False)
+            )
+            if live_catchup:
+                return float(
+                    getattr(
+                        self.cfg,
+                        "command_bridge_landing_catchup_max_speed_mps",
+                        0.70,
+                    )
+                )
             return float(
                 getattr(self.cfg, "command_bridge_landing_max_speed_mps", 0.38)
             )
@@ -678,7 +698,7 @@ class DroneEnv(gym.Env):
         maximum = max(
             0.0,
             float(
-                getattr(self.cfg, "command_bridge_parallel_vertical_max_mps", 0.35)
+                getattr(self.cfg, "command_bridge_parallel_vertical_max_mps", 0.40)
             ),
         )
         return float(np.clip(requested, 0.0, maximum))
@@ -881,7 +901,7 @@ class DroneEnv(gym.Env):
                         getattr(
                             self.cfg,
                             "parallel_vertical_near_ground_max_mps",
-                            0.12,
+                            0.18,
                         )
                     ),
                 ),
@@ -900,6 +920,7 @@ class DroneEnv(gym.Env):
         horizontal_speed_limit_mps: float = 6.0,
         bottom_guidance_active: bool = False,
         bottom_measurement_live: bool = False,
+        bottom_predictive_catchup: bool = False,
         reacquire_climb_active: bool = False,
     ) -> None:
         """Set the components used by the single parallel command mixer.
@@ -926,6 +947,9 @@ class DroneEnv(gym.Env):
         )
         self._parallel_bottom_guidance_active = bool(bottom_guidance_active)
         self._parallel_bottom_measurement_live = bool(bottom_measurement_live)
+        self._parallel_bottom_predictive_catchup = bool(
+            bottom_predictive_catchup
+        )
         self._parallel_reacquire_climb_active = bool(reacquire_climb_active)
 
     @staticmethod
@@ -5499,6 +5523,7 @@ class DroneEnv(gym.Env):
             "parallel_z_limited_by_safety": bool(getattr(self, "_last_parallel_z_limited_by_safety", False)),
             "parallel_bottom_guidance_active": bool(getattr(self, "_parallel_bottom_guidance_active", False)),
             "parallel_bottom_measurement_live": bool(getattr(self, "_parallel_bottom_measurement_live", False)),
+            "parallel_bottom_predictive_catchup": bool(getattr(self, "_parallel_bottom_predictive_catchup", False)),
             "parallel_reacquire_climb_active": bool(getattr(self, "_parallel_reacquire_climb_active", False)),
             "reward_parts": reward_parts,
             "pitch_deg": float(getattr(self, "_last_pitch_deg", 0.0)),

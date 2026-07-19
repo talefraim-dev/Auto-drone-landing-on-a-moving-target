@@ -115,15 +115,16 @@ def _cfg():
         command_bridge_lost_max_speed_mps=0.45,
         command_bridge_bottom_max_speed_mps=0.70,
         command_bridge_landing_max_speed_mps=0.38,
+        command_bridge_landing_catchup_max_speed_mps=0.70,
         command_bridge_velocity_ema_alpha=0.65,
         command_bridge_min_speed_mps=0.03,
         command_bridge_attitude_soft_limit_deg=10.0,
         command_bridge_attitude_hard_limit_deg=16.0,
         command_bridge_zero_vertical_velocity=True,
         command_bridge_parallel_vertical_enabled=True,
-        command_bridge_parallel_vertical_max_mps=0.35,
+        command_bridge_parallel_vertical_max_mps=0.40,
         command_bridge_parallel_vertical_min_mps=1.0e-4,
-        parallel_vertical_near_ground_max_mps=0.12,
+        parallel_vertical_near_ground_max_mps=0.18,
         command_bridge_zero_yaw_rate=True,
         parallel_share_agent2_bottom_perception=True,
         parallel_bottom_snapshot_stale_after_s=4.00,
@@ -147,7 +148,7 @@ def main() -> None:
     safe_vz, blocked, limited = env._apply_parallel_vertical_safety(
         0.80, ["landing_down_proximity_limit_descent"], hard_safety=False
     )
-    assert abs(safe_vz - 0.12) < 1.0e-9 and not blocked and limited
+    assert abs(safe_vz - 0.18) < 1.0e-9 and not blocked and limited
     safe_vz, blocked, limited = env._apply_parallel_vertical_safety(
         0.80, ["down_obstacle_warning_block_descent"], hard_safety=False
     )
@@ -179,6 +180,8 @@ def main() -> None:
     print("PASS bridge holds achieved velocity, never the raw 5.8 m/s pulse")
 
     env._speed_stage = "BOTTOM_LANDING_READY"
+    env._parallel_bottom_measurement_live = True
+    env._parallel_bottom_predictive_catchup = False
     env.client.state.kinematics_estimated.linear_velocity.x_val = 0.9
     env._issue_command_bridge(
         requested_vx_mps=5.80,
@@ -189,7 +192,20 @@ def main() -> None:
     )
     command = env.client.commands[-1]
     assert abs(command["vx"]) <= 0.38 + 1.0e-6, command
-    print("PASS landing-stage bridge has a 0.38 m/s XY cap")
+    print("PASS aligned landing-stage bridge keeps the strict 0.38 m/s XY cap")
+
+    env._parallel_bottom_predictive_catchup = True
+    env.client = _Client(body_vx=0.9, body_vy=0.0)
+    env._issue_command_bridge(
+        requested_vx_mps=1.20,
+        requested_vy_mps=0.0,
+        tracking_mode="MATCH",
+        safety_info={"safety_reasons": []},
+        control_period_s=1.0,
+    )
+    command = env.client.commands[-1]
+    assert 0.38 < abs(command["vx"]) <= 0.70 + 1.0e-6, command
+    print("PASS landing-ready LIVE catch-up temporarily restores the 0.70 m/s bridge cap")
 
     env.client = _Client(body_vx=0.5, pitch_deg=18.0)
     command_count_before = len(env.client.commands)
@@ -218,12 +234,12 @@ def main() -> None:
     )
     command = env.client.commands[-1]
     assert command["vx"] == 0.0 and command["vy"] == 0.0, command
-    assert abs(command["vz"] - 0.35) < 1.0e-9, command
+    assert abs(command["vz"] - 0.40) < 1.0e-9, command
     assert env._command_bridge_last_reason == "LANDING_Z_HOLD"
-    print("PASS parallel landing Z is refreshed independently and capped at 0.35 m/s")
+    print("PASS parallel landing Z is refreshed independently and capped at 0.40 m/s")
 
     env._parallel_external_vz_mps = 0.80
-    env._last_parallel_z_override_mps = 0.12
+    env._last_parallel_z_override_mps = 0.18
     env.client = _Client(body_vx=0.0, body_vy=0.0)
     env._issue_command_bridge(
         requested_vx_mps=0.0,
@@ -233,7 +249,7 @@ def main() -> None:
         control_period_s=2.0,
     )
     command = env.client.commands[-1]
-    assert abs(command["vz"] - 0.12) < 1.0e-9, command
+    assert abs(command["vz"] - 0.18) < 1.0e-9, command
     print("PASS bridge follows the safety-limited Z actually sent, not raw Agent-2 Z")
 
     env._parallel_external_vz_mps = -0.45

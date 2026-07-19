@@ -67,6 +67,10 @@ class tracker:
             ema_alpha=0.70,
             verbose=False,
         )
+        # The core may move only its frozen ReID extractor to CPU after a
+        # recoverable CUDA OOM. Keep restored target fingerprints on the same
+        # device as that extractor.
+        self.device = str(self.core.device)
 
         self.last_bbox: Optional[List[int]] = None          # XYXY for DroneEnv
         self.last_good_bbox: Optional[List[int]] = None     # XYXY for DroneEnv

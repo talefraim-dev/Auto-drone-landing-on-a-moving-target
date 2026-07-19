@@ -101,6 +101,9 @@ class Agent1P2Env(gym.Env):
         bottom_live_agent1_xy_weight: float = 0.0,
         bottom_pred_agent1_xy_weight: float = 0.35,
         bottom_pd_correction_gain: float = 1.0,
+        landing_bridge_max_speed_mps: float = 0.55,
+        landing_catchup_bridge_max_speed_mps: float = 0.75,
+        near_ground_descent_max_mps: float = 0.32,
         # Legacy v11 arguments remain accepted so old flow_config.py files do
         # not crash. Recovery is intentionally not used in v12.
         recovery_enabled: bool | None = None,
@@ -115,6 +118,27 @@ class Agent1P2Env(gym.Env):
         self.agent1_checkpoint = find_agent1_checkpoint(agent1_model_path)
         agent1_cfg, self.agent1_snapshot = exact_env_config_for_checkpoint(
             self.agent1_checkpoint
+        )
+
+        # Parallel-only final-metre overrides. The checkpoint snapshot remains
+        # the source of truth for the frozen Agent-1 policy; only the post-pulse
+        # bridge and the external Agent-2 Z safety cap are adjusted for the
+        # moving-platform landing phase.
+        agent1_cfg.command_bridge_landing_max_speed_mps = max(
+            0.10, float(landing_bridge_max_speed_mps)
+        )
+        agent1_cfg.command_bridge_landing_catchup_max_speed_mps = max(
+            agent1_cfg.command_bridge_landing_max_speed_mps,
+            float(landing_catchup_bridge_max_speed_mps),
+        )
+        near_ground_descent_max_mps = float(
+            np.clip(near_ground_descent_max_mps, 0.0, 1.0)
+        )
+        agent1_cfg.parallel_vertical_near_ground_max_mps = (
+            near_ground_descent_max_mps
+        )
+        agent1_cfg.safety_landing_max_descent_action_near_ground = (
+            near_ground_descent_max_mps
         )
 
         self.agent1_env = DroneEnv(cfg=agent1_cfg)
@@ -345,6 +369,9 @@ class Agent1P2Env(gym.Env):
             horizontal_speed_limit_mps=self.horizontal_total_speed_max_mps,
             bottom_guidance_active=bool(bottom_guidance_active),
             bottom_measurement_live=bool(bottom_live),
+            bottom_predictive_catchup=bool(
+                bottom_guidance.get("catchup_active", False)
+            ),
             reacquire_climb_active=bool(
                 getattr(self.agent2_env, "_reacquire_climb_active", False)
             ),

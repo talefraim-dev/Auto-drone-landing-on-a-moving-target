@@ -132,8 +132,8 @@ def test_high_altitude_bbox_relative_error_no_longer_deadlocks_descent():
         0.80, second[0], second[1], _info()
     )
     assert soft is True
-    assert abs(vz - 0.28) < 1.0e-9
-    assert abs(limit - 0.28) < 1.0e-9
+    assert abs(vz - 0.40) < 1.0e-9
+    assert abs(limit - 0.40) < 1.0e-9
 
 
 def test_near_contact_reenables_bbox_footprint_gate():
@@ -146,6 +146,23 @@ def test_near_contact_reenables_bbox_footprint_gate():
     assert "bbox_relative" in reason
     assert env._alignment_ready_streak == 0
 
+
+
+def test_latched_landing_allows_screenshot_like_predicted_center_during_catchup():
+    env = _env(catchup=True)
+    env._descent_alignment_latched = True
+    env._last_predictive_guidance["predicted_center_error"] = 0.273
+    state, allowed, reason = env._vertical_control_state(
+        _info(height=1.65, center=0.20, bbox_rel=0.40)
+    )
+    assert state == "DESCEND_SOFT_CATCHUP_LANDING_LOCK", (state, allowed, reason)
+    assert allowed is True
+    vz, limit, soft = env._bounded_descent_command(
+        0.58, state, allowed, _info(height=1.65, center=0.20, bbox_rel=0.40)
+    )
+    assert soft is True
+    assert abs(vz - 0.40) < 1.0e-9
+    assert abs(limit - 0.40) < 1.0e-9
 
 def test_predicted_target_escaping_still_blocks_soft_descent():
     env = _env(catchup=True)
@@ -283,10 +300,18 @@ def test_size_outlier_does_not_freeze_a_valid_center_update():
     )
 
 
+
+def test_parallel_runtime_flow_uses_near_touch_progress_limits():
+    from config import flow_config as flow
+
+    assert flow.PARALLEL_CATCHUP_DESCENT_MAX_VZ_MPS == 0.40
+    assert flow.PARALLEL_CATCHUP_DESCENT_TOUCHDOWN_MAX_VZ_MPS == 0.32
+    assert flow.PARALLEL_CATCHUP_DESCENT_MAX_PREDICTED_CENTER_ERROR == 0.34
+
 def test_soft_descent_touchdown_cap_is_lower():
     env = _env(catchup=True)
-    assert env._catchup_descent_speed_limit(_info(height=6.0)) == 0.28
-    assert env._catchup_descent_speed_limit(_info(height=0.7)) == 0.12
+    assert env._catchup_descent_speed_limit(_info(height=6.0)) == 0.40
+    assert env._catchup_descent_speed_limit(_info(height=0.7)) == 0.32
 
 
 if __name__ == "__main__":

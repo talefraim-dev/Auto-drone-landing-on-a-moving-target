@@ -1,0 +1,54 @@
+{
+  "base_zip": "RL_training_19_CUDA_OOM_GUARD_FIX.zip",
+  "python_file_count": 157,
+  "all_python_ast_parse": true,
+  "controller": {
+    "catchup_descent_max_vz_mps": 0.4,
+    "near_touch_descent_max_vz_mps": 0.32,
+    "touchdown_visual_correction_mps": 0.3,
+    "landing_bridge_max_speed_mps": 0.55,
+    "landing_catchup_bridge_max_speed_mps": 0.75
+  },
+  "reward": {
+    "descent_progress_per_m": 30.0,
+    "near_touch_multiplier": 1.5,
+    "landing_lock_time_penalty": -0.35,
+    "max_hesitation_penalty": -1.5,
+    "timeout_penalty": -600.0,
+    "target_lost_penalty": -300.0,
+    "wrong_collision_penalty": -1500.0,
+    "success_base_reward": 2500.0
+  },
+  "numeric_examples": {
+    "aligned_0_4m_descent_reward": 13.414705882352935,
+    "aligned_hover_reward": -1.85,
+    "unsafe_descent_request_reward": -0.675
+  },
+  "tests_passed": [
+    "test_agent2_reward_controller_progress_fix.py (7)",
+    "test_agent2_catchup_descent_fix.py (12)",
+    "test_agent2_horizontal_v5.py (8)",
+    "test_agent2_vertical_v4.py (5)",
+    "test_agent2_safe_training.py (7)",
+    "test_true_realtime_control_fix.py (13)",
+    "test_safe_isolated_flow.py",
+    "test_user_target_identity.py",
+    "test_cuda_oom_guard.py"
+  ],
+  "protected_hashes": {
+    "drone_env.py": "3aeb74111db5494cd99834294bf545d3869f4c901360a33cb8fa7297e0d15d94",
+    "weights_config.py": "55b3b4f6a27f193c3b356a191c9233cd49f42bd667b504d76a49f0264657f67f",
+    "resnet_yolo_tracker.py": "fe5ebf4eb1eedbf2ce32cde568c2e318a270b5770e636087563339f9d43b5407",
+    "object_tracker.py": "46151e360d825a4fea9c8f015829e0028d5e020eb3e13f9b94cf773ec232e28f",
+    "observation_builder.py": "579f17ac5d9ddfe7f96d6c77fac37f020c2aa9b9b1088b6bbc41572a421b88c3",
+    "safety_filter.py": "bbd1c1a7d23eee0e24d9c62e0c5cdbd33d2cf93826f3881e781efbc6818f2b70",
+    "follow_reward_v37.py": "204433f409496f3cd18aaab2e73ad28674a02663d99d9aae1306b45a6a3ad025"
+  },
+  "changed_runtime_files": [
+    "Run_train.py",
+    "agent1p2_env.py",
+    "agent2_landing_env.py",
+    "config/flow_config.py"
+  ],
+  "air_sim_live_flight_executed": false
+}

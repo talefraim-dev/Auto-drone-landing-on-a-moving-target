@@ -1,0 +1,256 @@
+diff -ru /mnt/data/ntpf/RL_training/BASELINE_CORE_SHA256.json /mnt/data/cuda_fix_work/BASELINE_CORE_SHA256.json
+--- /mnt/data/ntpf/RL_training/BASELINE_CORE_SHA256.json	2026-07-19 17:23:17.000000000 +0000
++++ /mnt/data/cuda_fix_work/BASELINE_CORE_SHA256.json	2026-07-19 17:52:27.710333232 +0000
+@@ -4,9 +4,9 @@
+   "drone_env.py": "3aeb74111db5494cd99834294bf545d3869f4c901360a33cb8fa7297e0d15d94",
+   "follow_reward_v37.py": "204433f409496f3cd18aaab2e73ad28674a02663d99d9aae1306b45a6a3ad025",
+   "lidar_processor.py": "9bc93e46068ad75b11225ff9e8c753ce1d3151dc9781a66236b87efca76fe90c",
+-  "object_tracker.py": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
++  "object_tracker.py": "46151e360d825a4fea9c8f015829e0028d5e020eb3e13f9b94cf773ec232e28f",
+   "observation_builder.py": "579f17ac5d9ddfe7f96d6c77fac37f020c2aa9b9b1088b6bbc41572a421b88c3",
+-  "resnet_yolo_tracker.py": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
++  "resnet_yolo_tracker.py": "fe5ebf4eb1eedbf2ce32cde568c2e318a270b5770e636087563339f9d43b5407",
+   "safety_filter.py": "bbd1c1a7d23eee0e24d9c62e0c5cdbd33d2cf93826f3881e781efbc6818f2b70",
+   "weights_config.py": "55b3b4f6a27f193c3b356a191c9233cd49f42bd667b504d76a49f0264657f67f"
+ }
+Only in /mnt/data/cuda_fix_work: __pycache__
+Only in /mnt/data/cuda_fix_work/config: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_022726/source_snapshot: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_022726/source_snapshot/config: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_022726/source_snapshot/tracking: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_095935/source_snapshot: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_095935/source_snapshot/config: __pycache__
+Only in /mnt/data/cuda_fix_work/diagnostics/diag_20260719_095935/source_snapshot/tracking: __pycache__
+diff -ru /mnt/data/ntpf/RL_training/object_tracker.py /mnt/data/cuda_fix_work/object_tracker.py
+--- /mnt/data/ntpf/RL_training/object_tracker.py	2026-07-16 12:08:04.000000000 +0000
++++ /mnt/data/cuda_fix_work/object_tracker.py	2026-07-19 17:50:11.289434094 +0000
+@@ -67,6 +67,10 @@
+             ema_alpha=0.70,
+             verbose=False,
+         )
++        # The core may move only its frozen ReID extractor to CPU after a
++        # recoverable CUDA OOM. Keep restored target fingerprints on the same
++        # device as that extractor.
++        self.device = str(self.core.device)
+ 
+         self.last_bbox: Optional[List[int]] = None          # XYXY for DroneEnv
+         self.last_good_bbox: Optional[List[int]] = None     # XYXY for DroneEnv
+diff -ru /mnt/data/ntpf/RL_training/resnet_yolo_tracker.py /mnt/data/cuda_fix_work/resnet_yolo_tracker.py
+--- /mnt/data/ntpf/RL_training/resnet_yolo_tracker.py	2026-07-16 12:08:04.000000000 +0000
++++ /mnt/data/cuda_fix_work/resnet_yolo_tracker.py	2026-07-19 17:51:00.749176193 +0000
+@@ -17,7 +17,8 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import List, Optional, Tuple
++import threading
++from typing import Dict, List, Optional, Tuple
+ 
+ import cv2
+ import numpy as np
+@@ -44,6 +45,34 @@
+     _TORCHVISION_IMPORT_ERROR = None
+ 
+ 
++
++
++# All trackers use the same frozen ImageNet ResNet18. Sharing this stateless
++# feature extractor avoids allocating an identical CUDA model for the front,
++# bottom and Agent-2 trackers. The cache is process-local and guarded because
++# environment construction may evolve to use worker threads later.
++_SHARED_RESNET_MODELS: Dict[str, torch.nn.Module] = {}
++_SHARED_RESNET_LOCK = threading.Lock()
++_CUDA_REID_DISABLED_AFTER_OOM = False
++_CUDA_YOLO_DISABLED_AFTER_OOM = False
++
++
++def _is_cuda_oom(exc: BaseException) -> bool:
++    text = str(exc).lower()
++    return (
++        "out of memory" in text
++        or "cudaerrormemoryallocation" in text
++        or "cuda error: out of memory" in text
++    )
++
++
++def _canonical_device_name(device: str) -> str:
++    try:
++        return str(torch.device(device))
++    except Exception:
++        return str(device)
++
++
+ BBox = List[int]  # [x, y, w, h]
+ 
+ 
+@@ -123,7 +152,10 @@
+         if torchvision is None or transforms is None:
+             raise ImportError(f"Could not import torchvision: {_TORCHVISION_IMPORT_ERROR}")
+ 
+-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++        requested_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
++        self.device = _canonical_device_name(requested_device)
++        self.detector_device = self.device
++        self._detector_cpu_fallback_used = False
+         self.verbose = verbose
+         self.yolo = YOLO(yolo_model_path)
+         self.yolo_conf = float(yolo_conf)
+@@ -150,7 +182,8 @@
+         if self.verbose:
+             print(f"[YOLO+RESNET] device={self.device}, yolo_model={yolo_model_path}")
+ 
+-    def _build_resnet_feature_extractor(self) -> torch.nn.Module:
++    @staticmethod
++    def _new_resnet18() -> torch.nn.Module:
+         try:
+             weights = torchvision.models.ResNet18_Weights.DEFAULT
+             model = torchvision.models.resnet18(weights=weights)
+@@ -162,11 +195,67 @@
+                 print("[WARN] Falling back to random weights. Tracking quality will be poor.")
+                 model = torchvision.models.resnet18(weights=None)
+         model.fc = torch.nn.Identity()
+-        model.eval().to(self.device)
+-        for p in model.parameters():
+-            p.requires_grad = False
++        model.eval()
++        for parameter in model.parameters():
++            parameter.requires_grad = False
+         return model
+ 
++    def _build_resnet_feature_extractor(self) -> torch.nn.Module:
++        global _CUDA_REID_DISABLED_AFTER_OOM
++
++        requested = _canonical_device_name(self.device)
++
++        with _SHARED_RESNET_LOCK:
++            if requested.startswith("cuda") and _CUDA_REID_DISABLED_AFTER_OOM:
++                self.device = "cpu"
++                cached_cpu = _SHARED_RESNET_MODELS.get("cpu")
++                if cached_cpu is not None:
++                    return cached_cpu
++                model = self._new_resnet18().to("cpu")
++                _SHARED_RESNET_MODELS["cpu"] = model
++                return model
++
++            cached = _SHARED_RESNET_MODELS.get(requested)
++            if cached is not None:
++                return cached
++
++            model = self._new_resnet18()
++            actual = requested
++            try:
++                model = model.to(requested)
++            except Exception as exc:
++                if not requested.startswith("cuda") or not _is_cuda_oom(exc):
++                    raise
++
++                # Unreal Engine can consume most laptop VRAM. A ReID CUDA OOM
++                # must not abort the whole flight: keep control logic untouched
++                # and move only the frozen embedding extractor to CPU.
++                _CUDA_REID_DISABLED_AFTER_OOM = True
++                self.device = "cpu"
++                actual = "cpu"
++                del model
++                try:
++                    torch.cuda.empty_cache()
++                except Exception:
++                    pass
++
++                cached_cpu = _SHARED_RESNET_MODELS.get(actual)
++                if cached_cpu is not None:
++                    print(
++                        "[VRAM GUARD] CUDA OOM while loading ResNet18; "
++                        "reusing shared CPU ReID extractor."
++                    )
++                    return cached_cpu
++
++                model = self._new_resnet18().to(actual)
++                print(
++                    "[VRAM GUARD] CUDA OOM while loading ResNet18; "
++                    "using shared CPU ReID extractor. Flight control is unchanged."
++                )
++
++            _SHARED_RESNET_MODELS[actual] = model
++            return model
++
+     def _build_preprocess(self):
+         return transforms.Compose([
+             transforms.Resize((224, 224)),
+@@ -191,8 +280,47 @@
+         return self._embedding_from_crop(crop)
+ 
+     def _detect_candidates(self, frame_bgr: np.ndarray) -> List[Candidate]:
++        global _CUDA_YOLO_DISABLED_AFTER_OOM
++
+         h_img, w_img = frame_bgr.shape[:2]
+-        results = self.yolo.predict(frame_bgr, conf=self.yolo_conf, verbose=False)
++        if str(self.detector_device).startswith("cuda") and _CUDA_YOLO_DISABLED_AFTER_OOM:
++            self.detector_device = "cpu"
++            self._detector_cpu_fallback_used = True
++
++        try:
++            results = self.yolo.predict(
++                frame_bgr,
++                conf=self.yolo_conf,
++                verbose=False,
++                device=self.detector_device,
++            )
++        except Exception as exc:
++            if (
++                self._detector_cpu_fallback_used
++                or not str(self.detector_device).startswith("cuda")
++                or not _is_cuda_oom(exc)
++            ):
++                raise
++
++            # Retry once on CPU if the first YOLO CUDA allocation cannot fit
++            # beside Unreal. Other trackers then avoid repeating the same OOM.
++            _CUDA_YOLO_DISABLED_AFTER_OOM = True
++            self._detector_cpu_fallback_used = True
++            self.detector_device = "cpu"
++            try:
++                torch.cuda.empty_cache()
++            except Exception:
++                pass
++            print(
++                "[VRAM GUARD] CUDA OOM during YOLO inference; "
++                "retrying visual detection on CPU."
++            )
++            results = self.yolo.predict(
++                frame_bgr,
++                conf=self.yolo_conf,
++                verbose=False,
++                device="cpu",
++            )
+         candidates: List[Candidate] = []
+         if not results:
+             return candidates
+Only in /mnt/data/cuda_fix_work: test_cuda_oom_guard.py
+diff -ru /mnt/data/ntpf/RL_training/test_user_target_identity.py /mnt/data/cuda_fix_work/test_user_target_identity.py
+--- /mnt/data/ntpf/RL_training/test_user_target_identity.py	2026-07-19 17:23:17.000000000 +0000
++++ /mnt/data/cuda_fix_work/test_user_target_identity.py	2026-07-19 17:53:19.431316623 +0000
+@@ -197,11 +197,11 @@
+     assert len(env._reference_embeddings) == 2
+     print("PASS: float32 handoff bbox becomes integer ResNet crop coordinates.")
+ 
+-    # Verify protected trackers/config remain unchanged and the authorized DroneEnv fix is present.
++    # Verify the authorized VRAM guard and protected runtime/config hashes.
+     expected = {
+         "drone_env.py": "3aeb74111db5494cd99834294bf545d3869f4c901360a33cb8fa7297e0d15d94",
+-        "object_tracker.py": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
+-        "resnet_yolo_tracker.py": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
++        "object_tracker.py": "46151e360d825a4fea9c8f015829e0028d5e020eb3e13f9b94cf773ec232e28f",
++        "resnet_yolo_tracker.py": "fe5ebf4eb1eedbf2ce32cde568c2e318a270b5770e636087563339f9d43b5407",
+         "config/tracking_config.py": "a3282379e9b83f4aa4b3f265a4a85b5f8a266b6c34b1c4730a4d07cec3c26b5a",
+         "Run_train.py": "a766c20e091bfc573c64f865f9ab8cf55cfa055cfcc6ad28fbd0560f5c96b823",
+     }
+@@ -210,7 +210,7 @@
+     for rel, wanted in expected.items():
+         got = hashlib.sha256(Path(rel).read_bytes()).hexdigest()
+         assert got == wanted, f"Agent-1 baseline changed: {rel}: {got} != {wanted}"
+-    print("PASS: protected runtime hashes and authorized DroneEnv hash match this package.")
++    print("PASS: authorized VRAM guard and protected runtime hashes match this package.")
+ 
+ 
+ if __name__ == "__main__":
+Only in /mnt/data/cuda_fix_work/tracking: __pycache__

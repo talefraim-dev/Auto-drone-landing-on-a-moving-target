@@ -40,6 +40,7 @@ def main() -> None:
     wrapper = (ROOT / "agent1p2_env.py").read_text(encoding="utf-8")
     assert 'reason == "handoff_success"' in wrapper
     assert "agent1_env.step(action)" in wrapper
+    assert "bottom_predictive_catchup=bool(" in wrapper
     assert "attach_from_agent1" in wrapper
     assert "activate_agent1_control" not in wrapper
     assert "_govern_agent1_prepare_action" not in wrapper
@@ -59,6 +60,9 @@ def main() -> None:
     assert "bottom_anchor_created" in agent2
     assert agent2.count("obs, info = self._observe()") == 1  # post-command observation only
     assert "simSetObjectPose" not in agent2
+    drone = (ROOT / "drone_env.py").read_text(encoding="utf-8")
+    assert "command_bridge_landing_catchup_max_speed_mps" in drone
+    assert "_parallel_bottom_predictive_catchup" in drone
     print("PASS Agent 2 uses ResNet-only user_target identity, API Z and never moves target actor")
 
     checkpoint_root = ROOT / "models" / "PPO_Tracker" / "tracking"

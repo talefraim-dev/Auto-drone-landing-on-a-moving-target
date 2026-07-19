@@ -145,7 +145,10 @@ class Agent2Config:
     horizontal_speed_far_mps: float = 0.90
     horizontal_speed_mid_mps: float = 0.60
     horizontal_speed_near_mps: float = 0.35
-    horizontal_speed_touchdown_mps: float = 0.20
+    # Preserve enough center-correction authority during the final metre. The
+    # target-velocity feed-forward still carries platform speed; this value is
+    # only the bounded visual correction budget on top of it.
+    horizontal_speed_touchdown_mps: float = 0.30
 
     # Predictive bottom-camera guidance. The primary controller operates in
     # metric body-frame coordinates: relative target position and relative
@@ -224,6 +227,21 @@ class Agent2Config:
     control_bbox_outlier_size_ratio: float = 0.40
     control_bbox_edge_margin_px: float = 6.0
 
+    # Stable semantic landing point. The detector bbox continues to serve
+    # identity and optical-flow ROI selection, while XY control, landing lock
+    # and touchdown validation use a virtual full-target anchor. When the car is
+    # clipped by an image edge, its hidden extent is reconstructed from the last
+    # reliable full-target aspect/size instead of treating the visible crop
+    # center as the physical roof center.
+    landing_anchor_enabled: bool = True
+    landing_anchor_u: float = 0.50
+    landing_anchor_v: float = 0.50
+    landing_anchor_size_ema_alpha: float = 0.45
+    landing_anchor_aspect_ema_alpha: float = 0.20
+    landing_anchor_center_alpha: float = 0.90
+    landing_anchor_edge_center_alpha: float = 0.98
+    landing_anchor_max_outside_frame_ratio: float = 0.75
+
     # Controlled descent during horizontal catch-up. Catch-up is not itself a
     # vertical hazard: when the target is a confirmed LIVE match, remains well
     # inside the bottom image, and its predicted image motion is not diverging,
@@ -231,8 +249,11 @@ class Agent2Config:
     # escaping target, PRED-only guidance, low identity confidence or excessive
     # image/metric outward motion still blocks Z immediately.
     catchup_descent_enabled: bool = True
-    catchup_descent_max_vz_mps: float = 0.28
-    catchup_descent_touchdown_max_vz_mps: float = 0.12
+    catchup_descent_max_vz_mps: float = 0.40
+    # Near contact the old 0.18 m/s cap made the drone hover long enough for a
+    # moving roof to escape. Keep a bounded but decisive final descent while
+    # LIVE identity and landing-lock geometry are still valid.
+    catchup_descent_touchdown_max_vz_mps: float = 0.32
     catchup_descent_touchdown_height_m: float = 1.00
     catchup_descent_max_predicted_center_error: float = 0.34
     catchup_descent_max_image_speed_per_s: float = 0.22
@@ -296,6 +317,24 @@ class Agent2Config:
     success_min_reward: float = 800.0
     success_max_reward: float = 6000.0
     wrong_collision_penalty: float = 1500.0
+
+    # Dense Agent-2 reward. Agent 2 owns only Z in AGENT_1P2, therefore it is
+    # rewarded only for real, aligned height progress and is not paid merely for
+    # horizontal centering that belongs to the deterministic/Agent-1 controller.
+    # This removes the old incentive to hover until timeout while preserving a
+    # dominant terminal touchdown objective.
+    dense_reward_enabled: bool = True
+    dense_reward_alignment_center_error: float = 0.34
+    dense_reward_descent_progress_per_m: float = 30.0
+    dense_reward_near_touch_height_m: float = 1.50
+    dense_reward_near_touch_multiplier: float = 1.50
+    dense_reward_max_progress_m_per_step: float = 1.00
+    dense_reward_landing_lock_time_penalty: float = 0.35
+    dense_reward_hesitation_penalty: float = 1.50
+    dense_reward_min_descent_action_when_aligned: float = 0.25
+    dense_reward_unsafe_descent_penalty: float = 0.75
+    timeout_penalty: float = 600.0
+    target_lost_penalty: float = 300.0
 
     target_lost_limit_steps: int = 120
 
@@ -379,6 +418,14 @@ class Agent2LandingEnv(gym.Env):
         self._control_bbox_history: list[np.ndarray] = []
         self._control_bbox_outlier_suppressed = False
         self._control_bbox_filter_mode = "INIT"
+        self._landing_anchor_px: Optional[np.ndarray] = None
+        self._landing_anchor_virtual_bbox_xyxy: Optional[np.ndarray] = None
+        self._landing_anchor_full_size_px: Optional[np.ndarray] = None
+        self._landing_anchor_aspect_ratio: Optional[float] = None
+        self._landing_anchor_reference_size_px: Optional[np.ndarray] = None
+        self._landing_anchor_reference_height_m: Optional[float] = None
+        self._landing_anchor_mode = "INIT"
+        self._landing_anchor_edge_flags = "NONE"
         self._last_bottom_observation_monotonic = 0.0
         self._last_similarity = 0.0
         self._last_candidate_class_id: Optional[int] = None
@@ -543,6 +590,13 @@ class Agent2LandingEnv(gym.Env):
         self._episode_climb_command_blocked_steps = 0
         self._episode_best_center_error = float("inf")
         self._episode_best_similarity = 0.0
+        self._last_dense_reward = 0.0
+        self._last_dense_reward_parts: dict[str, float] = {
+            "aligned_descent_progress": 0.0,
+            "landing_lock_time": 0.0,
+            "hesitation": 0.0,
+            "unsafe_descent": 0.0,
+        }
 
         # Optional single-command executor supplied by Agent1P2Env. When set,
         # Agent 2 computes only the gated Z command; the executor runs frozen
@@ -899,21 +953,59 @@ class Agent2LandingEnv(gym.Env):
         else:
             mode = "LOST"
 
+        anchor_px = info.get("bottom_landing_anchor_px", None)
+        if anchor_px is not None:
+            try:
+                anchor_px = np.asarray(anchor_px, dtype=np.float32).reshape(-1)[:2].copy()
+                if anchor_px.size < 2 or not np.all(np.isfinite(anchor_px)):
+                    anchor_px = None
+            except Exception:
+                anchor_px = None
+
+        # Agent 1's debug window displays this exact shared frame. Draw the
+        # semantic point here so no Agent-1 runtime file needs to change: green
+        # remains the visible bbox diagnostic, magenta is the actual XY/landing
+        # control anchor.
+        shared_frame = (
+            None if self._last_bottom_frame is None else self._last_bottom_frame.copy()
+        )
+        if shared_frame is not None and anchor_px is not None:
+            fh, fw = shared_frame.shape[:2]
+            ax = int(round(float(anchor_px[0])))
+            ay = int(round(float(anchor_px[1])))
+            marker = cv2.MARKER_CROSS
+            if not (0 <= ax < fw and 0 <= ay < fh):
+                ax = int(np.clip(ax, 0, max(0, fw - 1)))
+                ay = int(np.clip(ay, 0, max(0, fh - 1)))
+                marker = cv2.MARKER_TILTED_CROSS
+            cv2.drawMarker(
+                shared_frame,
+                (ax, ay),
+                (255, 0, 255),
+                marker,
+                30,
+                3,
+            )
+
         return {
             "source": "AGENT2_SHARED_BOTTOM",
             "source_monotonic": float(
                 getattr(self, "_last_bottom_observation_monotonic", 0.0)
                 or time.monotonic()
             ),
-            "frame_bgr": (
-                None if self._last_bottom_frame is None else self._last_bottom_frame
-            ),
+            "frame_bgr": shared_frame,
             "match": live,
             "confirmed": bool(info.get("bottom_match_confirmed", False)),
             "recent": recent,
             "mode": mode,
             "raw_mode": tracker_mode or "AGENT2",
             "bbox_xyxy": bbox,
+            "landing_anchor_px": (
+                None if anchor_px is None else [float(anchor_px[0]), float(anchor_px[1])]
+            ),
+            "landing_anchor_mode": str(
+                info.get("bottom_landing_anchor_mode", "NONE") or "NONE"
+            ),
             "similarity": float(info.get("bottom_similarity", 0.0) or 0.0),
             "err_x": float(info.get("bottom_err_x", 0.0) or 0.0),
             "err_y": float(info.get("bottom_err_y", 0.0) or 0.0),
@@ -1457,6 +1549,14 @@ class Agent2LandingEnv(gym.Env):
         self._control_bbox_history = []
         self._control_bbox_outlier_suppressed = False
         self._control_bbox_filter_mode = "INIT"
+        self._landing_anchor_px = None
+        self._landing_anchor_virtual_bbox_xyxy = None
+        self._landing_anchor_full_size_px = None
+        self._landing_anchor_aspect_ratio = None
+        self._landing_anchor_reference_size_px = None
+        self._landing_anchor_reference_height_m = None
+        self._landing_anchor_mode = "INIT"
+        self._landing_anchor_edge_flags = "NONE"
         self._last_bottom_observation_monotonic = 0.0
         self._last_bottom_frame = None
         self._last_info = {}
@@ -1526,6 +1626,13 @@ class Agent2LandingEnv(gym.Env):
         self._episode_climb_command_blocked_steps = 0
         self._episode_best_center_error = float("inf")
         self._episode_best_similarity = 0.0
+        self._last_dense_reward = 0.0
+        self._last_dense_reward_parts = {
+            "aligned_descent_progress": 0.0,
+            "landing_lock_time": 0.0,
+            "hesitation": 0.0,
+            "unsafe_descent": 0.0,
+        }
         try:
             collision = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
             self._collision_timestamp_at_reset = int(getattr(collision, "time_stamp", 0) or 0)
@@ -2311,15 +2418,15 @@ class Agent2LandingEnv(gym.Env):
                 and self._previous_relative_position_body is not None
                 and self._previous_motion_gray is not None
             ):
-                prev_metrics = self._bbox_metrics(
-                    self._previous_motion_bbox_xyxy,
-                    self._previous_motion_gray.shape,
-                )
+                # Differentiate the semantic landing anchor, not the visible
+                # bbox center. The visible bbox is still used below as the LK
+                # optical-flow ROI. This prevents edge clipping from appearing
+                # as false target motion.
                 bbox_vel_x_norm = float(
-                    (err_x - float(prev_metrics["err_x"])) / dt
+                    (err_x - float(self._last_control_err_x)) / dt
                 )
                 bbox_vel_y_norm = float(
-                    (err_y - float(prev_metrics["err_y"])) / dt
+                    (err_y - float(self._last_control_err_y)) / dt
                 )
                 flow_vel_x_norm, flow_vel_y_norm, flow_count, flow_confidence = (
                     self._optical_flow_velocity_norm(
@@ -2781,6 +2888,271 @@ class Agent2LandingEnv(gym.Env):
         self._control_bbox_xyxy = filtered_xyxy.copy()
         return filtered_xyxy
 
+    def _update_landing_anchor_geometry(
+        self,
+        *,
+        raw_bbox_xyxy: Optional[np.ndarray],
+        control_bbox_xyxy: Optional[np.ndarray],
+        frame_shape: tuple[int, ...],
+        live_match: bool,
+        relative_height_m: float,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return a stable roof anchor and virtual full-target bbox.
+
+        YOLO boxes describe only the visible part of an object. Near touchdown,
+        a moving car commonly crosses an image edge, so the visible bbox center
+        drifts toward the remaining crop even though the physical car center did
+        not move by the same amount. This method preserves a full-target size and
+        aspect estimate from unclipped LIVE frames, reconstructs the hidden
+        extent at an edge, and lets the semantic landing point move outside the
+        image when that is where the car center actually lies.
+
+        The returned virtual bbox is used only for geometry. Identity crops and
+        optical flow continue to consume the validated visible control bbox.
+        """
+        control = self._validated_xyxy(control_bbox_xyxy, frame_shape)
+        raw = self._validated_xyxy(raw_bbox_xyxy, frame_shape)
+        if control is None:
+            self._landing_anchor_mode = "HOLD_NO_BBOX"
+            return (
+                None if self._landing_anchor_px is None else self._landing_anchor_px.copy(),
+                None
+                if self._landing_anchor_virtual_bbox_xyxy is None
+                else self._landing_anchor_virtual_bbox_xyxy.copy(),
+            )
+
+        if not bool(self.cfg.landing_anchor_enabled):
+            cxcywh = self._xyxy_to_cxcywh(control)
+            self._landing_anchor_px = cxcywh[0:2].astype(np.float32)
+            self._landing_anchor_full_size_px = cxcywh[2:4].astype(np.float32)
+            self._landing_anchor_virtual_bbox_xyxy = control.copy()
+            self._landing_anchor_mode = "DISABLED_BBOX_CENTER"
+            self._landing_anchor_edge_flags = "NONE"
+            return self._landing_anchor_px.copy(), control.copy()
+
+        if not bool(live_match):
+            self._landing_anchor_mode = "HOLD_PRED"
+            return (
+                None if self._landing_anchor_px is None else self._landing_anchor_px.copy(),
+                None
+                if self._landing_anchor_virtual_bbox_xyxy is None
+                else self._landing_anchor_virtual_bbox_xyxy.copy(),
+            )
+
+        visible = control if raw is None else raw
+        h, w = frame_shape[:2]
+        edge_margin = max(1.0, float(self.cfg.control_bbox_edge_margin_px))
+        left = bool(float(visible[0]) <= edge_margin)
+        top = bool(float(visible[1]) <= edge_margin)
+        right = bool(float(visible[2]) >= float(w) - edge_margin)
+        bottom = bool(float(visible[3]) >= float(h) - edge_margin)
+        edge_clipped = bool(left or top or right or bottom)
+        edge_flags = "".join(
+            name for name, active in (("L", left), ("T", top), ("R", right), ("B", bottom)) if active
+        ) or "NONE"
+
+        control_cxcywh = self._xyxy_to_cxcywh(control)
+        visible_cxcywh = self._xyxy_to_cxcywh(visible)
+        control_center = control_cxcywh[0:2].astype(np.float64)
+        control_size = np.maximum(control_cxcywh[2:4].astype(np.float64), 2.0)
+        visible_size = np.maximum(visible_cxcywh[2:4].astype(np.float64), 2.0)
+
+        if self._landing_anchor_full_size_px is None:
+            self._landing_anchor_full_size_px = control_size.astype(np.float32)
+        if self._landing_anchor_aspect_ratio is None:
+            self._landing_anchor_aspect_ratio = float(
+                np.clip(control_size[0] / max(2.0, control_size[1]), 0.05, 20.0)
+            )
+
+        aspect = float(self._landing_anchor_aspect_ratio)
+        full_size_prev = np.maximum(
+            np.asarray(self._landing_anchor_full_size_px, dtype=np.float64), 2.0
+        )
+
+        if not edge_clipped:
+            size_measurement = control_size
+            size_alpha = float(np.clip(self.cfg.landing_anchor_size_ema_alpha, 0.0, 1.0))
+            full_size = size_alpha * size_measurement + (1.0 - size_alpha) * full_size_prev
+            measured_aspect = float(
+                np.clip(full_size[0] / max(2.0, full_size[1]), 0.05, 20.0)
+            )
+            aspect_alpha = float(
+                np.clip(self.cfg.landing_anchor_aspect_ema_alpha, 0.0, 1.0)
+            )
+            aspect = float(
+                aspect_alpha * measured_aspect
+                + (1.0 - aspect_alpha) * aspect
+            )
+            full_center = control_center
+            self._landing_anchor_reference_size_px = full_size.astype(np.float32)
+            if np.isfinite(relative_height_m) and float(relative_height_m) > 0.05:
+                self._landing_anchor_reference_height_m = float(relative_height_m)
+            mode = "TRACK_FULL"
+        else:
+            horizontal_unclipped = bool(not left and not right)
+            vertical_unclipped = bool(not top and not bottom)
+            candidate_size = full_size_prev.copy()
+
+            if horizontal_unclipped:
+                candidate_size[0] = visible_size[0]
+                candidate_size[1] = max(visible_size[1], candidate_size[0] / max(aspect, 1.0e-6))
+            elif vertical_unclipped:
+                candidate_size[1] = visible_size[1]
+                candidate_size[0] = max(visible_size[0], candidate_size[1] * aspect)
+            elif (
+                self._landing_anchor_reference_size_px is not None
+                and self._landing_anchor_reference_height_m is not None
+                and np.isfinite(relative_height_m)
+                and float(relative_height_m) > 0.05
+            ):
+                scale = float(
+                    np.clip(
+                        float(self._landing_anchor_reference_height_m)
+                        / float(relative_height_m),
+                        0.70,
+                        3.00,
+                    )
+                )
+                candidate_size = (
+                    np.asarray(self._landing_anchor_reference_size_px, dtype=np.float64)
+                    * scale
+                )
+
+            candidate_size = np.maximum(candidate_size, visible_size)
+            # At an edge, shrinking is usually clipping rather than a real target
+            # scale change. Follow growth quickly and shrink only weakly.
+            growth = candidate_size >= full_size_prev
+            alpha_grow = float(
+                np.clip(max(0.65, self.cfg.landing_anchor_size_ema_alpha), 0.0, 1.0)
+            )
+            alpha_shrink = float(
+                np.clip(min(0.15, self.cfg.landing_anchor_size_ema_alpha), 0.0, 1.0)
+            )
+            size_alpha = np.where(growth, alpha_grow, alpha_shrink)
+            full_size = size_alpha * candidate_size + (1.0 - size_alpha) * full_size_prev
+            full_size = np.maximum(full_size, visible_size)
+
+            u = float(np.clip(self.cfg.landing_anchor_u, 0.0, 1.0))
+            v = float(np.clip(self.cfg.landing_anchor_v, 0.0, 1.0))
+            previous_anchor = (
+                None
+                if self._landing_anchor_px is None
+                else np.asarray(self._landing_anchor_px, dtype=np.float64)
+            )
+            previous_full_center = (
+                control_center
+                if previous_anchor is None
+                else previous_anchor
+                - np.asarray([(u - 0.5) * full_size[0], (v - 0.5) * full_size[1]])
+            )
+
+            if left and not right:
+                full_cx = float(visible[2]) - 0.5 * float(full_size[0])
+            elif right and not left:
+                full_cx = float(visible[0]) + 0.5 * float(full_size[0])
+            elif not left and not right:
+                full_cx = float(control_center[0])
+            else:
+                full_cx = float(previous_full_center[0])
+
+            if top and not bottom:
+                full_cy = float(visible[3]) - 0.5 * float(full_size[1])
+            elif bottom and not top:
+                full_cy = float(visible[1]) + 0.5 * float(full_size[1])
+            elif not top and not bottom:
+                full_cy = float(control_center[1])
+            else:
+                full_cy = float(previous_full_center[1])
+
+            full_center = np.asarray([full_cx, full_cy], dtype=np.float64)
+            mode = f"EDGE_RECON_{edge_flags}"
+
+        self._landing_anchor_aspect_ratio = float(aspect)
+        self._landing_anchor_full_size_px = np.asarray(full_size, dtype=np.float32)
+        self._landing_anchor_edge_flags = edge_flags
+
+        u = float(np.clip(self.cfg.landing_anchor_u, 0.0, 1.0))
+        v = float(np.clip(self.cfg.landing_anchor_v, 0.0, 1.0))
+        measured_anchor = np.asarray(
+            [
+                float(full_center[0]) + (u - 0.5) * float(full_size[0]),
+                float(full_center[1]) + (v - 0.5) * float(full_size[1]),
+            ],
+            dtype=np.float64,
+        )
+        alpha = float(
+            np.clip(
+                self.cfg.landing_anchor_edge_center_alpha
+                if edge_clipped
+                else self.cfg.landing_anchor_center_alpha,
+                0.0,
+                1.0,
+            )
+        )
+        if self._landing_anchor_px is None:
+            anchor = measured_anchor
+        else:
+            anchor = (
+                alpha * measured_anchor
+                + (1.0 - alpha)
+                * np.asarray(self._landing_anchor_px, dtype=np.float64)
+            )
+
+        outside = max(0.0, float(self.cfg.landing_anchor_max_outside_frame_ratio))
+        anchor[0] = float(np.clip(anchor[0], -outside * w, (1.0 + outside) * w))
+        anchor[1] = float(np.clip(anchor[1], -outside * h, (1.0 + outside) * h))
+        virtual_center = anchor - np.asarray(
+            [(u - 0.5) * full_size[0], (v - 0.5) * full_size[1]],
+            dtype=np.float64,
+        )
+        virtual_bbox = np.asarray(
+            [
+                virtual_center[0] - 0.5 * full_size[0],
+                virtual_center[1] - 0.5 * full_size[1],
+                virtual_center[0] + 0.5 * full_size[0],
+                virtual_center[1] + 0.5 * full_size[1],
+            ],
+            dtype=np.float32,
+        )
+
+        self._landing_anchor_px = anchor.astype(np.float32)
+        self._landing_anchor_virtual_bbox_xyxy = virtual_bbox.copy()
+        self._landing_anchor_mode = mode
+        return self._landing_anchor_px.copy(), virtual_bbox.copy()
+
+    def _landing_anchor_metrics(
+        self,
+        *,
+        anchor_px: Optional[np.ndarray],
+        virtual_bbox_xyxy: Optional[np.ndarray],
+        visible_bbox_xyxy: Optional[np.ndarray],
+        frame_shape: tuple[int, ...],
+    ) -> dict[str, float]:
+        """Compute controller geometry from the semantic anchor."""
+        if anchor_px is None or virtual_bbox_xyxy is None:
+            return self._bbox_metrics(visible_bbox_xyxy, frame_shape)
+        h, w = frame_shape[:2]
+        anchor = np.asarray(anchor_px, dtype=np.float64).reshape(-1)
+        virtual = np.asarray(virtual_bbox_xyxy, dtype=np.float64).reshape(-1)
+        if anchor.size < 2 or virtual.size < 4 or not np.all(np.isfinite(anchor[:2])):
+            return self._bbox_metrics(visible_bbox_xyxy, frame_shape)
+        full_w = max(2.0, float(virtual[2] - virtual[0]))
+        full_h = max(2.0, float(virtual[3] - virtual[1]))
+        err_x = (float(anchor[0]) - 0.5 * w) / max(1.0, 0.5 * w)
+        err_y = (float(anchor[1]) - 0.5 * h) / max(1.0, 0.5 * h)
+        rel_x = abs(err_x) / max(1.0e-6, full_w / max(1.0, w))
+        rel_y = abs(err_y) / max(1.0e-6, full_h / max(1.0, h))
+        visible_metrics = self._bbox_metrics(visible_bbox_xyxy, frame_shape)
+        return {
+            "err_x": float(err_x),
+            "err_y": float(err_y),
+            "center_error": float(math.hypot(err_x, err_y)),
+            "bbox_rel_error": float(max(rel_x, rel_y)),
+            # Preserve the existing visual-scale speed schedule. Only the center
+            # reference changes; target area still comes from the visible bbox.
+            "area_norm": float(visible_metrics["area_norm"]),
+        }
+
     @staticmethod
     def _bbox_metrics(bbox_xyxy: Optional[np.ndarray], frame_shape: tuple[int, ...]) -> dict[str, float]:
         if bbox_xyxy is None:
@@ -2820,7 +3192,6 @@ class Agent2LandingEnv(gym.Env):
             live_match=live_match,
             frame_shape=frame.shape,
         )
-        metrics = self._bbox_metrics(bbox_xyxy, frame.shape)
         self._last_bottom_observation_monotonic = float(time.monotonic())
 
         # The moving platform may change world Z on uneven roads. Refresh its
@@ -2830,6 +3201,21 @@ class Agent2LandingEnv(gym.Env):
             self._read_target_surface_altitude()
 
         drone_state, relative_height, api_state = self._get_api_state()
+        landing_anchor_px, virtual_target_bbox_xyxy = (
+            self._update_landing_anchor_geometry(
+                raw_bbox_xyxy=raw_bbox_xyxy,
+                control_bbox_xyxy=bbox_xyxy,
+                frame_shape=frame.shape,
+                live_match=live_match,
+                relative_height_m=relative_height,
+            )
+        )
+        metrics = self._landing_anchor_metrics(
+            anchor_px=landing_anchor_px,
+            virtual_bbox_xyxy=virtual_target_bbox_xyxy,
+            visible_bbox_xyxy=bbox_xyxy,
+            frame_shape=frame.shape,
+        )
         self._update_visual_target_motion(
             frame=frame,
             bbox_xyxy=bbox_xyxy,
@@ -2855,9 +3241,14 @@ class Agent2LandingEnv(gym.Env):
         if bbox_xyxy is not None:
             x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
             conf = float(similarity if tracker_mode == "MATCH" else 0.25)
+            obs_cx = 0.5 * (x1 + x2)
+            obs_cy = 0.5 * (y1 + y2)
+            if landing_anchor_px is not None:
+                obs_cx = float(landing_anchor_px[0])
+                obs_cy = float(landing_anchor_px[1])
             bbox = BBox(
-                cx=0.5 * (x1 + x2),
-                cy=0.5 * (y1 + y2),
+                cx=obs_cx,
+                cy=obs_cy,
                 w=max(1.0, x2 - x1),
                 h=max(1.0, y2 - y1),
                 conf=conf,
@@ -2958,6 +3349,22 @@ class Agent2LandingEnv(gym.Env):
                 None
                 if bbox_xyxy is None
                 else [float(v) for v in np.asarray(bbox_xyxy).reshape(-1)[:4]]
+            ),
+            "bottom_landing_anchor_enabled": bool(self.cfg.landing_anchor_enabled),
+            "bottom_landing_anchor_mode": str(self._landing_anchor_mode),
+            "bottom_landing_anchor_edge_flags": str(self._landing_anchor_edge_flags),
+            "bottom_landing_anchor_px": (
+                None
+                if landing_anchor_px is None
+                else [float(v) for v in np.asarray(landing_anchor_px).reshape(-1)[:2]]
+            ),
+            "bottom_virtual_target_bbox_xyxy": (
+                None
+                if virtual_target_bbox_xyxy is None
+                else [
+                    float(v)
+                    for v in np.asarray(virtual_target_bbox_xyxy).reshape(-1)[:4]
+                ]
             ),
             "bottom_err_x": metrics["err_x"],
             "bottom_err_y": metrics["err_y"],
@@ -3098,10 +3505,34 @@ class Agent2LandingEnv(gym.Env):
                 x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
                 color = (0, 255, 0) if match_confirmed else (0, 255, 255)
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            if landing_anchor_px is not None:
+                anchor_x = int(round(float(landing_anchor_px[0])))
+                anchor_y = int(round(float(landing_anchor_px[1])))
+                if 0 <= anchor_x < w and 0 <= anchor_y < h:
+                    cv2.drawMarker(
+                        vis,
+                        (anchor_x, anchor_y),
+                        (255, 0, 255),
+                        cv2.MARKER_CROSS,
+                        34,
+                        3,
+                    )
+                else:
+                    edge_x = int(np.clip(anchor_x, 0, max(0, w - 1)))
+                    edge_y = int(np.clip(anchor_y, 0, max(0, h - 1)))
+                    cv2.drawMarker(
+                        vis,
+                        (edge_x, edge_y),
+                        (255, 0, 255),
+                        cv2.MARKER_TILTED_CROSS,
+                        30,
+                        3,
+                    )
             cv2.putText(
                 vis,
                 f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f} "
-                f"bboxFilter={self._control_bbox_filter_mode}",
+                f"bboxFilter={self._control_bbox_filter_mode} "
+                f"anchor={self._landing_anchor_mode}",
                 (15, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -3759,6 +4190,112 @@ class Agent2LandingEnv(gym.Env):
             f"{lost_steps}_steps"
         )
         return result
+
+    def _dense_landing_reward(
+        self,
+        info: dict[str, Any],
+        *,
+        raw_vz_action: float,
+        descent_allowed: bool,
+        applied_vz_mps: float,
+    ) -> tuple[float, dict[str, float]]:
+        """Reward real aligned Z progress and discourage safe-to-descend hover.
+
+        Agent 2 cannot physically control XY in the parallel architecture, so
+        horizontal centering is used only as a safety condition/quality weight.
+        The reward never pays for center quality alone. This prevents a centered
+        hover from becoming more profitable than completing touchdown.
+        """
+        parts = {
+            "aligned_descent_progress": 0.0,
+            "landing_lock_time": 0.0,
+            "hesitation": 0.0,
+            "unsafe_descent": 0.0,
+        }
+        if not bool(self.cfg.dense_reward_enabled):
+            return 0.0, parts
+
+        live = bool(info.get("bottom_match_live", False))
+        confirmed = bool(info.get("bottom_match_confirmed", False))
+        lock_active = bool(getattr(self, "_descent_alignment_latched", False))
+        center_error = float(info.get("bottom_center_error", 999.0))
+        height = float(info.get("relative_height_to_target_m", float("inf")))
+        max_center = max(
+            1.0e-6, float(self.cfg.dense_reward_alignment_center_error)
+        )
+        aligned = bool(
+            live
+            and confirmed
+            and lock_active
+            and np.isfinite(center_error)
+            and center_error <= max_center
+        )
+
+        if aligned:
+            alignment_quality = float(
+                np.clip(1.0 - center_error / max_center, 0.10, 1.0)
+            )
+            if self._prev_relative_height_m is not None and np.isfinite(height):
+                raw_progress = float(self._prev_relative_height_m - height)
+                progress_m = float(
+                    np.clip(
+                        raw_progress,
+                        0.0,
+                        max(
+                            0.0,
+                            float(self.cfg.dense_reward_max_progress_m_per_step),
+                        ),
+                    )
+                )
+                near_multiplier = 1.0
+                if height <= float(self.cfg.dense_reward_near_touch_height_m):
+                    near_multiplier = max(
+                        1.0,
+                        float(self.cfg.dense_reward_near_touch_multiplier),
+                    )
+                parts["aligned_descent_progress"] = float(
+                    float(self.cfg.dense_reward_descent_progress_per_m)
+                    * progress_m
+                    * alignment_quality
+                    * near_multiplier
+                )
+
+            # A small per-step cost starts only after a valid landing lock. It
+            # makes a long hover worse than completing the already-safe descent.
+            parts["landing_lock_time"] = -abs(
+                float(self.cfg.dense_reward_landing_lock_time_penalty)
+            )
+
+            # When the deterministic gate says descent is safe, negative/near-
+            # zero PPO Z is hesitation (negative NED-Z requests are blocked and
+            # become hover). Penalize the missing positive action, not a safety-
+            # blocked descent.
+            if bool(descent_allowed):
+                minimum = max(
+                    1.0e-6,
+                    float(self.cfg.dense_reward_min_descent_action_when_aligned),
+                )
+                positive_action = max(0.0, float(raw_vz_action))
+                deficit = float(np.clip((minimum - positive_action) / minimum, 0.0, 1.0))
+                parts["hesitation"] = -abs(
+                    float(self.cfg.dense_reward_hesitation_penalty)
+                ) * deficit
+        else:
+            # The gate still prevents physical descent. This small penalty tells
+            # PPO not to demand a dive while LIVE geometry is visibly unsafe.
+            positive_action = max(0.0, float(raw_vz_action))
+            if positive_action > 0.0 and not bool(descent_allowed):
+                parts["unsafe_descent"] = -abs(
+                    float(self.cfg.dense_reward_unsafe_descent_penalty)
+                ) * positive_action
+
+        # Do not reward a reported height drop if no positive NED-Z command was
+        # actually applied; this guards against pose/collision measurement jumps.
+        if float(applied_vz_mps) <= 1.0e-4:
+            parts["aligned_descent_progress"] = 0.0
+
+        total = float(sum(parts.values()))
+        return total, parts
 
     def _collision_reward_decision(
         self,
@@ -4451,16 +4988,25 @@ class Agent2LandingEnv(gym.Env):
                 f"targetSpeed={self._target_velocity_speed_mps:.2f}m/s"
             )
 
+        dense_reward, dense_reward_parts = self._dense_landing_reward(
+            info,
+            raw_vz_action=raw_vz_action,
+            descent_allowed=bool(descent_allowed),
+            applied_vz_mps=float(vz),
+        )
+        self._last_dense_reward = float(dense_reward)
+        self._last_dense_reward_parts = dict(dense_reward_parts)
+
         done = False
         reason = ""
-        reward = 0.0
+        reward = float(dense_reward)
         good_xy = bool(collision_decision["success"])
 
         if collision_now:
             done = True
             if good_xy:
                 reason = "landing_collision_success"
-                reward = float(np.clip(
+                reward += float(np.clip(
                     self.cfg.success_base_reward + self._reward_bank,
                     self.cfg.success_min_reward,
                     self.cfg.success_max_reward,
@@ -4472,21 +5018,21 @@ class Agent2LandingEnv(gym.Env):
                 self._target_surface_source = "verified_collision_api_z_ned"
             elif collision_decision["success_path"] != "NONE":
                 reason = "landing_collision_wrong_object"
-                reward = -float(self.cfg.wrong_collision_penalty)
+                reward -= float(self.cfg.wrong_collision_penalty)
             else:
                 reason = "landing_collision_bad_xy"
-                reward = -float(self.cfg.wrong_collision_penalty)
+                reward -= float(self.cfg.wrong_collision_penalty)
         elif self._step >= int(self.cfg.max_episode_steps):
             done = True
             reason = "landing_timeout_no_collision"
-            reward = 0.0
+            reward -= float(self.cfg.timeout_penalty)
         elif (
             not bool(self.cfg.parallel_dual_agent_mode)
             and self._lost_steps >= int(self.cfg.target_lost_limit_steps)
         ):
             done = True
             reason = "landing_target_lost"
-            reward = 0.0
+            reward -= float(self.cfg.target_lost_penalty)
 
         self._episode_return += float(reward)
         self._prev_action = raw.copy()
@@ -4571,6 +5117,19 @@ class Agent2LandingEnv(gym.Env):
                 "descent_alignment_latched": bool(getattr(self, "_descent_alignment_latched", False)),
                 "reward_bank": float(self._reward_bank),
                 "landing_shaping_bank_delta": shaping,
+                "dense_landing_reward": float(dense_reward),
+                "dense_reward_aligned_descent_progress": float(
+                    dense_reward_parts["aligned_descent_progress"]
+                ),
+                "dense_reward_landing_lock_time": float(
+                    dense_reward_parts["landing_lock_time"]
+                ),
+                "dense_reward_hesitation": float(
+                    dense_reward_parts["hesitation"]
+                ),
+                "dense_reward_unsafe_descent": float(
+                    dense_reward_parts["unsafe_descent"]
+                ),
                 "collision_new": collision_now,
                 "collision_object_name": collision_object,
                 "collision_timestamp": collision_timestamp,
@@ -4621,7 +5180,8 @@ class Agent2LandingEnv(gym.Env):
             )
             print(
                 f"[A2 EP] steps={self._step} result={reason or 'running'} "
-                f"reward={reward:+.1f} bank={self._reward_bank:+.1f} "
+                f"reward={reward:+.1f} dense={self._last_dense_reward:+.2f} "
+                f"bank={self._reward_bank:+.1f} "
                 f"live={live_pct:.1f}% pred={pred_pct:.1f}% lost={lost_pct:.1f}% "
                 f"xy={self._last_horizontal_control_state} recenter={int(getattr(self, '_episode_recenter_steps', 0))} "
                 f"xyHold={int(getattr(self, '_episode_xy_hold_steps', 0))} "
