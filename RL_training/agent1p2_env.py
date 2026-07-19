@@ -1,13 +1,16 @@
 """Parallel dual-agent training wrapper.
 
 Agent 1 never leaves the control loop after the initial landing-ready event.
-It continuously owns horizontal tracking (body-frame X/Y) and yaw while its
-front and bottom camera trackers remain active. Agent 2 continuously receives
-its 37-value landing observation and owns only the vertical NED-Z command.
+It continuously owns yaw and search/reacquire tracking while its front and
+bottom camera trackers remain active. During trusted Bottom LIVE/PRED guidance,
+the bottom visual-motion controller owns landing X/Y. Agent 2 continuously
+receives its 37-value landing observation and owns only vertical NED-Z.
 
 A single AirSim velocity command is sent per environment step:
-    X/Y/Yaw = frozen Agent 1 + moving-target velocity feed-forward
-    Z       = Agent 2, gated by the bottom-camera landing safety state
+    X/Y = bottom-camera t+1 predictive tracking + target-velocity feed-forward
+          whenever Bottom LIVE exists; otherwise frozen Agent 1 search/chase
+    Yaw = frozen Agent 1
+    Z   = Agent 2, gated by bottom prediction and landing safety
 
 There is no Agent-2 -> Agent-1 recovery cycle. When the bottom target is lost,
 Agent 2 immediately blocks descent while Agent 1 keeps searching/chasing in the
@@ -94,6 +97,10 @@ class Agent1P2Env(gym.Env):
         device: str = "auto",
         target_velocity_feedforward_gain: float = 1.0,
         horizontal_total_speed_max_mps: float = 6.0,
+        agent1_min_xy_weight_near_landing: float = 0.20,
+        bottom_live_agent1_xy_weight: float = 0.0,
+        bottom_pred_agent1_xy_weight: float = 0.35,
+        bottom_pd_correction_gain: float = 1.0,
         # Legacy v11 arguments remain accepted so old flow_config.py files do
         # not crash. Recovery is intentionally not used in v12.
         recovery_enabled: bool | None = None,
@@ -129,6 +136,21 @@ class Agent1P2Env(gym.Env):
         )
         self.horizontal_total_speed_max_mps = max(
             0.1, float(horizontal_total_speed_max_mps)
+        )
+        self.agent1_min_xy_weight_near_landing = float(
+            np.clip(agent1_min_xy_weight_near_landing, 0.0, 1.0)
+        )
+        # When the bottom camera has a LIVE match, its predictive controller is
+        # authoritative for XY. Frozen Agent 1 still runs every step and owns
+        # yaw/search, but front-camera/PRED XY cannot fight the landing servo.
+        self.bottom_live_agent1_xy_weight = float(
+            np.clip(bottom_live_agent1_xy_weight, 0.0, 1.0)
+        )
+        self.bottom_pred_agent1_xy_weight = float(
+            np.clip(bottom_pred_agent1_xy_weight, 0.0, 1.0)
+        )
+        self.bottom_pd_correction_gain = max(
+            0.0, float(bottom_pd_correction_gain)
         )
 
         self._parallel_active = False
@@ -277,11 +299,55 @@ class Agent1P2Env(gym.Env):
         ff_vx *= self.target_velocity_feedforward_gain
         ff_vy *= self.target_velocity_feedforward_gain
 
+        bottom_guidance = self.agent2_env.get_parallel_bottom_guidance()
+        bottom_blend = float(
+            np.clip(bottom_guidance.get("bottom_blend_strength", 0.0), 0.0, 1.0)
+        )
+        bottom_live = bool(bottom_guidance.get("measurement_live", False))
+        bottom_guidance_active = bool(
+            bottom_guidance.get("guidance_active", bottom_live)
+        )
+        bottom_prediction_only = bool(
+            bottom_guidance.get("prediction_only", False)
+        )
+        # Bottom LIVE has deterministic XY authority during landing. Agent 1's
+        # policy remains active for yaw and immediately regains full XY when the
+        # bottom view disappears.
+        if bottom_live:
+            agent1_xy_weight = float(self.bottom_live_agent1_xy_weight)
+        elif bottom_guidance_active and bottom_prediction_only:
+            agent1_xy_weight = float(self.bottom_pred_agent1_xy_weight)
+        else:
+            agent1_xy_weight = 1.0
+        bottom_vx = (
+            self.bottom_pd_correction_gain
+            * float(bottom_guidance.get("bottom_correction_vx_mps", 0.0))
+        )
+        bottom_vy = (
+            self.bottom_pd_correction_gain
+            * float(bottom_guidance.get("bottom_correction_vy_mps", 0.0))
+        )
+
+        # Agent 2 already computed the bottom frame for this control cycle.
+        # Reuse that exact perception state in Agent 1 instead of capturing and
+        # running a second bottom YOLO+ResNet tracker on a later frame.
+        self.agent1_env.set_parallel_bottom_perception_snapshot(
+            self.agent2_env.get_parallel_bottom_perception_snapshot()
+        )
+
         self.agent1_env.set_parallel_control_overrides(
-            vz_mps=max(0.0, float(agent2_vz_mps)),
+            vz_mps=float(agent2_vz_mps),
             feedforward_vx_mps=float(ff_vx),
             feedforward_vy_mps=float(ff_vy),
+            bottom_correction_vx_mps=float(bottom_vx),
+            bottom_correction_vy_mps=float(bottom_vy),
+            agent1_xy_weight=float(agent1_xy_weight),
             horizontal_speed_limit_mps=self.horizontal_total_speed_max_mps,
+            bottom_guidance_active=bool(bottom_guidance_active),
+            bottom_measurement_live=bool(bottom_live),
+            reacquire_climb_active=bool(
+                getattr(self.agent2_env, "_reacquire_climb_active", False)
+            ),
         )
 
         obs, agent1_reward, done, truncated, info = self._agent1_step(
@@ -298,6 +364,7 @@ class Agent1P2Env(gym.Env):
             "collision",
             "emergency_horizontal_obstacle_distance",
             "takeoff_failed_not_airborne",
+            "altitude_too_high",
         }
 
         return {
@@ -350,6 +417,70 @@ class Agent1P2Env(gym.Env):
                     "parallel_target_velocity_ff_blocked_by_safety", False
                 )
             ),
+            "bottom_guidance_live": bool(
+                bottom_guidance.get("measurement_live", False)
+            ),
+            "bottom_guidance_active": bool(bottom_guidance_active),
+            "bottom_guidance_prediction_only": bool(bottom_prediction_only),
+            "bottom_xy_authority": (
+                "BOTTOM_PREDICTIVE"
+                if bottom_live
+                else "BOTTOM_SHORT_PREDICTION"
+                if bottom_guidance_active
+                else "AGENT1_SEARCH_CHASE"
+            ),
+            "bottom_predictive_catchup": bool(
+                bottom_guidance.get("catchup_active", False)
+            ),
+            "bottom_predicted_err_x": float(
+                bottom_guidance.get("predicted_err_x", 0.0)
+            ),
+            "bottom_predicted_err_y": float(
+                bottom_guidance.get("predicted_err_y", 0.0)
+            ),
+            "bottom_predicted_center_error": float(
+                bottom_guidance.get("predicted_center_error", 999.0)
+            ),
+            "bottom_image_velocity_x_per_s": float(
+                bottom_guidance.get("image_velocity_x_per_s", 0.0)
+            ),
+            "bottom_image_velocity_y_per_s": float(
+                bottom_guidance.get("image_velocity_y_per_s", 0.0)
+            ),
+            "bottom_prediction_horizon_s": float(
+                bottom_guidance.get("prediction_horizon_s", 0.0)
+            ),
+            "bottom_relative_position_x_m": float(
+                bottom_guidance.get("relative_position_x_m", 0.0)
+            ),
+            "bottom_relative_position_y_m": float(
+                bottom_guidance.get("relative_position_y_m", 0.0)
+            ),
+            "bottom_relative_velocity_x_mps": float(
+                bottom_guidance.get("relative_velocity_x_mps", 0.0)
+            ),
+            "bottom_relative_velocity_y_mps": float(
+                bottom_guidance.get("relative_velocity_y_mps", 0.0)
+            ),
+            "bottom_predicted_relative_x_m": float(
+                bottom_guidance.get("predicted_relative_x_m", 0.0)
+            ),
+            "bottom_predicted_relative_y_m": float(
+                bottom_guidance.get("predicted_relative_y_m", 0.0)
+            ),
+            "bottom_controller_source": str(
+                bottom_guidance.get("controller_source", "NONE")
+            ),
+            "bottom_outward_speed_per_s": float(
+                bottom_guidance.get("outward_speed_per_s", 0.0)
+            ),
+            "bottom_guidance_landing_lock": bool(
+                bottom_guidance.get("landing_lock", False)
+            ),
+            "bottom_guidance_blend_strength": float(bottom_blend),
+            "bottom_guidance_vx_mps": float(bottom_vx),
+            "bottom_guidance_vy_mps": float(bottom_vy),
+            "agent1_xy_weight": float(agent1_xy_weight),
             "parallel_physical_steps": int(self._parallel_physical_steps),
         }
 

@@ -152,7 +152,7 @@ def test_unconfirmed_match_uses_pd_without_policy_residual():
         np.asarray([1.0, 1.0, 0.0, 0.0], dtype=np.float32),
         _info(bottom_match_confirmed=False, bottom_err_x=0.2),
     )
-    assert details["state"] == "PD_MATCH_PENDING"
+    assert details["state"] == "PREDICTIVE_BOTTOM_MATCH_PENDING"
     assert details["residual_ax"] == 0.0
     assert details["residual_ay"] == 0.0
     assert details["pd_ay"] > 0.0
@@ -189,23 +189,28 @@ def test_descent_requires_stable_alignment_then_recenters_on_drift():
     for _ in range(required - 1):
         state, allowed, _ = env._vertical_control_state(aligned)
         assert allowed is False
-        assert state == "ALIGN_STABLE_PENDING"
+        assert state == "ALIGN_LOCK_PENDING"
 
     state, allowed, reason = env._vertical_control_state(aligned)
-    assert state == "DESCEND_TRACKING"
+    assert state == "DESCEND_LANDING_LOCK_ACQUIRED"
     assert allowed is True
     assert reason == ""
     assert env._descent_alignment_latched is True
 
     drifted = _info(
-        bottom_center_error=0.40,
+        bottom_center_error=0.50,
         bottom_bbox_rel_err=0.20,
     )
-    state, allowed, reason = env._vertical_control_state(drifted)
-    assert state == "RECENTER_XY"
-    assert allowed is False
-    assert "center_error" in reason
-    assert env._descent_alignment_latched is False
+    for attempt in range(env.cfg.landing_lock_bad_live_release_steps):
+        state, allowed, reason = env._vertical_control_state(drifted)
+        assert allowed is False
+        if attempt < env.cfg.landing_lock_bad_live_release_steps - 1:
+            assert state == "RECENTER_LANDING_LOCK_HELD"
+            assert env._descent_alignment_latched is True
+        else:
+            assert state == "RECENTER_LANDING_LOCK_RELEASED"
+            assert "sustained_live_misalignment" in reason
+            assert env._descent_alignment_latched is False
 
 
 def test_perfect_zero_alignment_is_valid_numeric_input():
@@ -213,7 +218,7 @@ def test_perfect_zero_alignment_is_valid_numeric_input():
     aligned = _info(bottom_center_error=0.0, bottom_bbox_rel_err=0.0)
     for _ in range(env.cfg.alignment_streak_required):
         state, allowed, _ = env._vertical_control_state(aligned)
-    assert state == "DESCEND_TRACKING"
+    assert state == "DESCEND_LANDING_LOCK_ACQUIRED"
     assert allowed is True
 
 

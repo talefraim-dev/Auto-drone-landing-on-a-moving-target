@@ -88,20 +88,57 @@ class Agent2Config:
     horizontal_ppo_residual_max_action: float = 0.12
     horizontal_deadband_error: float = 0.025
     horizontal_deadband_velocity: float = 0.08
-    horizontal_velocity_ema_alpha: float = 0.35
+    horizontal_velocity_ema_alpha: float = 0.55
     horizontal_velocity_clip_per_s: float = 4.0
 
-    # Moving-target velocity feed-forward. The actor pose is sampled read-only
-    # from AirSim, converted from world NED XY into the drone body frame, and
-    # added to the visual centering correction. This does not change the PPO
-    # observation or action spaces.
+    # Moving-target velocity feed-forward is estimated from the bottom camera,
+    # not from the target actor API. The estimator fuses bbox-center motion with
+    # sparse optical flow inside the verified target ROI, converts the relative
+    # image motion to metric body-frame motion using camera geometry and height,
+    # then adds the drone's own measured ego velocity. This keeps the controller
+    # compatible with a real vehicle and does not change PPO observation/action
+    # spaces.
     target_velocity_feedforward_enabled: bool = True
     target_velocity_feedforward_gain: float = 1.0
-    target_velocity_ema_alpha: float = 0.35
+    target_velocity_ema_alpha: float = 0.45
     target_velocity_max_valid_mps: float = 8.0
-    target_velocity_stale_after_s: float = 1.0
+    target_velocity_stale_after_s: float = 0.65
+    target_velocity_max_accel_mps2: float = 7.0
+    bottom_camera_hfov_deg: float = 90.0
+    visual_motion_min_dt_s: float = 0.03
+    # A full dual-model observation can legitimately take 1-3 seconds. Accept
+    # that real measurement interval for velocity division, but keep the KF and
+    # acceleration update bounded separately.
+    visual_motion_max_dt_s: float = 0.80
+    visual_motion_measurement_max_dt_s: float = 3.00
+    visual_motion_kalman_dt_max_s: float = 0.80
+    visual_motion_attitude_gate_deg: float = 12.0
+    visual_motion_max_yaw_rate_dps: float = 45.0
+    visual_motion_yaw_compensation: bool = True
+    visual_motion_prediction_max_age_s: float = 0.30
+    visual_relative_velocity_ema_alpha: float = 0.55
+    # Constant-velocity Kalman filter over metric body-frame state
+    # [relative_x, relative_y, relative_vx, relative_vy]. It filters the noisy
+    # bbox/optical-flow measurement without querying target actor XY state.
+    visual_kalman_enabled: bool = True
+    visual_kalman_process_accel_std_mps2: float = 2.0
+    visual_kalman_position_std_m: float = 0.08
+    visual_kalman_velocity_std_bbox_mps: float = 0.70
+    visual_kalman_velocity_std_flow_mps: float = 0.35
+    optical_flow_enabled: bool = True
+    optical_flow_max_corners: int = 90
+    optical_flow_quality_level: float = 0.01
+    optical_flow_min_distance_px: float = 7.0
+    optical_flow_window_px: int = 21
+    optical_flow_max_level: int = 3
+    optical_flow_min_points: int = 6
+    optical_flow_max_forward_backward_error_px: float = 1.75
+    optical_flow_bbox_expand: float = 1.25
+    optical_flow_max_norm_velocity_per_s: float = 4.0
+    optical_flow_max_bbox_disagreement_per_s: float = 1.25
+    optical_flow_weight: float = 0.65
     horizontal_total_speed_max_mps: float = 6.0
-    horizontal_velocity_hold_max_s: float = 1.0
+    horizontal_velocity_hold_max_s: float = 0.65
 
     # Speed shrinks near touchdown. The final limit also considers bbox area,
     # so a wrong actor-Z estimate cannot make close-range commands aggressive.
@@ -110,14 +147,111 @@ class Agent2Config:
     horizontal_speed_near_mps: float = 0.35
     horizontal_speed_touchdown_mps: float = 0.20
 
-    # Alignment hysteresis: enter DESCEND only after several strongly aligned
-    # frames, and immediately return to RECENTER when the looser exit limits
-    # are exceeded.
-    alignment_enter_center_error: float = 0.20
-    alignment_enter_bbox_rel_error: float = 0.35
-    alignment_exit_center_error: float = 0.32
-    alignment_exit_bbox_rel_error: float = 0.58
-    alignment_streak_required: int = 5
+    # Predictive bottom-camera guidance. The primary controller operates in
+    # metric body-frame coordinates: relative target position and relative
+    # target velocity are propagated to t+1, and the controller corrects toward
+    # that future point. Normalized-image control remains only as a fallback.
+    predictive_bottom_enabled: bool = True
+    predictive_bottom_extra_latency_s: float = 0.08
+    predictive_bottom_horizon_min_s: float = 0.10
+    predictive_bottom_horizon_max_s: float = 0.60
+    predictive_metric_kp_position_per_s: float = 1.65
+    predictive_metric_kd_relative_velocity: float = 0.85
+    predictive_metric_catchup_enter_position_m: float = 0.55
+    predictive_metric_catchup_exit_position_m: float = 0.20
+    predictive_metric_catchup_enter_relative_speed_mps: float = 0.22
+    predictive_metric_catchup_exit_relative_speed_mps: float = 0.09
+    predictive_bottom_kp_y_to_vx_mps: float = 2.20
+    predictive_bottom_kd_y_to_vx_mps: float = 0.40
+    predictive_bottom_kp_x_to_vy_mps: float = 1.80
+    predictive_bottom_kd_x_to_vy_mps: float = 0.35
+    predictive_bottom_normal_correction_max_mps: float = 1.50
+    predictive_bottom_catchup_correction_max_mps: float = 3.20
+    predictive_bottom_touchdown_catchup_max_mps: float = 2.40
+    predictive_bottom_catchup_enter_center_error: float = 0.24
+    predictive_bottom_catchup_exit_center_error: float = 0.13
+    predictive_bottom_catchup_enter_outward_speed_per_s: float = 0.10
+    predictive_bottom_catchup_exit_outward_speed_per_s: float = 0.03
+    predictive_bottom_catchup_exit_image_speed_per_s: float = 0.16
+    predictive_bottom_catchup_release_streak: int = 2
+
+    # A short PRED gap can continue using the visual motion estimator, but Z is
+    # always held. Once the bottom view is genuinely lost, Agent 1 regains XY
+    # and a deterministic, bounded climb restores field of view. The PPO policy
+    # still cannot request arbitrary climb; negative NED-Z is reserved for this
+    # explicit reacquisition state only.
+    bottom_pred_guidance_max_age_s: float = 0.25
+    reacquire_climb_enabled: bool = True
+    reacquire_climb_after_s: float = 0.45
+    reacquire_climb_speed_mps: float = 0.45
+    reacquire_climb_target_height_m: float = 3.20
+    reacquire_climb_max_duration_s: float = 4.0
+    reacquire_climb_min_last_bbox_area_norm: float = 0.0
+
+    # Landing lock. Initial acquisition is intentionally faster than the old
+    # 3+5-frame handoff gate: two aligned LIVE frames are enough. Once acquired,
+    # a short detector gap pauses Z but does not erase the lock, so reacquisition
+    # resumes descent immediately instead of rebuilding the full streak.
+    alignment_enter_center_error: float = 0.30
+    alignment_enter_bbox_rel_error: float = 0.55
+    alignment_exit_center_error: float = 0.42
+    alignment_exit_bbox_rel_error: float = 0.72
+    alignment_streak_required: int = 2
+    landing_lock_max_visual_gap_steps: int = 3
+    landing_lock_bad_live_release_steps: int = 3
+
+    # BBOX-relative alignment becomes increasingly meaningful near contact,
+    # when the vehicle fills a larger fraction of the image. At high altitude,
+    # dividing image-center error by a narrow bbox creates a circular deadlock:
+    # the drone must descend to enlarge the bbox, but descent is blocked because
+    # that same relative error is too large. Use image-center geometry above
+    # this height and re-enable the footprint-relative gate near touchdown.
+    landing_bbox_rel_gate_below_height_m: float = 1.50
+    catchup_descent_enter_center_error: float = 0.24
+    catchup_descent_exit_center_error: float = 0.34
+
+    # Control-space bbox stabilization. Identity selection still uses every raw
+    # YOLO/ResNet proposal, but landing geometry and motion control consume a
+    # robust median + EMA bbox. This prevents a single detector shape/center
+    # jump from flipping XY commands or resetting the landing lock.
+    control_bbox_filter_enabled: bool = True
+    control_bbox_history_size: int = 5
+    control_bbox_center_alpha: float = 0.78
+    control_bbox_edge_center_alpha: float = 0.95
+    control_bbox_size_alpha: float = 0.35
+    control_bbox_outlier_alpha: float = 0.10
+    control_bbox_outlier_center_jump_norm: float = 0.14
+    control_bbox_outlier_size_ratio: float = 0.40
+    control_bbox_edge_margin_px: float = 6.0
+
+    # Controlled descent during horizontal catch-up. Catch-up is not itself a
+    # vertical hazard: when the target is a confirmed LIVE match, remains well
+    # inside the bottom image, and its predicted image motion is not diverging,
+    # Agent 2 may acquire the landing lock and descend slowly. A genuinely
+    # escaping target, PRED-only guidance, low identity confidence or excessive
+    # image/metric outward motion still blocks Z immediately.
+    catchup_descent_enabled: bool = True
+    catchup_descent_max_vz_mps: float = 0.28
+    catchup_descent_touchdown_max_vz_mps: float = 0.12
+    catchup_descent_touchdown_height_m: float = 1.00
+    catchup_descent_max_predicted_center_error: float = 0.34
+    catchup_descent_max_image_speed_per_s: float = 0.22
+    catchup_descent_max_outward_speed_per_s: float = 0.06
+    catchup_descent_max_metric_outward_speed_mps: float = 1.50
+
+    # Adaptive multi-scale landing appearance memory. The two immutable identity
+    # anchors are never replaced. Recent close-range embeddings are appended to
+    # a small FIFO only after a strong LIVE match also agrees with an immutable
+    # anchor, preventing PRED/self-reinforcement drift.
+    adaptive_embedding_enabled: bool = True
+    adaptive_embedding_max_entries: int = 8
+    adaptive_embedding_update_interval_steps: int = 3
+    adaptive_embedding_identity_floor: float = 0.52
+    adaptive_embedding_add_min_identity_similarity: float = 0.62
+    adaptive_embedding_add_min_combined_similarity: float = 0.68
+    adaptive_embedding_novelty_max_similarity: float = 0.985
+    adaptive_embedding_bbox_scales: tuple[float, ...] = (1.00, 1.16, 1.32)
+    adaptive_embedding_max_additions_per_update: int = 2
 
     lidar_max_range_m: float = 20.0
     obstacle_emergency_m: float = 0.55
@@ -128,8 +262,8 @@ class Agent2Config:
     # bottom-camera match exists, or the current bottom image itself looks like
     # the selected target directly under the camera. Historical latches remain
     # diagnostic only and cannot grant terminal reward.
-    good_collision_center_error: float = 0.45
-    good_collision_bbox_rel_error: float = 0.75
+    good_collision_center_error: float = 0.32
+    good_collision_bbox_rel_error: float = 0.58
     good_collision_recent_match_steps: int = 4
     collision_latch_max_age_steps: int = 6
     collision_latch_center_error: float = 0.10
@@ -231,10 +365,21 @@ class Agent2LandingEnv(gym.Env):
 
         self._original_embedding: Optional[torch.Tensor] = None
         self._bottom_anchor_embedding: Optional[torch.Tensor] = None
+        # Immutable identity anchors are kept in _reference_embeddings.
+        # _adaptive_embeddings contains only recent, verified landing views.
         self._reference_embeddings: list[torch.Tensor] = []
+        self._adaptive_embeddings: list[torch.Tensor] = []
+        self._adaptive_embedding_steps: list[int] = []
+        self._last_adaptive_embedding_update_step = -999999
+        self._adaptive_embedding_updates = 0
         self._target_id = "user_target"
         self._target_class_id: Optional[int] = None
         self._last_bbox_xyxy: Optional[np.ndarray] = None
+        self._control_bbox_xyxy: Optional[np.ndarray] = None
+        self._control_bbox_history: list[np.ndarray] = []
+        self._control_bbox_outlier_suppressed = False
+        self._control_bbox_filter_mode = "INIT"
+        self._last_bottom_observation_monotonic = 0.0
         self._last_similarity = 0.0
         self._last_candidate_class_id: Optional[int] = None
         self._last_candidate_confidence = 0.0
@@ -297,6 +442,8 @@ class Agent2LandingEnv(gym.Env):
         self._last_raw_vz_action = 0.0
         self._last_requested_vz_mps = 0.0
         self._last_applied_vz_mps = 0.0
+        self._last_vertical_speed_limit_mps = 0.0
+        self._last_soft_catchup_descent_active = False
         self._last_climb_command_blocked = False
 
         self._last_observation_monotonic: Optional[float] = None
@@ -305,8 +452,54 @@ class Agent2LandingEnv(gym.Env):
         self._last_control_err_y = 0.0
         self._control_img_vel_x = 0.0
         self._control_img_vel_y = 0.0
-        self._target_pose_xy: Optional[tuple[float, float]] = None
-        self._target_pose_monotonic: Optional[float] = None
+        self._last_control_dt_s = float(self.cfg.cmd_duration_s)
+        self._predictive_catchup_active = False
+        self._predictive_catchup_release_streak = 0
+        self._last_predictive_guidance: dict[str, Any] = {
+            "live_match": False,
+            "catchup_active": False,
+            "predicted_err_x": 0.0,
+            "predicted_err_y": 0.0,
+            "predicted_center_error": 999.0,
+            "image_velocity_x_per_s": 0.0,
+            "image_velocity_y_per_s": 0.0,
+            "image_speed_per_s": 0.0,
+            "outward_speed_per_s": 0.0,
+            "prediction_horizon_s": float(self.cfg.cmd_duration_s),
+            "correction_vx_mps": 0.0,
+            "correction_vy_mps": 0.0,
+            "correction_limit_mps": 0.0,
+        }
+        # Visual motion estimator. No target XY position or velocity is read
+        # from the simulator API. The only target-motion measurements are the
+        # verified bottom-camera ROI and optical flow inside that ROI.
+        self._bottom_camera_hfov_deg = float(self.cfg.bottom_camera_hfov_deg)
+        self._previous_motion_gray: Optional[np.ndarray] = None
+        self._previous_motion_bbox_xyxy: Optional[np.ndarray] = None
+        self._previous_motion_time: Optional[float] = None
+        self._previous_relative_position_body: Optional[tuple[float, float]] = None
+        self._previous_relative_height_m: Optional[float] = None
+        self._previous_motion_yaw_rad: Optional[float] = None
+        self._visual_motion_attitude_valid = True
+        self._visual_motion_yaw_rate_dps = 0.0
+        self._visual_relative_position_body_x_m = 0.0
+        self._visual_relative_position_body_y_m = 0.0
+        self._visual_relative_velocity_body_x_mps = 0.0
+        self._visual_relative_velocity_body_y_mps = 0.0
+        self._visual_relative_velocity_valid = False
+        self._visual_kalman_state: Optional[np.ndarray] = None
+        self._visual_kalman_covariance = np.eye(4, dtype=np.float64)
+        self._visual_kalman_velocity_initialized = False
+        self._visual_motion_age_s = float("inf")
+        self._visual_motion_source = "WAIT"
+        self._visual_bbox_velocity_x_per_s = 0.0
+        self._visual_bbox_velocity_y_per_s = 0.0
+        self._visual_flow_velocity_x_per_s = 0.0
+        self._visual_flow_velocity_y_per_s = 0.0
+        self._visual_flow_point_count = 0
+        self._visual_flow_confidence = 0.0
+        self._drone_body_velocity_x_mps = 0.0
+        self._drone_body_velocity_y_mps = 0.0
         self._target_velocity_world_x_mps = 0.0
         self._target_velocity_world_y_mps = 0.0
         self._target_velocity_body_vx_mps = 0.0
@@ -314,10 +507,15 @@ class Agent2LandingEnv(gym.Env):
         self._target_velocity_speed_mps = 0.0
         self._target_velocity_valid = False
         self._target_velocity_age_s = float("inf")
+        self._reacquire_climb_started_monotonic: Optional[float] = None
+        self._reacquire_climb_active = False
         self._non_live_started_monotonic: Optional[float] = None
         self._non_live_duration_s = 0.0
         self._alignment_ready_streak = 0
         self._descent_alignment_latched = False
+        self._landing_lock_visual_gap_steps = 0
+        self._landing_lock_bad_live_steps = 0
+        self._landing_lock_acquired_step = -999999
         self._last_horizontal_control_state = "HOLD_INIT"
         self._last_pd_action_vx = 0.0
         self._last_pd_action_vy = 0.0
@@ -361,7 +559,12 @@ class Agent2LandingEnv(gym.Env):
         self._external_command_executor = executor
 
     def get_target_velocity_feedforward_body(self) -> tuple[float, float, bool]:
-        """Return the current filtered target velocity in drone body axes."""
+        """Return visually estimated target velocity in drone body axes.
+
+        The estimate is built from bottom-camera relative motion plus the
+        drone's own measured ego velocity. Target actor XY pose/velocity is not
+        used anywhere in this path.
+        """
         valid = bool(
             self.cfg.target_velocity_feedforward_enabled
             and self._target_velocity_valid
@@ -372,9 +575,366 @@ class Agent2LandingEnv(gym.Env):
             return 0.0, 0.0, False
         gain = float(self.cfg.target_velocity_feedforward_gain)
         return (
-            float(self._target_velocity_body_vx_mps) * gain,
-            float(self._target_velocity_body_vy_mps) * gain,
+            float(getattr(self, "_target_velocity_body_vx_mps", 0.0)) * gain,
+            float(getattr(self, "_target_velocity_body_vy_mps", 0.0)) * gain,
             True,
+        )
+
+    @staticmethod
+    def _clip_vector(vx: float, vy: float, limit: float) -> tuple[float, float]:
+        """Clip a 2-D vector without changing its direction."""
+        magnitude = float(math.hypot(vx, vy))
+        safe_limit = max(0.0, float(limit))
+        if magnitude <= max(1.0e-9, safe_limit):
+            return float(vx), float(vy)
+        scale = float(safe_limit / magnitude)
+        return float(vx * scale), float(vy * scale)
+
+    def _compute_predictive_bottom_guidance(
+        self,
+        info: dict[str, Any],
+        *,
+        update_hysteresis: bool,
+    ) -> dict[str, Any]:
+        """Predict target relative position at t+1 from bottom-camera motion.
+
+        The primary state is metric body-frame relative position/velocity from
+        the visual estimator. A short PRED gap may continue this state without
+        updating it. Normalized bbox motion is retained only as a fallback.
+        """
+        live_match = bool(info.get("bottom_match_live", False))
+        tracker_mode = str(info.get("tracker_mode", ""))
+        visual_age = float(info.get("visual_motion_age_s", float("inf")))
+        prediction_only = bool(
+            not live_match
+            and tracker_mode.startswith("PRED")
+            and visual_age <= float(self.cfg.bottom_pred_guidance_max_age_s)
+            and bool(info.get("visual_relative_velocity_valid", False))
+        )
+        guidance_active = bool(
+            bool(self.cfg.predictive_bottom_enabled)
+            and (live_match or prediction_only)
+        )
+        center_error = float(info.get("bottom_center_error", 999.0))
+        area = float(info.get("bottom_bbox_area_norm", 0.0))
+        height = float(info.get("relative_height_to_target_m", float("inf")))
+        landing_lock = bool(self._descent_alignment_latched)
+
+        if not guidance_active:
+            if update_hysteresis:
+                self._predictive_catchup_active = False
+                self._predictive_catchup_release_streak = 0
+            result = {
+                "live_match": False,
+                "measurement_live": False,
+                "guidance_active": False,
+                "prediction_only": False,
+                "landing_lock": landing_lock,
+                "catchup_active": False,
+                "bottom_correction_vx_mps": 0.0,
+                "bottom_correction_vy_mps": 0.0,
+                "bottom_blend_strength": 0.0,
+                "center_error": center_error,
+                "bbox_area_norm": area,
+                "relative_height_m": height,
+                "predicted_err_x": 0.0,
+                "predicted_err_y": 0.0,
+                "predicted_center_error": 999.0,
+                "relative_position_x_m": 0.0,
+                "relative_position_y_m": 0.0,
+                "relative_velocity_x_mps": 0.0,
+                "relative_velocity_y_mps": 0.0,
+                "predicted_relative_x_m": 0.0,
+                "predicted_relative_y_m": 0.0,
+                "predicted_relative_distance_m": 999.0,
+                "relative_speed_mps": 0.0,
+                "image_velocity_x_per_s": 0.0,
+                "image_velocity_y_per_s": 0.0,
+                "image_speed_per_s": 0.0,
+                "outward_speed_per_s": 0.0,
+                "metric_outward_speed_mps": 0.0,
+                "prediction_horizon_s": float(self.cfg.cmd_duration_s),
+                "correction_limit_mps": 0.0,
+                "controller_source": "NONE",
+            }
+            if update_hysteresis:
+                self._last_predictive_guidance = dict(result)
+            return result
+
+        err_x = float(info.get("bottom_err_x", 0.0) or 0.0)
+        err_y = float(info.get("bottom_err_y", 0.0) or 0.0)
+        vel_x = float(
+            info.get(
+                "bottom_img_vel_x_control",
+                getattr(self, "_control_img_vel_x", 0.0),
+            )
+            or 0.0
+        )
+        vel_y = float(
+            info.get(
+                "bottom_img_vel_y_control",
+                getattr(self, "_control_img_vel_y", 0.0),
+            )
+            or 0.0
+        )
+        measured_dt = float(
+            info.get(
+                "bottom_control_dt_s",
+                getattr(self, "_last_control_dt_s", self.cfg.cmd_duration_s),
+            )
+            or self.cfg.cmd_duration_s
+        )
+        horizon = float(
+            np.clip(
+                max(float(self.cfg.cmd_duration_s), measured_dt)
+                + float(self.cfg.predictive_bottom_extra_latency_s),
+                float(self.cfg.predictive_bottom_horizon_min_s),
+                float(self.cfg.predictive_bottom_horizon_max_s),
+            )
+        )
+
+        # During a short PRED interval, advance the last measured state to now
+        # before predicting the next command horizon.
+        prediction_age = visual_age if prediction_only else 0.0
+        predicted_err_x = float(
+            np.clip(err_x + vel_x * (prediction_age + horizon), -1.50, 1.50)
+        )
+        predicted_err_y = float(
+            np.clip(err_y + vel_y * (prediction_age + horizon), -1.50, 1.50)
+        )
+        predicted_center = float(math.hypot(predicted_err_x, predicted_err_y))
+        image_speed = float(math.hypot(vel_x, vel_y))
+        current_center = float(math.hypot(err_x, err_y))
+        if current_center > 1.0e-6:
+            outward_speed = float((err_x * vel_x + err_y * vel_y) / current_center)
+        else:
+            outward_speed = 0.0
+
+        metric_valid = bool(
+            info.get("visual_relative_velocity_valid", False)
+            and np.isfinite(float(info.get("visual_relative_position_body_x_m", 0.0)))
+            and np.isfinite(float(info.get("visual_relative_position_body_y_m", 0.0)))
+        )
+        relative_x = float(info.get("visual_relative_position_body_x_m", 0.0) or 0.0)
+        relative_y = float(info.get("visual_relative_position_body_y_m", 0.0) or 0.0)
+        relative_vx = float(info.get("visual_relative_velocity_body_x_mps", 0.0) or 0.0)
+        relative_vy = float(info.get("visual_relative_velocity_body_y_mps", 0.0) or 0.0)
+        if prediction_only and metric_valid:
+            relative_x += relative_vx * prediction_age
+            relative_y += relative_vy * prediction_age
+        predicted_relative_x = float(relative_x + relative_vx * horizon)
+        predicted_relative_y = float(relative_y + relative_vy * horizon)
+        predicted_relative_distance = float(
+            math.hypot(predicted_relative_x, predicted_relative_y)
+        )
+        relative_speed = float(math.hypot(relative_vx, relative_vy))
+        current_metric_distance = float(math.hypot(relative_x, relative_y))
+        if current_metric_distance > 1.0e-6:
+            metric_outward_speed = float(
+                (relative_x * relative_vx + relative_y * relative_vy)
+                / current_metric_distance
+            )
+        else:
+            metric_outward_speed = 0.0
+
+        metric_enter = bool(
+            metric_valid
+            and (
+                predicted_relative_distance
+                >= float(self.cfg.predictive_metric_catchup_enter_position_m)
+                or metric_outward_speed
+                >= float(self.cfg.predictive_metric_catchup_enter_relative_speed_mps)
+            )
+        )
+        metric_exit = bool(
+            metric_valid
+            and predicted_relative_distance
+            <= float(self.cfg.predictive_metric_catchup_exit_position_m)
+            and abs(metric_outward_speed)
+            <= float(self.cfg.predictive_metric_catchup_exit_relative_speed_mps)
+            and relative_speed
+            <= float(self.cfg.predictive_metric_catchup_enter_relative_speed_mps)
+        )
+        image_enter = bool(
+            predicted_center
+            >= float(self.cfg.predictive_bottom_catchup_enter_center_error)
+            or outward_speed
+            >= float(self.cfg.predictive_bottom_catchup_enter_outward_speed_per_s)
+        )
+        image_exit = bool(
+            predicted_center
+            <= float(self.cfg.predictive_bottom_catchup_exit_center_error)
+            and outward_speed
+            <= float(self.cfg.predictive_bottom_catchup_exit_outward_speed_per_s)
+            and image_speed
+            <= float(self.cfg.predictive_bottom_catchup_exit_image_speed_per_s)
+        )
+        enter_catchup = bool(metric_enter or image_enter or prediction_only)
+        exit_catchup = bool((metric_exit if metric_valid else True) and image_exit)
+
+        catchup_active = bool(getattr(self, "_predictive_catchup_active", False))
+        release_streak = int(getattr(self, "_predictive_catchup_release_streak", 0))
+        if update_hysteresis:
+            if catchup_active:
+                if exit_catchup and live_match:
+                    release_streak += 1
+                    if release_streak >= max(
+                        1, int(self.cfg.predictive_bottom_catchup_release_streak)
+                    ):
+                        catchup_active = False
+                        release_streak = 0
+                else:
+                    release_streak = 0
+            elif enter_catchup:
+                catchup_active = True
+                release_streak = 0
+            self._predictive_catchup_active = bool(catchup_active)
+            self._predictive_catchup_release_streak = int(release_streak)
+        else:
+            catchup_active = bool(getattr(self, "_predictive_catchup_active", False) or enter_catchup)
+
+        if metric_valid:
+            correction_vx = float(
+                float(self.cfg.predictive_metric_kp_position_per_s)
+                * predicted_relative_x
+                + float(self.cfg.predictive_metric_kd_relative_velocity)
+                * relative_vx
+            )
+            correction_vy = float(
+                float(self.cfg.predictive_metric_kp_position_per_s)
+                * predicted_relative_y
+                + float(self.cfg.predictive_metric_kd_relative_velocity)
+                * relative_vy
+            )
+            controller_source = "METRIC_BOTTOM_VISION"
+        else:
+            correction_vx = float(
+                -float(self.cfg.predictive_bottom_kp_y_to_vx_mps) * predicted_err_y
+                -float(self.cfg.predictive_bottom_kd_y_to_vx_mps) * vel_y
+            )
+            correction_vy = float(
+                float(self.cfg.predictive_bottom_kp_x_to_vy_mps) * predicted_err_x
+                +float(self.cfg.predictive_bottom_kd_x_to_vy_mps) * vel_x
+            )
+            controller_source = "NORMALIZED_IMAGE_FALLBACK"
+
+        if catchup_active:
+            correction_limit = float(
+                self.cfg.predictive_bottom_catchup_correction_max_mps
+            )
+            if np.isfinite(height) and height <= 0.80:
+                correction_limit = min(
+                    correction_limit,
+                    float(self.cfg.predictive_bottom_touchdown_catchup_max_mps),
+                )
+        else:
+            correction_limit = float(
+                self.cfg.predictive_bottom_normal_correction_max_mps
+            )
+
+        correction_vx, correction_vy = self._clip_vector(
+            correction_vx,
+            correction_vy,
+            correction_limit,
+        )
+
+        result = {
+            "live_match": bool(live_match),
+            "measurement_live": bool(live_match),
+            "guidance_active": True,
+            "prediction_only": bool(prediction_only),
+            "landing_lock": landing_lock,
+            "catchup_active": bool(catchup_active),
+            "bottom_correction_vx_mps": float(correction_vx),
+            "bottom_correction_vy_mps": float(correction_vy),
+            "bottom_blend_strength": 1.0 if live_match else 0.65,
+            "center_error": center_error,
+            "bbox_area_norm": area,
+            "relative_height_m": height,
+            "predicted_err_x": float(predicted_err_x),
+            "predicted_err_y": float(predicted_err_y),
+            "predicted_center_error": float(predicted_center),
+            "relative_position_x_m": float(relative_x),
+            "relative_position_y_m": float(relative_y),
+            "relative_velocity_x_mps": float(relative_vx),
+            "relative_velocity_y_mps": float(relative_vy),
+            "predicted_relative_x_m": float(predicted_relative_x),
+            "predicted_relative_y_m": float(predicted_relative_y),
+            "predicted_relative_distance_m": float(predicted_relative_distance),
+            "relative_speed_mps": float(relative_speed),
+            "image_velocity_x_per_s": float(vel_x),
+            "image_velocity_y_per_s": float(vel_y),
+            "image_speed_per_s": float(image_speed),
+            "outward_speed_per_s": float(outward_speed),
+            "metric_outward_speed_mps": float(metric_outward_speed),
+            "prediction_horizon_s": float(horizon),
+            "correction_limit_mps": float(correction_limit),
+            "controller_source": controller_source,
+        }
+        if update_hysteresis:
+            self._last_predictive_guidance = dict(result)
+        return result
+
+    def get_parallel_bottom_perception_snapshot(self) -> dict[str, Any]:
+        """Export the current bottom result for Agent 1 without new inference."""
+        info = dict(self._last_info or {})
+        bbox = getattr(self, "_control_bbox_xyxy", None)
+        if bbox is None:
+            bbox = getattr(self, "_last_bbox_xyxy", None)
+        if bbox is not None:
+            try:
+                bbox = np.asarray(bbox, dtype=np.float32).reshape(-1)[:4].copy()
+                if bbox.size < 4 or not np.all(np.isfinite(bbox)):
+                    bbox = None
+            except Exception:
+                bbox = None
+
+        live = bool(info.get("bottom_match_live", False))
+        recent = bool(info.get("bottom_match_recent", False))
+        tracker_mode = str(info.get("tracker_mode", "") or "").upper()
+        if live:
+            mode = "MATCH"
+        elif recent or tracker_mode.startswith("PRED"):
+            mode = "PRED"
+        else:
+            mode = "LOST"
+
+        return {
+            "source": "AGENT2_SHARED_BOTTOM",
+            "source_monotonic": float(
+                getattr(self, "_last_bottom_observation_monotonic", 0.0)
+                or time.monotonic()
+            ),
+            "frame_bgr": (
+                None if self._last_bottom_frame is None else self._last_bottom_frame
+            ),
+            "match": live,
+            "confirmed": bool(info.get("bottom_match_confirmed", False)),
+            "recent": recent,
+            "mode": mode,
+            "raw_mode": tracker_mode or "AGENT2",
+            "bbox_xyxy": bbox,
+            "similarity": float(info.get("bottom_similarity", 0.0) or 0.0),
+            "err_x": float(info.get("bottom_err_x", 0.0) or 0.0),
+            "err_y": float(info.get("bottom_err_y", 0.0) or 0.0),
+            "bbox_area_norm": float(info.get("bottom_bbox_area_norm", 0.0) or 0.0),
+            "bbox_rel_err": float(info.get("bottom_bbox_rel_err", 999.0) or 999.0),
+            "bbox_rel_err_x": float(info.get("bottom_bbox_rel_err_x", info.get("bottom_bbox_rel_err", 999.0)) or 999.0),
+            "bbox_rel_err_y": float(info.get("bottom_bbox_rel_err_y", info.get("bottom_bbox_rel_err", 999.0)) or 999.0),
+            "live_match_streak": int(info.get("bottom_live_match_streak", 0) or 0),
+            "tracker_confidence": float(info.get("bottom_similarity", 0.0) or 0.0),
+            "candidate_count": int(info.get("yolo_candidate_count", 0) or 0),
+        }
+
+    def get_parallel_bottom_guidance(self) -> dict[str, Any]:
+        """Return the predictive bottom-camera correction cached this step."""
+        if self._last_predictive_guidance:
+            result = dict(self._last_predictive_guidance)
+            result["landing_lock"] = bool(self._descent_alignment_latched)
+            return result
+        return self._compute_predictive_bottom_guidance(
+            dict(self._last_info or {}),
+            update_hysteresis=False,
         )
 
     # ------------------------------------------------------------------
@@ -390,6 +950,10 @@ class Agent2LandingEnv(gym.Env):
         self._original_embedding = emb.detach().clone()
         self._bottom_anchor_embedding = None
         self._reference_embeddings = [self._original_embedding.detach().clone()]
+        self._adaptive_embeddings = []
+        self._adaptive_embedding_steps = []
+        self._last_adaptive_embedding_update_step = -999999
+        self._adaptive_embedding_updates = 0
         self._target_class_id = None if class_id is None else int(class_id)
 
         # The internal tracker is used only as a detector/embedding backend.
@@ -418,6 +982,118 @@ class Agent2LandingEnv(gym.Env):
         self._reference_embeddings = [self._original_embedding.detach().clone()]
         self._reference_embeddings.append(self._bottom_anchor_embedding.detach().clone())
         return True
+
+    def _all_reference_embeddings(self) -> list[torch.Tensor]:
+        """Return immutable identity anchors followed by verified adaptive views."""
+        references = [embedding for embedding in self._reference_embeddings]
+        references.extend(getattr(self, "_adaptive_embeddings", []))
+        return references
+
+    @staticmethod
+    def _scaled_bbox_xywh(
+        bbox_xywh: Any,
+        scale: float,
+        frame_shape: tuple[int, ...],
+    ) -> Optional[list[int]]:
+        """Scale an XYWH box around its center and clamp it to the image."""
+        try:
+            x, y, w, h = [float(value) for value in bbox_xywh[:4]]
+        except Exception:
+            return None
+        image_h, image_w = frame_shape[:2]
+        scale = max(0.25, float(scale))
+        cx = x + 0.5 * w
+        cy = y + 0.5 * h
+        new_w = max(2.0, w * scale)
+        new_h = max(2.0, h * scale)
+        x1 = max(0.0, cx - 0.5 * new_w)
+        y1 = max(0.0, cy - 0.5 * new_h)
+        x2 = min(float(image_w), cx + 0.5 * new_w)
+        y2 = min(float(image_h), cy + 0.5 * new_h)
+        if x2 - x1 < 2.0 or y2 - y1 < 2.0:
+            return None
+        return [
+            int(round(x1)),
+            int(round(y1)),
+            max(1, int(round(x2 - x1))),
+            max(1, int(round(y2 - y1))),
+        ]
+
+    def _append_adaptive_embedding(self, embedding: torch.Tensor) -> bool:
+        """Append a novel normalized embedding to the bounded adaptive FIFO."""
+        if embedding is None:
+            return False
+        candidate = F.normalize(embedding.detach().clone(), dim=0)
+        if not hasattr(self, "_adaptive_embeddings"):
+            self._adaptive_embeddings = []
+        if not hasattr(self, "_adaptive_embedding_steps"):
+            self._adaptive_embedding_steps = []
+        novelty_limit = float(self.cfg.adaptive_embedding_novelty_max_similarity)
+        for existing in self._adaptive_embeddings:
+            similarity = float(torch.dot(existing, candidate).detach().cpu().item())
+            if similarity >= novelty_limit:
+                return False
+        self._adaptive_embeddings.append(candidate)
+        self._adaptive_embedding_steps.append(int(self._step))
+        max_entries = max(1, int(self.cfg.adaptive_embedding_max_entries))
+        while len(self._adaptive_embeddings) > max_entries:
+            self._adaptive_embeddings.pop(0)
+            self._adaptive_embedding_steps.pop(0)
+        return True
+
+    def _maybe_update_adaptive_embedding_bank(
+        self,
+        frame: np.ndarray,
+        bbox_xywh: Any,
+        immutable_similarity: float,
+        combined_similarity: float,
+    ) -> int:
+        """Add verified close-range views without ever mutating identity anchors."""
+        if not bool(self.cfg.adaptive_embedding_enabled):
+            return 0
+        interval = max(1, int(self.cfg.adaptive_embedding_update_interval_steps))
+        current_step = int(getattr(self, "_step", 0))
+        if current_step - int(getattr(self, "_last_adaptive_embedding_update_step", -999999)) < interval:
+            return 0
+        if immutable_similarity < float(
+            self.cfg.adaptive_embedding_add_min_identity_similarity
+        ):
+            return 0
+        if combined_similarity < float(
+            self.cfg.adaptive_embedding_add_min_combined_similarity
+        ):
+            return 0
+
+        additions = 0
+        max_additions = max(
+            1, int(self.cfg.adaptive_embedding_max_additions_per_update)
+        )
+        for scale in self.cfg.adaptive_embedding_bbox_scales:
+            scaled_bbox = self._scaled_bbox_xywh(bbox_xywh, scale, frame.shape)
+            if scaled_bbox is None:
+                continue
+            embedding = self.tracker._embedding_from_bbox(frame, scaled_bbox)
+            if embedding is None:
+                continue
+            immutable_scores = [
+                float(torch.dot(anchor, embedding).detach().cpu().item())
+                for anchor in self._reference_embeddings
+            ]
+            if not immutable_scores or max(immutable_scores) < float(
+                self.cfg.adaptive_embedding_add_min_identity_similarity
+            ):
+                continue
+            if self._append_adaptive_embedding(embedding):
+                additions += 1
+                if additions >= max_additions:
+                    break
+
+        if additions > 0:
+            self._last_adaptive_embedding_update_step = current_step
+            self._adaptive_embedding_updates = int(
+                getattr(self, "_adaptive_embedding_updates", 0)
+            ) + 1
+        return additions
 
     @staticmethod
     def _validated_xyxy(bbox_xyxy: Any, frame_shape: tuple[int, ...]) -> Optional[np.ndarray]:
@@ -521,6 +1197,7 @@ class Agent2LandingEnv(gym.Env):
         self.cfg.vehicle_name = str(agent1_env.cfg.vehicle_name)
         self.cfg.bottom_camera_name = str(getattr(agent1_env.cfg, "downward_camera_name", "bottom_center"))
         self.cfg.lidar_sensor_name = str(getattr(agent1_env.cfg, "lidar_sensor_name", "LidarSensor1"))
+        self._refresh_bottom_camera_intrinsics()
 
         fingerprint = getattr(agent1_env, "target_fingerprint", None)
         class_id = getattr(agent1_env, "target_class_id", None)
@@ -550,6 +1227,12 @@ class Agent2LandingEnv(gym.Env):
         validated_handoff_bbox = self._validated_xyxy(handoff_bbox, frame.shape)
         if validated_handoff_bbox is not None:
             self._last_bbox_xyxy = validated_handoff_bbox.copy()
+            self._control_bbox_xyxy = validated_handoff_bbox.copy()
+            self._control_bbox_history = [
+                self._xyxy_to_cxcywh(validated_handoff_bbox)
+            ]
+            self._control_bbox_outlier_suppressed = False
+            self._control_bbox_filter_mode = "HANDOFF_INIT"
             self._last_match_step = int(self._step)
             self._last_similarity = 1.0
             self.tracker.last_bbox = self._xyxy_to_xywh(validated_handoff_bbox)
@@ -660,6 +1343,12 @@ class Agent2LandingEnv(gym.Env):
         validated_handoff_bbox = self._validated_xyxy(handoff_bbox, frame.shape)
         if validated_handoff_bbox is not None:
             self._last_bbox_xyxy = validated_handoff_bbox.copy()
+            self._control_bbox_xyxy = validated_handoff_bbox.copy()
+            self._control_bbox_history = [
+                self._xyxy_to_cxcywh(validated_handoff_bbox)
+            ]
+            self._control_bbox_outlier_suppressed = False
+            self._control_bbox_filter_mode = "HANDOFF_INIT"
             self._last_match_step = int(self._step)
             self._last_similarity = 1.0
             self.tracker.last_bbox = self._xyxy_to_xywh(validated_handoff_bbox)
@@ -694,6 +1383,7 @@ class Agent2LandingEnv(gym.Env):
         self._attached_from_agent1 = False
         self.client.enableApiControl(True, vehicle_name=self.cfg.vehicle_name)
         self.client.armDisarm(True, vehicle_name=self.cfg.vehicle_name)
+        self._refresh_bottom_camera_intrinsics()
 
         if self._standalone_initial_pose is None:
             self._standalone_initial_pose = self.client.simGetVehiclePose(vehicle_name=self.cfg.vehicle_name)
@@ -758,7 +1448,16 @@ class Agent2LandingEnv(gym.Env):
         self._last_candidate_confidence = 0.0
         self._last_candidate_count = 0
         self._last_candidate_scores = []
+        self._adaptive_embeddings = []
+        self._adaptive_embedding_steps = []
+        self._last_adaptive_embedding_update_step = -999999
+        self._adaptive_embedding_updates = 0
         self._last_bbox_xyxy = None
+        self._control_bbox_xyxy = None
+        self._control_bbox_history = []
+        self._control_bbox_outlier_suppressed = False
+        self._control_bbox_filter_mode = "INIT"
+        self._last_bottom_observation_monotonic = 0.0
         self._last_bottom_frame = None
         self._last_info = {}
         self._last_vertical_control_state = "HOLD_INIT"
@@ -766,6 +1465,8 @@ class Agent2LandingEnv(gym.Env):
         self._last_raw_vz_action = 0.0
         self._last_requested_vz_mps = 0.0
         self._last_applied_vz_mps = 0.0
+        self._last_vertical_speed_limit_mps = 0.0
+        self._last_soft_catchup_descent_active = False
         self._last_climb_command_blocked = False
         self._last_observation_monotonic = None
         self._last_control_had_live_match = False
@@ -773,11 +1474,32 @@ class Agent2LandingEnv(gym.Env):
         self._last_control_err_y = 0.0
         self._control_img_vel_x = 0.0
         self._control_img_vel_y = 0.0
+        self._last_control_dt_s = float(self.cfg.cmd_duration_s)
+        self._predictive_catchup_active = False
+        self._predictive_catchup_release_streak = 0
+        self._last_predictive_guidance = {
+            "live_match": False,
+            "catchup_active": False,
+            "predicted_err_x": 0.0,
+            "predicted_err_y": 0.0,
+            "predicted_center_error": 999.0,
+            "image_velocity_x_per_s": 0.0,
+            "image_velocity_y_per_s": 0.0,
+            "image_speed_per_s": 0.0,
+            "outward_speed_per_s": 0.0,
+            "prediction_horizon_s": float(self.cfg.cmd_duration_s),
+            "correction_vx_mps": 0.0,
+            "correction_vy_mps": 0.0,
+            "correction_limit_mps": 0.0,
+        }
         self._reset_target_motion_estimator()
         self._non_live_started_monotonic = None
         self._non_live_duration_s = 0.0
         self._alignment_ready_streak = 0
         self._descent_alignment_latched = False
+        self._landing_lock_visual_gap_steps = 0
+        self._landing_lock_bad_live_steps = 0
+        self._landing_lock_acquired_step = -999999
         self._last_horizontal_control_state = "HOLD_INIT"
         self._last_pd_action_vx = 0.0
         self._last_pd_action_vy = 0.0
@@ -820,12 +1542,27 @@ class Agent2LandingEnv(gym.Env):
 
     @staticmethod
     def _xyxy_to_xywh(bbox: Any) -> list[int]:
+        """Convert XYXY to top-left XYWH for tracker APIs."""
         x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
         x = int(round(x1))
         y = int(round(y1))
         w = max(1, int(round(x2 - x1)))
         h = max(1, int(round(y2 - y1)))
         return [x, y, w, h]
+
+    @staticmethod
+    def _xyxy_to_cxcywh(bbox: Any) -> np.ndarray:
+        """Convert XYXY to floating-point center CXCYWH for control geometry."""
+        x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        return np.asarray(
+            [
+                0.5 * (x1 + x2),
+                0.5 * (y1 + y2),
+                max(1.0, x2 - x1),
+                max(1.0, y2 - y1),
+            ],
+            dtype=np.float64,
+        )
 
     def _get_bottom_frame(self) -> np.ndarray:
         responses = self.client.simGetImages(
@@ -840,16 +1577,19 @@ class Agent2LandingEnv(gym.Env):
         return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     def _strict_track(self, frame: np.ndarray) -> tuple[Optional[np.ndarray], float, str]:
-        """Track ``user_target`` using ResNet identity only.
+        """Track ``user_target`` with immutable identity plus verified landing views.
 
-        YOLO is a proposal generator. Its class ID and confidence are recorded
-        for diagnostics, but neither participates in target acceptance after
-        the initial user click/handoff.
+        YOLO remains a proposal generator. Adaptive embeddings may improve
+        close-range scale coverage, but a candidate must still agree with at
+        least one immutable identity anchor before it can become LIVE.
         """
-        references = list(self._reference_embeddings)
-        if not references and self._original_embedding is not None:
-            references = [self._original_embedding]
+        immutable_references = list(self._reference_embeddings)
+        if not immutable_references and self._original_embedding is not None:
+            immutable_references = [self._original_embedding]
+        references = self._all_reference_embeddings()
         if not references:
+            references = immutable_references
+        if not immutable_references or not references:
             return None, 0.0, "NO_IDENTITY"
 
         candidates = self.tracker._detect_candidates(frame)
@@ -869,29 +1609,37 @@ class Agent2LandingEnv(gym.Env):
             return None, 0.0, "NO_DETECTION"
 
         best = None
+        best_embedding: Optional[torch.Tensor] = None
         best_similarity = -1.0
+        best_immutable_similarity = -1.0
         best_anchor_index = -1
-        scored_candidates: list[tuple[float, Any, int]] = []
+        scored_candidates: list[tuple[float, Any, int, torch.Tensor, float]] = []
 
         for candidate_index, candidate in enumerate(candidates):
-            emb = self.tracker._embedding_from_bbox(frame, candidate.bbox)
-            if emb is None:
+            embedding = self.tracker._embedding_from_bbox(frame, candidate.bbox)
+            if embedding is None:
                 self._last_candidate_scores.append(
                     {
                         "candidate_index": int(candidate_index),
                         "yolo_class_id": int(candidate.cls_id),
                         "yolo_confidence": float(candidate.conf),
                         "resnet_similarity": -1.0,
+                        "immutable_similarity": -1.0,
                         "best_anchor_index": -1,
                     }
                 )
                 continue
 
             anchor_scores = [
-                float(torch.dot(reference, emb).detach().cpu().item())
+                float(torch.dot(reference, embedding).detach().cpu().item())
                 for reference in references
             ]
+            immutable_scores = [
+                float(torch.dot(reference, embedding).detach().cpu().item())
+                for reference in immutable_references
+            ]
             candidate_similarity = max(anchor_scores)
+            candidate_immutable_similarity = max(immutable_scores)
             candidate_anchor_index = int(np.argmax(anchor_scores))
             self._last_candidate_scores.append(
                 {
@@ -899,17 +1647,26 @@ class Agent2LandingEnv(gym.Env):
                     "yolo_class_id": int(candidate.cls_id),
                     "yolo_confidence": float(candidate.conf),
                     "resnet_similarity": float(candidate_similarity),
+                    "immutable_similarity": float(candidate_immutable_similarity),
                     "best_anchor_index": int(candidate_anchor_index),
                 }
             )
 
             if candidate_similarity > best_similarity:
                 best_similarity = float(candidate_similarity)
+                best_immutable_similarity = float(candidate_immutable_similarity)
                 best = candidate
+                best_embedding = embedding
                 best_anchor_index = candidate_anchor_index
 
             scored_candidates.append(
-                (float(candidate_similarity), candidate, int(candidate_anchor_index))
+                (
+                    float(candidate_similarity),
+                    candidate,
+                    int(candidate_anchor_index),
+                    embedding,
+                    float(candidate_immutable_similarity),
+                )
             )
 
         scored_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -940,7 +1697,14 @@ class Agent2LandingEnv(gym.Env):
                 or best_similarity >= float(self.cfg.high_conf_reacquire_similarity)
             )
 
-        similarity_ok = bool(best is not None and best_similarity >= self.cfg.min_match_similarity)
+        similarity_ok = bool(
+            best is not None and best_similarity >= self.cfg.min_match_similarity
+        )
+        immutable_identity_ok = bool(
+            best is not None
+            and best_immutable_similarity
+            >= float(self.cfg.adaptive_embedding_identity_floor)
+        )
         margin_ok = bool(
             best is not None
             and (
@@ -953,7 +1717,13 @@ class Agent2LandingEnv(gym.Env):
         self._last_match_margin = float(match_margin)
         self._last_spatial_jump_norm = float(spatial_jump_norm)
 
-        if best is None or not similarity_ok or not margin_ok or not spatial_ok:
+        if (
+            best is None
+            or not similarity_ok
+            or not immutable_identity_ok
+            or not margin_ok
+            or not spatial_ok
+        ):
             self._last_candidate_class_id = None if best is None else int(best.cls_id)
             self._last_candidate_confidence = 0.0 if best is None else float(best.conf)
             self._last_similarity = max(0.0, float(best_similarity))
@@ -963,6 +1733,8 @@ class Agent2LandingEnv(gym.Env):
                 self._last_match_reject_reason = "no_embedded_candidate"
             elif not similarity_ok:
                 self._last_match_reject_reason = "low_similarity"
+            elif not immutable_identity_ok:
+                self._last_match_reject_reason = "adaptive_match_failed_immutable_identity_floor"
             elif not margin_ok:
                 self._last_match_reject_reason = "ambiguous_similarity_margin"
             else:
@@ -980,12 +1752,25 @@ class Agent2LandingEnv(gym.Env):
         self._last_candidate_class_id = int(best.cls_id)
         self._last_candidate_confidence = float(best.conf)
 
-        # Keep detector metadata for diagnostics only. The identity remains
-        # ``user_target`` and the immutable reference embeddings never change.
+        additions = self._maybe_update_adaptive_embedding_bank(
+            frame=frame,
+            bbox_xywh=best.bbox,
+            immutable_similarity=float(best_immutable_similarity),
+            combined_similarity=float(best_similarity),
+        )
+
         self.tracker.last_bbox = list(best.bbox)
         self.tracker.last_good_bbox = list(best.bbox)
         self.tracker.last_score = float(best_similarity)
-        self.tracker.last_mode = f"MATCH_USER_TARGET_ANCHOR_{best_anchor_index}"
+        anchor_kind = (
+            "IMMUTABLE"
+            if best_anchor_index < len(immutable_references)
+            else "ADAPTIVE"
+        )
+        self.tracker.last_mode = (
+            f"MATCH_USER_TARGET_{anchor_kind}_{best_anchor_index}"
+            f"_BANKADD_{additions}"
+        )
         return self._last_bbox_xyxy.copy(), float(best_similarity), "MATCH"
 
     def _get_api_state(self) -> tuple[DroneState, float, Any]:
@@ -1016,22 +1801,33 @@ class Agent2LandingEnv(gym.Env):
         return drone_state, relative_height, state
 
     def _read_target_surface_altitude(self) -> None:
-        actor = str(self._target_actor_name or self.cfg.static_target_actor_name or "")
-        previous_z = float(self._target_surface_z_ned)
-        previous_source = str(self._target_surface_source)
+        actor = str(
+            getattr(self, "_target_actor_name", "")
+            or self.cfg.static_target_actor_name
+            or ""
+        )
+        previous_z = float(
+            getattr(
+                self,
+                "_target_surface_z_ned",
+                -float(self.cfg.static_target_surface_altitude_m),
+            )
+        )
+        previous_source = str(
+            getattr(self, "_target_surface_source", "configured_static")
+        )
         if actor:
             try:
                 pose = self.client.simGetObjectPose(actor)
-                self._update_target_velocity_from_pose(pose)
                 z_ned = float(pose.position.z_val)
                 if np.isfinite(z_ned):
                     self._target_surface_z_ned = z_ned
                     # Diagnostic conversion only. Relative height never uses it.
                     self._target_surface_altitude_m = max(0.0, -z_ned)
-                    self._target_surface_source = "api_object_pose_z_ned"
+                    self._target_surface_source = "api_object_pose_z_ned_only"
                     return
             except Exception:
-                self._target_velocity_valid = False
+                pass
 
             # A single read failure must not replace a previously valid moving
             # platform Z with the configured ground fallback. Keep the last
@@ -1053,8 +1849,32 @@ class Agent2LandingEnv(gym.Env):
         self._target_surface_source = "configured_static"
 
     def _reset_target_motion_estimator(self) -> None:
-        self._target_pose_xy = None
-        self._target_pose_monotonic = None
+        self._previous_motion_gray = None
+        self._previous_motion_bbox_xyxy = None
+        self._previous_motion_time = None
+        self._previous_relative_position_body = None
+        self._previous_relative_height_m = None
+        self._previous_motion_yaw_rad = None
+        self._visual_motion_attitude_valid = True
+        self._visual_motion_yaw_rate_dps = 0.0
+        self._visual_relative_position_body_x_m = 0.0
+        self._visual_relative_position_body_y_m = 0.0
+        self._visual_relative_velocity_body_x_mps = 0.0
+        self._visual_relative_velocity_body_y_mps = 0.0
+        self._visual_relative_velocity_valid = False
+        self._visual_kalman_state = None
+        self._visual_kalman_covariance = np.eye(4, dtype=np.float64)
+        self._visual_kalman_velocity_initialized = False
+        self._visual_motion_age_s = float("inf")
+        self._visual_motion_source = "WAIT"
+        self._visual_bbox_velocity_x_per_s = 0.0
+        self._visual_bbox_velocity_y_per_s = 0.0
+        self._visual_flow_velocity_x_per_s = 0.0
+        self._visual_flow_velocity_y_per_s = 0.0
+        self._visual_flow_point_count = 0
+        self._visual_flow_confidence = 0.0
+        self._drone_body_velocity_x_mps = 0.0
+        self._drone_body_velocity_y_mps = 0.0
         self._target_velocity_world_x_mps = 0.0
         self._target_velocity_world_y_mps = 0.0
         self._target_velocity_body_vx_mps = 0.0
@@ -1062,99 +1882,34 @@ class Agent2LandingEnv(gym.Env):
         self._target_velocity_speed_mps = 0.0
         self._target_velocity_valid = False
         self._target_velocity_age_s = float("inf")
+        self._reacquire_climb_started_monotonic = None
+        self._reacquire_climb_active = False
 
-    def _update_target_velocity_from_pose(
-        self,
-        pose: Any,
-        now: Optional[float] = None,
-    ) -> None:
-        """Estimate target world-NED XY velocity from consecutive actor poses."""
-        if not bool(self.cfg.target_velocity_feedforward_enabled):
-            self._target_velocity_valid = False
-            return
-
+    def _refresh_bottom_camera_intrinsics(self) -> None:
+        """Read only the camera FOV; target state is never queried here."""
+        hfov = float(self.cfg.bottom_camera_hfov_deg)
         try:
-            x = float(pose.position.x_val)
-            y = float(pose.position.y_val)
+            camera_info = self.client.simGetCameraInfo(
+                self.cfg.bottom_camera_name,
+                vehicle_name=self.cfg.vehicle_name,
+            )
+            candidate = float(getattr(camera_info, "fov", hfov))
+            if np.isfinite(candidate) and 20.0 <= candidate <= 170.0:
+                hfov = candidate
         except Exception:
-            self._target_velocity_valid = False
-            return
-        if not np.isfinite(x) or not np.isfinite(y):
-            self._target_velocity_valid = False
-            return
+            pass
+        self._bottom_camera_hfov_deg = float(hfov)
 
-        sample_time = float(time.monotonic() if now is None else now)
-        previous_xy = self._target_pose_xy
-        previous_time = self._target_pose_monotonic
-        self._target_pose_xy = (x, y)
-        self._target_pose_monotonic = sample_time
+    def _camera_projection_tangents(self, frame_shape: tuple[int, ...]) -> tuple[float, float]:
+        """Return tan(horizontal/vertical half FOV) for square image pixels."""
+        h, w = frame_shape[:2]
+        tan_h = math.tan(math.radians(float(self._bottom_camera_hfov_deg)) * 0.5)
+        tan_v = tan_h * float(h) / max(1.0, float(w))
+        return float(max(1.0e-4, tan_h)), float(max(1.0e-4, tan_v))
 
-        if previous_xy is None or previous_time is None:
-            self._target_velocity_valid = False
-            self._target_velocity_age_s = 0.0
-            return
-
-        dt = float(sample_time - previous_time)
-        if not np.isfinite(dt) or dt < 0.02 or dt > 3.0:
-            self._target_velocity_valid = False
-            self._target_velocity_age_s = 0.0
-            return
-
-        raw_vx = float((x - previous_xy[0]) / dt)
-        raw_vy = float((y - previous_xy[1]) / dt)
-        raw_speed = float(math.hypot(raw_vx, raw_vy))
-        if (
-            not np.isfinite(raw_speed)
-            or raw_speed > float(self.cfg.target_velocity_max_valid_mps)
-        ):
-            # A reset/teleport must never become a feed-forward speed command.
-            self._target_velocity_valid = False
-            self._target_velocity_world_x_mps = 0.0
-            self._target_velocity_world_y_mps = 0.0
-            self._target_velocity_speed_mps = 0.0
-            self._target_velocity_age_s = 0.0
-            return
-
-        alpha = float(np.clip(self.cfg.target_velocity_ema_alpha, 0.0, 1.0))
-        if not self._target_velocity_valid:
-            filtered_vx = raw_vx
-            filtered_vy = raw_vy
-        else:
-            filtered_vx = (
-                alpha * raw_vx
-                + (1.0 - alpha) * float(self._target_velocity_world_x_mps)
-            )
-            filtered_vy = (
-                alpha * raw_vy
-                + (1.0 - alpha) * float(self._target_velocity_world_y_mps)
-            )
-
-        self._target_velocity_world_x_mps = float(filtered_vx)
-        self._target_velocity_world_y_mps = float(filtered_vy)
-        self._target_velocity_speed_mps = float(math.hypot(filtered_vx, filtered_vy))
-        self._target_velocity_valid = True
-        self._target_velocity_age_s = 0.0
-
-    def _update_target_body_velocity(self, api_state: Any) -> None:
-        """Convert target world velocity into the current drone body frame."""
-        now = time.monotonic()
-        if self._target_pose_monotonic is None:
-            age = float("inf")
-        else:
-            age = max(0.0, float(now - self._target_pose_monotonic))
-        self._target_velocity_age_s = age
-
-        valid = bool(
-            self.cfg.target_velocity_feedforward_enabled
-            and self._target_velocity_valid
-            and age <= float(self.cfg.target_velocity_stale_after_s)
-        )
-        if not valid:
-            self._target_velocity_body_vx_mps = 0.0
-            self._target_velocity_body_vy_mps = 0.0
-            self._target_velocity_valid = False
-            return
-
+    @staticmethod
+    def _body_velocity_from_api_state(api_state: Any) -> tuple[float, float, float]:
+        """Convert the drone's own world-NED velocity to body XY and return yaw."""
         yaw = 0.0
         try:
             _pitch, _roll, yaw = airsim.to_eularian_angles(
@@ -1162,17 +1917,675 @@ class Agent2LandingEnv(gym.Env):
             )
         except Exception:
             yaw = 0.0
-
+        velocity = api_state.kinematics_estimated.linear_velocity
+        world_vx = float(velocity.x_val)
+        world_vy = float(velocity.y_val)
         cos_yaw = math.cos(float(yaw))
         sin_yaw = math.sin(float(yaw))
-        world_vx = float(self._target_velocity_world_x_mps)
-        world_vy = float(self._target_velocity_world_y_mps)
-        self._target_velocity_body_vx_mps = float(
-            cos_yaw * world_vx + sin_yaw * world_vy
+        body_vx = cos_yaw * world_vx + sin_yaw * world_vy
+        body_vy = -sin_yaw * world_vx + cos_yaw * world_vy
+        return float(body_vx), float(body_vy), float(yaw)
+
+    @staticmethod
+    def _attitude_from_api_state(api_state: Any) -> tuple[float, float, float]:
+        """Return pitch, roll and yaw radians from the drone state."""
+        try:
+            pitch, roll, yaw = airsim.to_eularian_angles(
+                api_state.kinematics_estimated.orientation
+            )
+            return float(pitch), float(roll), float(yaw)
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+    def _update_visual_motion_kalman(
+        self,
+        measured_x_m: float,
+        measured_y_m: float,
+        measured_vx_mps: Optional[float],
+        measured_vy_mps: Optional[float],
+        dt_s: float,
+        flow_confidence: float,
+        source: str,
+    ) -> tuple[float, float, float, float, bool]:
+        """Filter metric relative target state with a constant-velocity KF.
+
+        Measurements come only from bottom-camera geometry, bbox motion and
+        optical flow. The filter never reads target actor XY pose or velocity.
+        """
+        velocity_measurement_valid = bool(
+            measured_vx_mps is not None
+            and measured_vy_mps is not None
+            and np.isfinite(float(measured_vx_mps))
+            and np.isfinite(float(measured_vy_mps))
         )
-        self._target_velocity_body_vy_mps = float(
-            -sin_yaw * world_vx + cos_yaw * world_vy
+        measured_x = float(measured_x_m)
+        measured_y = float(measured_y_m)
+        measured_vx = float(measured_vx_mps or 0.0)
+        measured_vy = float(measured_vy_mps or 0.0)
+
+        if not bool(self.cfg.visual_kalman_enabled):
+            return (
+                measured_x,
+                measured_y,
+                measured_vx,
+                measured_vy,
+                velocity_measurement_valid,
+            )
+
+        dt = float(
+            np.clip(
+                dt_s,
+                float(self.cfg.visual_motion_min_dt_s),
+                float(self.cfg.visual_motion_max_dt_s),
+            )
         )
+        position_var = max(1.0e-6, float(self.cfg.visual_kalman_position_std_m) ** 2)
+        if str(source).startswith("BBOX+FLOW"):
+            flow_weight = float(np.clip(flow_confidence, 0.0, 1.0))
+            velocity_std = (
+                flow_weight * float(self.cfg.visual_kalman_velocity_std_flow_mps)
+                + (1.0 - flow_weight)
+                * float(self.cfg.visual_kalman_velocity_std_bbox_mps)
+            )
+        else:
+            velocity_std = float(self.cfg.visual_kalman_velocity_std_bbox_mps)
+        velocity_var = max(1.0e-5, velocity_std ** 2)
+
+        if self._visual_kalman_state is None:
+            self._visual_kalman_state = np.asarray(
+                [measured_x, measured_y, measured_vx, measured_vy],
+                dtype=np.float64,
+            )
+            self._visual_kalman_covariance = np.diag(
+                [position_var, position_var, velocity_var, velocity_var]
+            ).astype(np.float64)
+            self._visual_kalman_velocity_initialized = velocity_measurement_valid
+            return (
+                measured_x,
+                measured_y,
+                measured_vx,
+                measured_vy,
+                bool(self._visual_kalman_velocity_initialized),
+            )
+
+        transition = np.asarray(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        acceleration_std = max(
+            1.0e-3, float(self.cfg.visual_kalman_process_accel_std_mps2)
+        )
+        process_map = np.asarray(
+            [
+                [0.5 * dt * dt, 0.0],
+                [0.0, 0.5 * dt * dt],
+                [dt, 0.0],
+                [0.0, dt],
+            ],
+            dtype=np.float64,
+        )
+        process_noise = (acceleration_std ** 2) * (process_map @ process_map.T)
+        process_noise += np.eye(4, dtype=np.float64) * 1.0e-8
+
+        state_pred = transition @ self._visual_kalman_state
+        covariance_pred = (
+            transition @ self._visual_kalman_covariance @ transition.T
+            + process_noise
+        )
+
+        if velocity_measurement_valid:
+            measurement = np.asarray(
+                [measured_x, measured_y, measured_vx, measured_vy],
+                dtype=np.float64,
+            )
+            observation = np.eye(4, dtype=np.float64)
+            measurement_noise = np.diag(
+                [position_var, position_var, velocity_var, velocity_var]
+            ).astype(np.float64)
+        else:
+            measurement = np.asarray([measured_x, measured_y], dtype=np.float64)
+            observation = np.asarray(
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                dtype=np.float64,
+            )
+            measurement_noise = np.diag([position_var, position_var]).astype(
+                np.float64
+            )
+
+        innovation = measurement - observation @ state_pred
+        innovation_covariance = (
+            observation @ covariance_pred @ observation.T + measurement_noise
+        )
+        try:
+            kalman_gain = np.linalg.solve(
+                innovation_covariance.T,
+                (covariance_pred @ observation.T).T,
+            ).T
+        except np.linalg.LinAlgError:
+            kalman_gain = covariance_pred @ observation.T @ np.linalg.pinv(
+                innovation_covariance
+            )
+        state = state_pred + kalman_gain @ innovation
+        identity = np.eye(4, dtype=np.float64)
+        # Joseph form keeps covariance positive semi-definite under rounding.
+        correction = identity - kalman_gain @ observation
+        covariance = (
+            correction @ covariance_pred @ correction.T
+            + kalman_gain @ measurement_noise @ kalman_gain.T
+        )
+        self._visual_kalman_state = state
+        self._visual_kalman_covariance = covariance
+        if velocity_measurement_valid:
+            self._visual_kalman_velocity_initialized = True
+        return (
+            float(state[0]),
+            float(state[1]),
+            float(state[2]),
+            float(state[3]),
+            bool(self._visual_kalman_velocity_initialized),
+        )
+
+    @staticmethod
+    def _expanded_bbox_xyxy(
+        bbox_xyxy: np.ndarray,
+        frame_shape: tuple[int, ...],
+        scale: float,
+    ) -> np.ndarray:
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        bw = max(2.0, (x2 - x1) * float(scale))
+        bh = max(2.0, (y2 - y1) * float(scale))
+        return np.asarray(
+            [
+                np.clip(cx - 0.5 * bw, 0.0, max(0.0, w - 1.0)),
+                np.clip(cy - 0.5 * bh, 0.0, max(0.0, h - 1.0)),
+                np.clip(cx + 0.5 * bw, 1.0, float(w)),
+                np.clip(cy + 0.5 * bh, 1.0, float(h)),
+            ],
+            dtype=np.float32,
+        )
+
+    def _optical_flow_velocity_norm(
+        self,
+        previous_gray: np.ndarray,
+        current_gray: np.ndarray,
+        previous_bbox_xyxy: np.ndarray,
+        current_bbox_xyxy: np.ndarray,
+        dt: float,
+    ) -> tuple[float, float, int, float]:
+        """Estimate normalized target ROI motion with forward/backward LK flow."""
+        if not bool(self.cfg.optical_flow_enabled):
+            return 0.0, 0.0, 0, 0.0
+        h, w = previous_gray.shape[:2]
+        mask = np.zeros_like(previous_gray, dtype=np.uint8)
+        roi = self._expanded_bbox_xyxy(
+            previous_bbox_xyxy,
+            previous_gray.shape,
+            0.88,
+        )
+        x1, y1, x2, y2 = [int(round(v)) for v in roi]
+        if x2 - x1 < 6 or y2 - y1 < 6:
+            return 0.0, 0.0, 0, 0.0
+        mask[y1:y2, x1:x2] = 255
+        points0 = cv2.goodFeaturesToTrack(
+            previous_gray,
+            maxCorners=max(8, int(self.cfg.optical_flow_max_corners)),
+            qualityLevel=max(1.0e-5, float(self.cfg.optical_flow_quality_level)),
+            minDistance=max(2.0, float(self.cfg.optical_flow_min_distance_px)),
+            mask=mask,
+            blockSize=7,
+        )
+        if points0 is None or len(points0) < int(self.cfg.optical_flow_min_points):
+            return 0.0, 0.0, 0, 0.0
+
+        win = max(9, int(self.cfg.optical_flow_window_px))
+        if win % 2 == 0:
+            win += 1
+        lk = dict(
+            winSize=(win, win),
+            maxLevel=max(0, int(self.cfg.optical_flow_max_level)),
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
+        )
+        points1, status1, _error1 = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points0, None, **lk
+        )
+        if points1 is None or status1 is None:
+            return 0.0, 0.0, 0, 0.0
+        points0_back, status_back, _error_back = cv2.calcOpticalFlowPyrLK(
+            current_gray, previous_gray, points1, None, **lk
+        )
+        if points0_back is None or status_back is None:
+            return 0.0, 0.0, 0, 0.0
+
+        p0 = points0.reshape(-1, 2)
+        p1 = points1.reshape(-1, 2)
+        p0b = points0_back.reshape(-1, 2)
+        valid = (status1.reshape(-1) > 0) & (status_back.reshape(-1) > 0)
+        valid &= np.all(np.isfinite(p1), axis=1) & np.all(np.isfinite(p0b), axis=1)
+        fb_error = np.linalg.norm(p0 - p0b, axis=1)
+        valid &= fb_error <= float(self.cfg.optical_flow_max_forward_backward_error_px)
+
+        current_roi = self._expanded_bbox_xyxy(
+            current_bbox_xyxy,
+            current_gray.shape,
+            float(self.cfg.optical_flow_bbox_expand),
+        )
+        cx1, cy1, cx2, cy2 = [float(v) for v in current_roi]
+        valid &= (
+            (p1[:, 0] >= cx1)
+            & (p1[:, 0] <= cx2)
+            & (p1[:, 1] >= cy1)
+            & (p1[:, 1] <= cy2)
+        )
+        displacement = p1[valid] - p0[valid]
+        if displacement.shape[0] < int(self.cfg.optical_flow_min_points):
+            return 0.0, 0.0, int(displacement.shape[0]), 0.0
+
+        median = np.median(displacement, axis=0)
+        residual = np.linalg.norm(displacement - median.reshape(1, 2), axis=1)
+        mad = float(np.median(np.abs(residual - np.median(residual))))
+        threshold = max(1.5, 3.5 * 1.4826 * mad)
+        inliers = residual <= threshold
+        displacement = displacement[inliers]
+        if displacement.shape[0] < int(self.cfg.optical_flow_min_points):
+            return 0.0, 0.0, int(displacement.shape[0]), 0.0
+
+        median = np.median(displacement, axis=0)
+        clip_v = float(self.cfg.optical_flow_max_norm_velocity_per_s)
+        vel_x = float(np.clip(median[0] / max(1.0, 0.5 * w) / dt, -clip_v, clip_v))
+        vel_y = float(np.clip(median[1] / max(1.0, 0.5 * h) / dt, -clip_v, clip_v))
+        count = int(displacement.shape[0])
+        confidence = float(np.clip(count / max(1.0, 0.35 * self.cfg.optical_flow_max_corners), 0.0, 1.0))
+        return vel_x, vel_y, count, confidence
+
+    def _update_visual_target_motion(
+        self,
+        frame: np.ndarray,
+        bbox_xyxy: Optional[np.ndarray],
+        metrics: dict[str, float],
+        live_match: bool,
+        relative_height_m: float,
+        api_state: Any,
+    ) -> None:
+        """Fuse bbox motion and optical flow into a metric target velocity.
+
+        The target's absolute body-frame velocity is:
+
+            drone ego velocity + target relative velocity from bottom vision.
+
+        This is the only target-velocity estimator used by the controller.
+        """
+        now = float(time.monotonic())
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ego_vx, ego_vy, yaw = self._body_velocity_from_api_state(api_state)
+        pitch, roll, attitude_yaw = self._attitude_from_api_state(api_state)
+        if np.isfinite(attitude_yaw):
+            yaw = float(attitude_yaw)
+        self._drone_body_velocity_x_mps = ego_vx
+        self._drone_body_velocity_y_mps = ego_vy
+
+        if self._previous_motion_time is None:
+            dt = float(self.cfg.cmd_duration_s)
+        else:
+            dt = float(now - self._previous_motion_time)
+        measurement_max_dt = float(
+            getattr(
+                self.cfg,
+                "visual_motion_measurement_max_dt_s",
+                self.cfg.visual_motion_max_dt_s,
+            )
+        )
+        dt_valid = bool(
+            np.isfinite(dt)
+            and float(self.cfg.visual_motion_min_dt_s)
+            <= dt
+            <= measurement_max_dt
+        )
+        if dt_valid:
+            self._last_control_dt_s = dt
+
+        attitude_limit = float(
+            getattr(self.cfg, "visual_motion_attitude_gate_deg", 12.0)
+        )
+        max_attitude_deg = max(
+            abs(math.degrees(float(pitch))),
+            abs(math.degrees(float(roll))),
+        )
+        attitude_valid = bool(max_attitude_deg <= attitude_limit)
+        yaw_rate_dps = 0.0
+        if (
+            dt_valid
+            and self._previous_motion_yaw_rad is not None
+            and np.isfinite(float(self._previous_motion_yaw_rad))
+        ):
+            yaw_delta = math.atan2(
+                math.sin(float(yaw) - float(self._previous_motion_yaw_rad)),
+                math.cos(float(yaw) - float(self._previous_motion_yaw_rad)),
+            )
+            yaw_rate_dps = abs(math.degrees(yaw_delta) / max(dt, 1.0e-6))
+        yaw_motion_valid = bool(
+            yaw_rate_dps
+            <= float(getattr(self.cfg, "visual_motion_max_yaw_rate_dps", 45.0))
+        )
+        self._visual_motion_attitude_valid = bool(attitude_valid and yaw_motion_valid)
+        self._visual_motion_yaw_rate_dps = float(yaw_rate_dps)
+
+        if (
+            live_match
+            and bbox_xyxy is not None
+            and np.isfinite(relative_height_m)
+            and float(relative_height_m) > 0.05
+        ):
+            err_x = float(metrics.get("err_x", 0.0) or 0.0)
+            err_y = float(metrics.get("err_y", 0.0) or 0.0)
+            height = max(0.05, float(relative_height_m))
+            tan_h, tan_v = self._camera_projection_tangents(frame.shape)
+            relative_x = float(-err_y * height * tan_v)
+            relative_y = float(err_x * height * tan_h)
+            self._visual_relative_position_body_x_m = relative_x
+            self._visual_relative_position_body_y_m = relative_y
+
+            bbox_vel_x_norm = 0.0
+            bbox_vel_y_norm = 0.0
+            flow_vel_x_norm = 0.0
+            flow_vel_y_norm = 0.0
+            flow_count = 0
+            flow_confidence = 0.0
+            relative_vx = 0.0
+            relative_vy = 0.0
+            measurement_valid = False
+            source = "POSITION_ONLY"
+
+            if (
+                dt_valid
+                and attitude_valid
+                and yaw_motion_valid
+                and self._previous_motion_bbox_xyxy is not None
+                and self._previous_relative_position_body is not None
+                and self._previous_motion_gray is not None
+            ):
+                prev_metrics = self._bbox_metrics(
+                    self._previous_motion_bbox_xyxy,
+                    self._previous_motion_gray.shape,
+                )
+                bbox_vel_x_norm = float(
+                    (err_x - float(prev_metrics["err_x"])) / dt
+                )
+                bbox_vel_y_norm = float(
+                    (err_y - float(prev_metrics["err_y"])) / dt
+                )
+                flow_vel_x_norm, flow_vel_y_norm, flow_count, flow_confidence = (
+                    self._optical_flow_velocity_norm(
+                        self._previous_motion_gray,
+                        gray,
+                        self._previous_motion_bbox_xyxy,
+                        bbox_xyxy,
+                        dt,
+                    )
+                )
+
+                flow_available = bool(
+                    flow_count >= int(self.cfg.optical_flow_min_points)
+                    and flow_confidence > 0.0
+                )
+                if flow_available:
+                    disagreement = float(
+                        math.hypot(
+                            flow_vel_x_norm - bbox_vel_x_norm,
+                            flow_vel_y_norm - bbox_vel_y_norm,
+                        )
+                    )
+                    if disagreement <= float(
+                        self.cfg.optical_flow_max_bbox_disagreement_per_s
+                    ):
+                        flow_weight = float(
+                            np.clip(
+                                float(self.cfg.optical_flow_weight)
+                                * flow_confidence,
+                                0.15,
+                                0.80,
+                            )
+                        )
+                    else:
+                        flow_weight = 0.15
+                    fused_vel_x_norm = float(
+                        flow_weight * flow_vel_x_norm
+                        + (1.0 - flow_weight) * bbox_vel_x_norm
+                    )
+                    fused_vel_y_norm = float(
+                        flow_weight * flow_vel_y_norm
+                        + (1.0 - flow_weight) * bbox_vel_y_norm
+                    )
+                    source = "BBOX+FLOW"
+                else:
+                    fused_vel_x_norm = bbox_vel_x_norm
+                    fused_vel_y_norm = bbox_vel_y_norm
+                    source = "BBOX"
+
+                alpha_img = float(
+                    np.clip(self.cfg.horizontal_velocity_ema_alpha, 0.0, 1.0)
+                )
+                self._control_img_vel_x = float(
+                    alpha_img * fused_vel_x_norm
+                    + (1.0 - alpha_img) * self._control_img_vel_x
+                )
+                self._control_img_vel_y = float(
+                    alpha_img * fused_vel_y_norm
+                    + (1.0 - alpha_img) * self._control_img_vel_y
+                )
+
+                previous_x, previous_y = self._previous_relative_position_body
+                if (
+                    bool(getattr(self.cfg, "visual_motion_yaw_compensation", True))
+                    and self._previous_motion_yaw_rad is not None
+                ):
+                    # Express the previous body-frame target vector in the
+                    # current body frame before differentiating it.
+                    frame_delta = float(self._previous_motion_yaw_rad) - float(yaw)
+                    c_delta = math.cos(frame_delta)
+                    s_delta = math.sin(frame_delta)
+                    previous_x, previous_y = (
+                        c_delta * previous_x - s_delta * previous_y,
+                        s_delta * previous_x + c_delta * previous_y,
+                    )
+                bbox_metric_vx = float((relative_x - previous_x) / dt)
+                bbox_metric_vy = float((relative_y - previous_y) / dt)
+                previous_height = (
+                    height
+                    if self._previous_relative_height_m is None
+                    else float(self._previous_relative_height_m)
+                )
+                height_rate = float((height - previous_height) / dt)
+                flow_metric_vx = float(
+                    -tan_v * (height * fused_vel_y_norm + err_y * height_rate)
+                )
+                flow_metric_vy = float(
+                    tan_h * (height * fused_vel_x_norm + err_x * height_rate)
+                )
+                metric_weight = 0.55 if source == "BBOX+FLOW" else 0.25
+                raw_relative_vx = float(
+                    metric_weight * flow_metric_vx
+                    + (1.0 - metric_weight) * bbox_metric_vx
+                )
+                raw_relative_vy = float(
+                    metric_weight * flow_metric_vy
+                    + (1.0 - metric_weight) * bbox_metric_vy
+                )
+
+                max_relative = float(self.cfg.target_velocity_max_valid_mps) + 4.0
+                raw_speed = float(math.hypot(raw_relative_vx, raw_relative_vy))
+                if np.isfinite(raw_speed) and raw_speed <= max_relative:
+                    alpha_rel = float(
+                        np.clip(
+                            self.cfg.visual_relative_velocity_ema_alpha,
+                            0.0,
+                            1.0,
+                        )
+                    )
+                    if self._visual_relative_velocity_valid:
+                        relative_vx = float(
+                            alpha_rel * raw_relative_vx
+                            + (1.0 - alpha_rel)
+                            * self._visual_relative_velocity_body_x_mps
+                        )
+                        relative_vy = float(
+                            alpha_rel * raw_relative_vy
+                            + (1.0 - alpha_rel)
+                            * self._visual_relative_velocity_body_y_mps
+                        )
+                    else:
+                        relative_vx = raw_relative_vx
+                        relative_vy = raw_relative_vy
+                    measurement_valid = True
+
+            (
+                filtered_relative_x,
+                filtered_relative_y,
+                filtered_relative_vx,
+                filtered_relative_vy,
+                filtered_velocity_valid,
+            ) = self._update_visual_motion_kalman(
+                measured_x_m=relative_x,
+                measured_y_m=relative_y,
+                measured_vx_mps=relative_vx if measurement_valid else None,
+                measured_vy_mps=relative_vy if measurement_valid else None,
+                dt_s=(
+                    min(
+                        dt,
+                        float(getattr(self.cfg, "visual_motion_kalman_dt_max_s", 0.80)),
+                    )
+                    if dt_valid
+                    else float(self.cfg.cmd_duration_s)
+                ),
+                flow_confidence=flow_confidence,
+                source=source,
+            )
+            self._visual_relative_position_body_x_m = float(filtered_relative_x)
+            self._visual_relative_position_body_y_m = float(filtered_relative_y)
+            relative_vx = float(filtered_relative_vx)
+            relative_vy = float(filtered_relative_vy)
+            velocity_estimate_valid = bool(filtered_velocity_valid)
+            if velocity_estimate_valid and source != "POSITION_ONLY":
+                source = f"{source}+KALMAN"
+            self._visual_motion_source = source
+
+            self._visual_bbox_velocity_x_per_s = float(bbox_vel_x_norm)
+            self._visual_bbox_velocity_y_per_s = float(bbox_vel_y_norm)
+            self._visual_flow_velocity_x_per_s = float(flow_vel_x_norm)
+            self._visual_flow_velocity_y_per_s = float(flow_vel_y_norm)
+            self._visual_flow_point_count = int(flow_count)
+            self._visual_flow_confidence = float(flow_confidence)
+
+            if velocity_estimate_valid:
+                self._visual_relative_velocity_body_x_mps = float(relative_vx)
+                self._visual_relative_velocity_body_y_mps = float(relative_vy)
+                self._visual_relative_velocity_valid = True
+                self._visual_motion_age_s = 0.0
+
+                raw_target_vx = float(ego_vx + relative_vx)
+                raw_target_vy = float(ego_vy + relative_vy)
+                raw_target_speed = float(math.hypot(raw_target_vx, raw_target_vy))
+                if raw_target_speed <= float(self.cfg.target_velocity_max_valid_mps):
+                    if self._target_velocity_valid:
+                        max_delta = float(
+                            max(
+                                0.05,
+                                self.cfg.target_velocity_max_accel_mps2
+                                * min(
+                                    dt,
+                                    float(getattr(self.cfg, "visual_motion_kalman_dt_max_s", 0.80)),
+                                ),
+                            )
+                        )
+                        delta_x = raw_target_vx - self._target_velocity_body_vx_mps
+                        delta_y = raw_target_vy - self._target_velocity_body_vy_mps
+                        delta_speed = float(math.hypot(delta_x, delta_y))
+                        if delta_speed > max_delta:
+                            scale = max_delta / max(delta_speed, 1.0e-6)
+                            raw_target_vx = self._target_velocity_body_vx_mps + delta_x * scale
+                            raw_target_vy = self._target_velocity_body_vy_mps + delta_y * scale
+                    alpha_target = float(
+                        np.clip(self.cfg.target_velocity_ema_alpha, 0.0, 1.0)
+                    )
+                    if self._target_velocity_valid:
+                        filtered_vx = float(
+                            alpha_target * raw_target_vx
+                            + (1.0 - alpha_target)
+                            * self._target_velocity_body_vx_mps
+                        )
+                        filtered_vy = float(
+                            alpha_target * raw_target_vy
+                            + (1.0 - alpha_target)
+                            * self._target_velocity_body_vy_mps
+                        )
+                    else:
+                        filtered_vx = raw_target_vx
+                        filtered_vy = raw_target_vy
+                    self._target_velocity_body_vx_mps = filtered_vx
+                    self._target_velocity_body_vy_mps = filtered_vy
+                    self._target_velocity_speed_mps = float(
+                        math.hypot(filtered_vx, filtered_vy)
+                    )
+                    # Diagnostic world components are reconstructed from the
+                    # visual body estimate; they are not actor API measurements.
+                    cos_yaw = math.cos(yaw)
+                    sin_yaw = math.sin(yaw)
+                    self._target_velocity_world_x_mps = float(
+                        cos_yaw * filtered_vx - sin_yaw * filtered_vy
+                    )
+                    self._target_velocity_world_y_mps = float(
+                        sin_yaw * filtered_vx + cos_yaw * filtered_vy
+                    )
+                    self._target_velocity_valid = True
+                    self._target_velocity_age_s = 0.0
+
+            self._previous_motion_gray = gray
+            self._previous_motion_bbox_xyxy = bbox_xyxy.copy()
+            self._previous_motion_time = now
+            self._previous_relative_position_body = (relative_x, relative_y)
+            self._previous_relative_height_m = height
+            self._previous_motion_yaw_rad = float(yaw)
+            self._last_control_err_x = err_x
+            self._last_control_err_y = err_y
+            self._last_control_had_live_match = True
+            self._last_observation_monotonic = now
+            return
+
+        # No current LIVE measurement. Preserve the estimate only for a short,
+        # bounded prediction interval; never update it from PRED itself.
+        if self._previous_motion_time is not None:
+            age = max(0.0, float(now - self._previous_motion_time))
+        else:
+            age = float("inf")
+        self._visual_motion_age_s = age
+        self._target_velocity_age_s = age
+        if age > float(self.cfg.target_velocity_stale_after_s):
+            self._target_velocity_valid = False
+            self._visual_relative_velocity_valid = False
+            self._visual_motion_source = "STALE"
+            self._control_img_vel_x = 0.0
+            self._control_img_vel_y = 0.0
+        self._last_control_had_live_match = False
+        self._last_observation_monotonic = now
+
+    def _update_target_body_velocity(self, api_state: Any) -> None:
+        """Age the visual estimate; retained for call-site compatibility."""
+        if self._previous_motion_time is None:
+            self._target_velocity_age_s = float("inf")
+            self._target_velocity_valid = False
+            return
+        age = max(0.0, float(time.monotonic() - self._previous_motion_time))
+        self._target_velocity_age_s = age
+        self._visual_motion_age_s = age
+        if age > float(self.cfg.target_velocity_stale_after_s):
+            self._target_velocity_valid = False
 
     def _get_obstacles(self, api_altitude_m: float, relative_height_m: float) -> dict[str, Any]:
         max_d = float(self.cfg.lidar_max_range_m)
@@ -1202,6 +2615,171 @@ class Agent2LandingEnv(gym.Env):
         result["down_dist_m"] = max(0.0, float(relative_height_m))
         result["obstacle_source"] = "lidar_horizontal+api_z_vertical"
         return result
+
+    def _stabilize_control_bbox(
+        self,
+        bbox_xyxy: Optional[np.ndarray],
+        *,
+        live_match: bool,
+        frame_shape: tuple[int, ...],
+    ) -> Optional[np.ndarray]:
+        """Return a stable control bbox without shifting it away from the target.
+
+        ``_xyxy_to_xywh`` is a tracker helper and returns top-left ``x, y``.
+        The previous implementation accidentally interpreted those values as
+        center ``cx, cy``. That moved the control box by roughly half its width
+        and height and became especially visible when the vehicle approached an
+        image edge.
+
+        Center and size are filtered independently here. The current verified
+        LIVE center remains responsive, while median/EMA filtering is retained
+        for detector width/height changes. Edge-clipped sizes never suppress a
+        valid center update.
+        """
+        if not bool(self.cfg.control_bbox_filter_enabled):
+            self._control_bbox_filter_mode = "DISABLED"
+            return (
+                None
+                if bbox_xyxy is None
+                else np.asarray(bbox_xyxy, dtype=np.float32).copy()
+            )
+
+        if bbox_xyxy is None or not bool(live_match):
+            self._control_bbox_outlier_suppressed = False
+            self._control_bbox_filter_mode = "HOLD_PRED"
+            return (
+                None
+                if self._control_bbox_xyxy is None
+                else self._control_bbox_xyxy.copy()
+            )
+
+        raw = self._validated_xyxy(bbox_xyxy, frame_shape)
+        if raw is None:
+            self._control_bbox_filter_mode = "HOLD_INVALID"
+            return (
+                None
+                if self._control_bbox_xyxy is None
+                else self._control_bbox_xyxy.copy()
+            )
+
+        raw_cxcywh = self._xyxy_to_cxcywh(raw)
+        h, w = frame_shape[:2]
+        edge_margin = max(1.0, float(self.cfg.control_bbox_edge_margin_px))
+        touches_left = bool(float(raw[0]) <= edge_margin)
+        touches_top = bool(float(raw[1]) <= edge_margin)
+        touches_right = bool(float(raw[2]) >= float(w) - edge_margin)
+        touches_bottom = bool(float(raw[3]) >= float(h) - edge_margin)
+        edge_clipped = bool(
+            touches_left or touches_top or touches_right or touches_bottom
+        )
+
+        # Keep robust history for size only. A bbox clipped by the image border
+        # has a truncated visible size and must not teach the filter that the
+        # physical target suddenly became smaller.
+        history = list(getattr(self, "_control_bbox_history", []))
+        if not edge_clipped or not history:
+            history.append(raw_cxcywh.copy())
+            keep = max(1, int(self.cfg.control_bbox_history_size))
+            history = history[-keep:]
+            self._control_bbox_history = history
+        robust_size = (
+            np.median(np.stack(history, axis=0), axis=0)[2:4]
+            if history
+            else raw_cxcywh[2:4].copy()
+        )
+
+        if self._control_bbox_xyxy is None:
+            filtered_center = raw_cxcywh[0:2].copy()
+            filtered_size = raw_cxcywh[2:4].copy()
+            center_outlier = False
+            size_outlier = False
+            self._control_bbox_filter_mode = (
+                "EDGE_INIT" if edge_clipped else "TRACK_INIT"
+            )
+        else:
+            previous = self._xyxy_to_cxcywh(self._control_bbox_xyxy)
+            frame_diag = max(1.0, math.hypot(float(w), float(h)))
+            center_jump_norm = float(
+                np.linalg.norm(raw_cxcywh[0:2] - previous[0:2]) / frame_diag
+            )
+            width_ratio = abs(float(robust_size[0] - previous[2])) / max(
+                1.0, float(previous[2])
+            )
+            height_ratio = abs(float(robust_size[1] - previous[3])) / max(
+                1.0, float(previous[3])
+            )
+
+            # Reaching an image edge is expected motion, not a bad center. A
+            # large non-edge jump remains strongly suppressed as before.
+            center_outlier = bool(
+                not edge_clipped
+                and center_jump_norm
+                > float(self.cfg.control_bbox_outlier_center_jump_norm)
+            )
+            size_outlier = bool(
+                max(width_ratio, height_ratio)
+                > float(self.cfg.control_bbox_outlier_size_ratio)
+            )
+            if edge_clipped:
+                center_alpha = float(self.cfg.control_bbox_edge_center_alpha)
+            elif center_outlier:
+                center_alpha = float(self.cfg.control_bbox_outlier_alpha)
+            else:
+                center_alpha = float(self.cfg.control_bbox_center_alpha)
+            size_alpha = float(
+                self.cfg.control_bbox_outlier_alpha
+                if size_outlier
+                else self.cfg.control_bbox_size_alpha
+            )
+            center_alpha = float(np.clip(center_alpha, 0.0, 1.0))
+            size_alpha = float(np.clip(size_alpha, 0.0, 1.0))
+            filtered_center = (
+                center_alpha * raw_cxcywh[0:2]
+                + (1.0 - center_alpha) * previous[0:2]
+            )
+            filtered_size = (
+                size_alpha * robust_size
+                + (1.0 - size_alpha) * previous[2:4]
+            )
+            if edge_clipped:
+                self._control_bbox_filter_mode = "EDGE_FOLLOW"
+            elif center_outlier:
+                self._control_bbox_filter_mode = "CENTER_GUARD"
+            elif size_outlier:
+                self._control_bbox_filter_mode = "SIZE_GUARD"
+            else:
+                self._control_bbox_filter_mode = "TRACK"
+
+        self._control_bbox_outlier_suppressed = bool(
+            center_outlier or size_outlier
+        )
+
+        cx, cy = [float(v) for v in filtered_center]
+        bw, bh = [float(v) for v in filtered_size]
+        cx = float(np.clip(cx, 1.0, max(1.0, float(w) - 1.0)))
+        cy = float(np.clip(cy, 1.0, max(1.0, float(h) - 1.0)))
+        bw = float(np.clip(bw, 2.0, max(2.0, float(w))))
+        bh = float(np.clip(bh, 2.0, max(2.0, float(h))))
+
+        # Preserve the filtered center at an image edge. The old code shifted
+        # the center inward until the full historical size fit in the frame,
+        # leaving the rectangle on the road. Shrink only the visible extent.
+        visible_bw = min(bw, max(2.0, 2.0 * min(cx, float(w) - cx)))
+        visible_bh = min(bh, max(2.0, 2.0 * min(cy, float(h) - cy)))
+        filtered_xyxy = np.asarray(
+            [
+                cx - 0.5 * visible_bw,
+                cy - 0.5 * visible_bh,
+                cx + 0.5 * visible_bw,
+                cy + 0.5 * visible_bh,
+            ],
+            dtype=np.float32,
+        )
+        filtered_xyxy = self._validated_xyxy(filtered_xyxy, frame_shape)
+        if filtered_xyxy is None:
+            filtered_xyxy = raw.copy()
+        self._control_bbox_xyxy = filtered_xyxy.copy()
+        return filtered_xyxy
 
     @staticmethod
     def _bbox_metrics(bbox_xyxy: Optional[np.ndarray], frame_shape: tuple[int, ...]) -> dict[str, float]:
@@ -1235,8 +2813,15 @@ class Agent2LandingEnv(gym.Env):
         frame = self._get_bottom_frame() if frame is None else frame
         self._sync_image_geometry(frame)
         self._last_bottom_frame = frame.copy()
-        bbox_xyxy, similarity, tracker_mode = self._strict_track(frame)
+        raw_bbox_xyxy, similarity, tracker_mode = self._strict_track(frame)
+        live_match = bool(tracker_mode == "MATCH")
+        bbox_xyxy = self._stabilize_control_bbox(
+            raw_bbox_xyxy,
+            live_match=live_match,
+            frame_shape=frame.shape,
+        )
         metrics = self._bbox_metrics(bbox_xyxy, frame.shape)
+        self._last_bottom_observation_monotonic = float(time.monotonic())
 
         # The moving platform may change world Z on uneven roads. Refresh its
         # API pose before every vertical-state calculation. No actor movement is
@@ -1245,7 +2830,14 @@ class Agent2LandingEnv(gym.Env):
             self._read_target_surface_altitude()
 
         drone_state, relative_height, api_state = self._get_api_state()
-        self._update_target_body_velocity(api_state)
+        self._update_visual_target_motion(
+            frame=frame,
+            bbox_xyxy=bbox_xyxy,
+            metrics=metrics,
+            live_match=live_match,
+            relative_height_m=relative_height,
+            api_state=api_state,
+        )
         drone_z_ned = float(api_state.kinematics_estimated.position.z_val)
         obstacle = self._get_obstacles(drone_state.altitude_m, relative_height)
         obstacle_state = ObstacleState(
@@ -1278,8 +2870,6 @@ class Agent2LandingEnv(gym.Env):
             dt=float(self.cfg.cmd_duration_s),
         )
 
-        live_match = bool(tracker_mode == "MATCH")
-        self._update_control_image_velocity(metrics, live_match)
         match_recent = bool(
             self._step - self._last_match_step <= self.cfg.good_collision_recent_match_steps
         )
@@ -1327,6 +2917,8 @@ class Agent2LandingEnv(gym.Env):
             "identity_judge": "resnet_only",
             "yolo_proposal_conf_threshold": float(self.cfg.yolo_proposal_conf),
             "reference_anchor_count": int(len(self._reference_embeddings)),
+            "adaptive_anchor_count": int(len(self._adaptive_embeddings)),
+            "adaptive_embedding_updates": int(self._adaptive_embedding_updates),
             "has_front_anchor": self._original_embedding is not None,
             "has_bottom_anchor": self._bottom_anchor_embedding is not None,
             "yolo_candidate_count": int(self._last_candidate_count),
@@ -1349,15 +2941,53 @@ class Agent2LandingEnv(gym.Env):
             "bottom_spatial_jump_norm": float(self._last_spatial_jump_norm),
             "bottom_match_reject_reason": self._last_match_reject_reason,
             "bottom_similarity": float(similarity),
+            "bottom_bbox_filter_enabled": bool(self.cfg.control_bbox_filter_enabled),
+            "bottom_bbox_outlier_suppressed": bool(
+                self._control_bbox_outlier_suppressed
+            ),
+            "bottom_bbox_filter_mode": str(self._control_bbox_filter_mode),
+            "bottom_bbox_raw_xyxy": (
+                None
+                if raw_bbox_xyxy is None
+                else [
+                    float(v)
+                    for v in np.asarray(raw_bbox_xyxy).reshape(-1)[:4]
+                ]
+            ),
+            "bottom_bbox_control_xyxy": (
+                None
+                if bbox_xyxy is None
+                else [float(v) for v in np.asarray(bbox_xyxy).reshape(-1)[:4]]
+            ),
             "bottom_err_x": metrics["err_x"],
             "bottom_err_y": metrics["err_y"],
             "bottom_center_error": metrics["center_error"],
             "bottom_bbox_rel_err": metrics["bbox_rel_error"],
+            "bottom_bbox_rel_gate_required": bool(
+                self._bbox_relative_alignment_required(
+                    {
+                        "relative_height_to_target_m": relative_height,
+                    }
+                )
+            ),
             "bottom_bbox_area_norm": metrics["area_norm"],
             "bottom_img_vel_x_control": float(self._control_img_vel_x),
             "bottom_img_vel_y_control": float(self._control_img_vel_y),
+            "bottom_control_dt_s": float(self._last_control_dt_s),
+            "predicted_bottom_err_x": float(self._last_predictive_guidance.get("predicted_err_x", 0.0)),
+            "predicted_bottom_err_y": float(self._last_predictive_guidance.get("predicted_err_y", 0.0)),
+            "predicted_bottom_center_error": float(self._last_predictive_guidance.get("predicted_center_error", 999.0)),
+            "predictive_bottom_catchup_active": bool(self._predictive_catchup_active),
             "alignment_ready_streak": int(self._alignment_ready_streak),
             "descent_alignment_latched": bool(self._descent_alignment_latched),
+            "landing_lock_active": bool(self._descent_alignment_latched),
+            "landing_lock_visual_gap_steps": int(self._landing_lock_visual_gap_steps),
+            "landing_lock_bad_live_steps": int(self._landing_lock_bad_live_steps),
+            "landing_lock_age_steps": int(
+                self._step - self._landing_lock_acquired_step
+                if self._descent_alignment_latched
+                else -1
+            ),
             "horizontal_control_state": self._last_horizontal_control_state,
             "horizontal_pd_action_vx": float(self._last_pd_action_vx),
             "horizontal_pd_action_vy": float(self._last_pd_action_vy),
@@ -1366,13 +2996,55 @@ class Agent2LandingEnv(gym.Env):
             "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
             "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
             "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
-            "target_velocity_valid": bool(self._target_velocity_valid),
-            "target_velocity_age_s": float(self._target_velocity_age_s),
-            "target_velocity_world_x_mps": float(self._target_velocity_world_x_mps),
-            "target_velocity_world_y_mps": float(self._target_velocity_world_y_mps),
-            "target_velocity_body_vx_mps": float(self._target_velocity_body_vx_mps),
-            "target_velocity_body_vy_mps": float(self._target_velocity_body_vy_mps),
-            "target_velocity_speed_mps": float(self._target_velocity_speed_mps),
+            "target_velocity_valid": bool(getattr(self, "_target_velocity_valid", False)),
+            "target_velocity_age_s": float(getattr(self, "_target_velocity_age_s", float("inf"))),
+            "target_velocity_world_x_mps": float(getattr(self, "_target_velocity_world_x_mps", 0.0)),
+            "target_velocity_world_y_mps": float(getattr(self, "_target_velocity_world_y_mps", 0.0)),
+            "target_velocity_body_vx_mps": float(getattr(self, "_target_velocity_body_vx_mps", 0.0)),
+            "target_velocity_body_vy_mps": float(getattr(self, "_target_velocity_body_vy_mps", 0.0)),
+            "target_velocity_speed_mps": float(getattr(self, "_target_velocity_speed_mps", 0.0)),
+            "target_velocity_source": "bottom_vision_plus_drone_ego_velocity",
+            "target_actor_xy_velocity_api_used": False,
+            "visual_motion_source": str(self._visual_motion_source),
+            "visual_motion_age_s": float(self._visual_motion_age_s),
+            "visual_motion_attitude_valid": bool(self._visual_motion_attitude_valid),
+            "visual_motion_yaw_rate_dps": float(self._visual_motion_yaw_rate_dps),
+            "visual_relative_position_body_x_m": float(
+                self._visual_relative_position_body_x_m
+            ),
+            "visual_relative_position_body_y_m": float(
+                self._visual_relative_position_body_y_m
+            ),
+            "visual_relative_velocity_body_x_mps": float(
+                self._visual_relative_velocity_body_x_mps
+            ),
+            "visual_relative_velocity_body_y_mps": float(
+                self._visual_relative_velocity_body_y_mps
+            ),
+            "visual_relative_velocity_valid": bool(
+                self._visual_relative_velocity_valid
+            ),
+            "visual_kalman_enabled": bool(self.cfg.visual_kalman_enabled),
+            "visual_kalman_velocity_initialized": bool(
+                self._visual_kalman_velocity_initialized
+            ),
+            "visual_bbox_velocity_x_per_s": float(
+                self._visual_bbox_velocity_x_per_s
+            ),
+            "visual_bbox_velocity_y_per_s": float(
+                self._visual_bbox_velocity_y_per_s
+            ),
+            "visual_flow_velocity_x_per_s": float(
+                self._visual_flow_velocity_x_per_s
+            ),
+            "visual_flow_velocity_y_per_s": float(
+                self._visual_flow_velocity_y_per_s
+            ),
+            "visual_flow_point_count": int(self._visual_flow_point_count),
+            "visual_flow_confidence": float(self._visual_flow_confidence),
+            "drone_body_velocity_x_mps": float(self._drone_body_velocity_x_mps),
+            "drone_body_velocity_y_mps": float(self._drone_body_velocity_y_mps),
+            "bottom_camera_hfov_deg": float(self._bottom_camera_hfov_deg),
             "horizontal_velocity_ff_vx_mps": float(self._last_velocity_ff_vx_mps),
             "horizontal_velocity_ff_vy_mps": float(self._last_velocity_ff_vy_mps),
             "horizontal_correction_vx_mps": float(self._last_horizontal_correction_vx_mps),
@@ -1402,6 +3074,8 @@ class Agent2LandingEnv(gym.Env):
             "raw_vz_action": float(self._last_raw_vz_action),
             "requested_vz_mps": float(self._last_requested_vz_mps),
             "applied_vz_mps": float(self._last_applied_vz_mps),
+            "vertical_speed_limit_mps": float(self._last_vertical_speed_limit_mps),
+            "soft_catchup_descent_active": bool(self._last_soft_catchup_descent_active),
             "climb_command_blocked": bool(self._last_climb_command_blocked),
         }
 
@@ -1410,19 +3084,35 @@ class Agent2LandingEnv(gym.Env):
             h, w = vis.shape[:2]
             cv2.drawMarker(vis, (w // 2, h // 2), (0, 255, 0), cv2.MARKER_CROSS, 28, 2)
             display_mode = tracker_mode
-            if live_match and not match_confirmed:
+            if live_match and not bool(self._descent_alignment_latched):
                 display_mode = (
-                    f"MATCH_PENDING({self._live_match_streak}/"
-                    f"{int(self.cfg.match_confirmation_steps)})"
+                    f"LOCK_PENDING({self._alignment_ready_streak}/"
+                    f"{int(self.cfg.alignment_streak_required)})"
                 )
+            elif live_match and bool(self._descent_alignment_latched):
+                display_mode = "MATCH_LANDING_LOCK"
+            if raw_bbox_xyxy is not None and live_match:
+                rx1, ry1, rx2, ry2 = [int(v) for v in raw_bbox_xyxy]
+                cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (255, 255, 0), 1)
             if bbox_xyxy is not None:
                 x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
                 color = (0, 255, 0) if match_confirmed else (0, 255, 255)
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(vis, f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f}", (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
             cv2.putText(
                 vis,
-                f"API height above target={relative_height:.2f}m YOLOcls(diag)={self._last_candidate_class_id}",
+                f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f} "
+                f"bboxFilter={self._control_bbox_filter_mode}",
+                (15, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                vis,
+                f"API height above target={relative_height:.2f}m "
+                f"BRelGate={'FINAL' if self._bbox_relative_alignment_required(info) else 'CENTER_ONLY'} "
+                f"YOLOcls(diag)={self._last_candidate_class_id}",
                 (15, 56),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
@@ -1433,7 +3123,8 @@ class Agent2LandingEnv(gym.Env):
                 vis,
                 f"Z_CTRL={self._last_vertical_control_state} "
                 f"raw={self._last_raw_vz_action:+.2f} "
-                f"down={self._last_requested_vz_mps:+.2f} applied={self._last_applied_vz_mps:+.2f}",
+                f"down={self._last_requested_vz_mps:+.2f} applied={self._last_applied_vz_mps:+.2f} "
+                f"cap={self._last_vertical_speed_limit_mps:+.2f}",
                 (15, 84),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -1452,13 +3143,58 @@ class Agent2LandingEnv(gym.Env):
                 (0, 255, 255),
                 2,
             )
+            external = dict(getattr(self, "_last_external_command_info", {}) or {})
+            if bool(self.cfg.parallel_dual_agent_mode):
+                cv2.putText(
+                    vis,
+                    f"PHYSICAL_XY=({float(external.get('agent1_commanded_vx_mps', 0.0)):+.2f},"
+                    f"{float(external.get('agent1_commanded_vy_mps', 0.0)):+.2f})m/s "
+                    f"A1W={float(external.get('agent1_xy_weight', 1.0)):.2f} "
+                    f"BPD=({float(external.get('bottom_guidance_vx_mps', 0.0)):+.2f},"
+                    f"{float(external.get('bottom_guidance_vy_mps', 0.0)):+.2f})",
+                    (15, 140),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    vis,
+                    f"FF=({float(external.get('target_velocity_ff_vx_mps', 0.0)):+.2f},"
+                    f"{float(external.get('target_velocity_ff_vy_mps', 0.0)):+.2f}) "
+                    f"LOCK={int(bool(self._descent_alignment_latched))} "
+                    f"CATCH={int(bool(external.get('bottom_predictive_catchup', False)))} "
+                    f"BANK={len(self._adaptive_embeddings)}",
+                    (15, 168),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.putText(
+                    vis,
+                    f"PRED=({float(external.get('bottom_predicted_err_x', 0.0)):+.2f},"
+                    f"{float(external.get('bottom_predicted_err_y', 0.0)):+.2f}) "
+                    f"IVEL=({float(external.get('bottom_image_velocity_x_per_s', 0.0)):+.2f},"
+                    f"{float(external.get('bottom_image_velocity_y_per_s', 0.0)):+.2f}) "
+                    f"H={float(external.get('bottom_prediction_horizon_s', 0.0)):.2f}s",
+                    (15, 196),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.46,
+                    (0, 255, 255),
+                    2,
+                )
+                target_vel_y = 224
+            else:
+                target_vel_y = 140
             cv2.putText(
                 vis,
-                f"TARGET_VEL={'VALID' if self._target_velocity_valid else 'WAIT'} "
+                f"VISUAL_TARGET_VEL={'VALID' if self._target_velocity_valid else 'WAIT'} "
                 f"body=({self._target_velocity_body_vx_mps:+.2f},"
                 f"{self._target_velocity_body_vy_mps:+.2f})m/s "
+                f"src={self._visual_motion_source} flowN={self._visual_flow_point_count} "
                 f"lost={self._lost_steps}/{self._non_live_duration_s:.1f}s",
-                (15, 140),
+                (15, target_vel_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
                 (0, 255, 255),
@@ -1474,19 +3210,41 @@ class Agent2LandingEnv(gym.Env):
     # Control/reward
     # ------------------------------------------------------------------
     def _update_control_image_velocity(self, metrics: dict[str, float], live_match: bool) -> None:
-        """Estimate live target motion using real wall-clock spacing between frames."""
+        """Estimate bottom-frame relative velocity using real frame spacing."""
         now = time.monotonic()
+        self._last_control_dt_s = float(self.cfg.cmd_duration_s)
         if live_match:
             err_x = float(metrics.get("err_x", 0.0) or 0.0)
             err_y = float(metrics.get("err_y", 0.0) or 0.0)
             if self._last_control_had_live_match and self._last_observation_monotonic is not None:
                 dt = float(np.clip(now - self._last_observation_monotonic, 0.03, 1.0))
+                self._last_control_dt_s = dt
                 clip_v = float(self.cfg.horizontal_velocity_clip_per_s)
-                raw_vx = float(np.clip((err_x - self._last_control_err_x) / dt, -clip_v, clip_v))
-                raw_vy = float(np.clip((err_y - self._last_control_err_y) / dt, -clip_v, clip_v))
-                alpha = float(np.clip(self.cfg.horizontal_velocity_ema_alpha, 0.0, 1.0))
-                self._control_img_vel_x = float(alpha * raw_vx + (1.0 - alpha) * self._control_img_vel_x)
-                self._control_img_vel_y = float(alpha * raw_vy + (1.0 - alpha) * self._control_img_vel_y)
+                raw_vx = float(
+                    np.clip(
+                        (err_x - self._last_control_err_x) / dt,
+                        -clip_v,
+                        clip_v,
+                    )
+                )
+                raw_vy = float(
+                    np.clip(
+                        (err_y - self._last_control_err_y) / dt,
+                        -clip_v,
+                        clip_v,
+                    )
+                )
+                alpha = float(
+                    np.clip(self.cfg.horizontal_velocity_ema_alpha, 0.0, 1.0)
+                )
+                self._control_img_vel_x = float(
+                    alpha * raw_vx
+                    + (1.0 - alpha) * self._control_img_vel_x
+                )
+                self._control_img_vel_y = float(
+                    alpha * raw_vy
+                    + (1.0 - alpha) * self._control_img_vel_y
+                )
             else:
                 self._control_img_vel_x = 0.0
                 self._control_img_vel_y = 0.0
@@ -1537,25 +3295,9 @@ class Agent2LandingEnv(gym.Env):
         raw: np.ndarray,
         info: dict[str, Any],
     ) -> tuple[float, float, dict[str, Any]]:
-        """Combine target-speed feed-forward, visual PD, and PPO residual."""
+        """Combine target-velocity feed-forward and predictive bottom guidance."""
         live_match = bool(info.get("bottom_match_live", False))
         confirmed = bool(info.get("bottom_match_confirmed", False))
-        err_x = float(info.get("bottom_err_x", 0.0) or 0.0)
-        err_y = float(info.get("bottom_err_y", 0.0) or 0.0)
-        vel_x = float(
-            info.get(
-                "bottom_img_vel_x_control",
-                getattr(self, "_control_img_vel_x", 0.0),
-            )
-            or 0.0
-        )
-        vel_y = float(
-            info.get(
-                "bottom_img_vel_y_control",
-                getattr(self, "_control_img_vel_y", 0.0),
-            )
-            or 0.0
-        )
         correction_speed_limit = self._horizontal_speed_limit(info)
 
         velocity_valid = bool(info.get("target_velocity_valid", False))
@@ -1572,18 +3314,15 @@ class Agent2LandingEnv(gym.Env):
         )
         ff_speed = float(math.hypot(ff_vx, ff_vy))
         max_total = max(0.10, float(self.cfg.horizontal_total_speed_max_mps))
-        total_speed_limit = float(
-            min(max_total, max(correction_speed_limit, ff_speed + correction_speed_limit))
+
+        guidance = self._compute_predictive_bottom_guidance(
+            info,
+            update_hysteresis=True,
         )
+        guidance_active = bool(guidance.get("guidance_active", live_match))
+        prediction_only = bool(guidance.get("prediction_only", False))
 
-        def clip_vector(vx: float, vy: float, limit: float) -> tuple[float, float]:
-            magnitude = float(math.hypot(vx, vy))
-            if magnitude <= max(1.0e-9, limit):
-                return float(vx), float(vy)
-            scale = float(limit / magnitude)
-            return float(vx * scale), float(vy * scale)
-
-        if not live_match:
+        if not guidance_active:
             self._episode_xy_hold_steps = int(
                 getattr(self, "_episode_xy_hold_steps", 0)
             ) + 1
@@ -1592,12 +3331,11 @@ class Agent2LandingEnv(gym.Env):
             )
             velocity_hold = bool(
                 velocity_valid
-                and no_live_duration_s <= float(
-                    self.cfg.horizontal_velocity_hold_max_s
-                )
+                and no_live_duration_s
+                <= float(self.cfg.horizontal_velocity_hold_max_s)
             )
             if velocity_hold:
-                vx, vy = clip_vector(ff_vx, ff_vy, total_speed_limit)
+                vx, vy = self._clip_vector(ff_vx, ff_vy, max_total)
                 state = "VELOCITY_HOLD_NO_LIVE_MATCH"
             else:
                 vx, vy = 0.0, 0.0
@@ -1617,58 +3355,82 @@ class Agent2LandingEnv(gym.Env):
                 "correction_vy_mps": 0.0,
                 "command_vx_mps": float(vx),
                 "command_vy_mps": float(vy),
-                "total_speed_limit_mps": total_speed_limit,
+                "total_speed_limit_mps": max_total,
+                "predicted_err_x": 0.0,
+                "predicted_err_y": 0.0,
+                "predicted_center_error": 999.0,
+                "image_velocity_x_per_s": 0.0,
+                "image_velocity_y_per_s": 0.0,
+                "prediction_horizon_s": float(self.cfg.cmd_duration_s),
+                "catchup_active": False,
+                "guidance_active": False,
+                "prediction_only": False,
             }
             return float(vx), float(vy), details
 
-        pd_ax = (
-            -float(self.cfg.horizontal_pd_kp_y_to_vx) * err_y
-            - float(self.cfg.horizontal_pd_kd_y_to_vx) * vel_y
+        predictive_vx = float(guidance["bottom_correction_vx_mps"])
+        predictive_vy = float(guidance["bottom_correction_vy_mps"])
+        correction_limit = max(
+            0.05,
+            float(guidance.get("correction_limit_mps", correction_speed_limit)),
         )
-        pd_ay = (
-            float(self.cfg.horizontal_pd_kp_x_to_vy) * err_x
-            + float(self.cfg.horizontal_pd_kd_x_to_vy) * vel_x
-        )
-
-        if (
-            abs(err_y) <= float(self.cfg.horizontal_deadband_error)
-            and abs(vel_y) <= float(self.cfg.horizontal_deadband_velocity)
-        ):
-            pd_ax = 0.0
-        if (
-            abs(err_x) <= float(self.cfg.horizontal_deadband_error)
-            and abs(vel_x) <= float(self.cfg.horizontal_deadband_velocity)
-        ):
-            pd_ay = 0.0
-
-        pd_max = float(np.clip(self.cfg.horizontal_pd_max_action, 0.05, 1.0))
-        pd_ax = float(np.clip(pd_ax, -pd_max, pd_max))
-        pd_ay = float(np.clip(pd_ay, -pd_max, pd_max))
 
         residual_max = float(
             np.clip(self.cfg.horizontal_ppo_residual_max_action, 0.0, 0.30)
         )
-        if confirmed:
+        if confirmed and live_match:
             residual_ax = float(
                 np.clip(float(raw[0]) * residual_max, -residual_max, residual_max)
             )
             residual_ay = float(
                 np.clip(float(raw[1]) * residual_max, -residual_max, residual_max)
             )
-            state = "VELOCITY_FF_PD_PLUS_RESIDUAL"
         else:
             residual_ax = 0.0
             residual_ay = 0.0
-            state = "VELOCITY_FF_PD_MATCH_PENDING"
 
-        final_ax = float(np.clip(pd_ax + residual_ax, -1.0, 1.0))
-        final_ay = float(np.clip(pd_ay + residual_ay, -1.0, 1.0))
-        correction_vx = float(final_ax * correction_speed_limit)
-        correction_vy = float(final_ay * correction_speed_limit)
-        vx, vy = clip_vector(
+        # PPO XY remains a small residual in standalone Agent-2 mode. In the
+        # parallel wrapper this residual is masked and only deterministic
+        # predictive guidance is exported.
+        residual_vx = float(residual_ax * correction_speed_limit)
+        residual_vy = float(residual_ay * correction_speed_limit)
+        correction_vx = float(predictive_vx + residual_vx)
+        correction_vy = float(predictive_vy + residual_vy)
+        correction_vx, correction_vy = self._clip_vector(
+            correction_vx,
+            correction_vy,
+            correction_limit,
+        )
+
+        total_speed_limit = float(
+            min(
+                max_total,
+                max(
+                    correction_limit,
+                    ff_speed + correction_limit,
+                ),
+            )
+        )
+        vx, vy = self._clip_vector(
             ff_vx + correction_vx,
             ff_vy + correction_vy,
             total_speed_limit,
+        )
+
+        pd_ax = float(np.clip(predictive_vx / correction_limit, -1.0, 1.0))
+        pd_ay = float(np.clip(predictive_vy / correction_limit, -1.0, 1.0))
+        final_ax = float(np.clip(correction_vx / correction_limit, -1.0, 1.0))
+        final_ay = float(np.clip(correction_vy / correction_limit, -1.0, 1.0))
+        state = (
+            "PREDICTIVE_BOTTOM_SHORT_PREDICTION"
+            if prediction_only
+            else "PREDICTIVE_BOTTOM_CATCHUP"
+            if bool(guidance.get("catchup_active", False))
+            else (
+                "PREDICTIVE_BOTTOM_PLUS_RESIDUAL"
+                if confirmed
+                else "PREDICTIVE_BOTTOM_MATCH_PENDING"
+            )
         )
 
         details = {
@@ -1679,7 +3441,7 @@ class Agent2LandingEnv(gym.Env):
             "residual_ay": residual_ay,
             "final_ax": final_ax,
             "final_ay": final_ay,
-            "speed_limit_mps": correction_speed_limit,
+            "speed_limit_mps": correction_limit,
             "ff_vx_mps": ff_vx,
             "ff_vy_mps": ff_vy,
             "correction_vx_mps": correction_vx,
@@ -1687,6 +3449,15 @@ class Agent2LandingEnv(gym.Env):
             "command_vx_mps": vx,
             "command_vy_mps": vy,
             "total_speed_limit_mps": total_speed_limit,
+            "predicted_err_x": float(guidance["predicted_err_x"]),
+            "predicted_err_y": float(guidance["predicted_err_y"]),
+            "predicted_center_error": float(guidance["predicted_center_error"]),
+            "image_velocity_x_per_s": float(guidance["image_velocity_x_per_s"]),
+            "image_velocity_y_per_s": float(guidance["image_velocity_y_per_s"]),
+            "prediction_horizon_s": float(guidance["prediction_horizon_s"]),
+            "catchup_active": bool(guidance["catchup_active"]),
+            "guidance_active": bool(guidance_active),
+            "prediction_only": bool(prediction_only),
         }
         return float(vx), float(vy), details
 
@@ -1903,14 +3674,15 @@ class Agent2LandingEnv(gym.Env):
         # This is intentionally redundant with _vertical_control_state(). It
         # prevents a future caller from creating physical authorization without
         # current, confirmed visual evidence.
+        geometry_ok, _ = self._landing_alignment_geometry(
+            pre_info, acquire=False, soft_catchup=False
+        )
         valid_evidence = bool(
             live_match
             and confirmed
             and np.isfinite(center_error)
-            and np.isfinite(bbox_rel)
             and np.isfinite(similarity)
-            and center_error <= float(self.cfg.alignment_exit_center_error)
-            and bbox_rel <= float(self.cfg.alignment_exit_bbox_rel_error)
+            and geometry_ok
             and similarity >= float(self.cfg.descent_min_similarity)
         )
         if not valid_evidence:
@@ -1951,7 +3723,7 @@ class Agent2LandingEnv(gym.Env):
             "contact_guard_similarity": 0.0,
             "contact_guard_margin": 0.0,
         }
-        if collision_now or not self._attached_from_agent1:
+        if collision_now or not bool(getattr(self, "_attached_from_agent1", False)):
             return result
         if bool(info.get("bottom_match_live", False)):
             return result
@@ -1999,7 +3771,9 @@ class Agent2LandingEnv(gym.Env):
         Historical visual latches and prior descent authorization are logged for
         diagnosis, but they cannot grant terminal reward. Success requires a
         target-object collision plus either a centered LIVE bottom-camera match
-        or direct target appearance under the camera in the current frame.
+        or, only when no LIVE bbox exists, direct target appearance under the
+        camera in the current frame. A bad LIVE alignment cannot be overridden
+        by appearance similarity.
         """
         live_match = bool(info.get("bottom_match_live", False))
         center_error = float(info.get("bottom_center_error", 999.0))
@@ -2028,8 +3802,14 @@ class Agent2LandingEnv(gym.Env):
                 "reason": "not_a_collision_step",
             }
 
-        if live_alignment:
-            success_path = "LIVE_MATCH"
+        # LIVE geometry has precedence over appearance. If a live bbox exists
+        # but is not centered, a broad ResNet crop must never rescue the event:
+        # that exact pattern is a side impact where the vehicle remains visible
+        # at the edge of the bottom frame. CONTACT_APPEARANCE is only a fallback
+        # when the live detector has disappeared because the target fills the
+        # camera immediately before contact.
+        if live_match:
+            success_path = "LIVE_MATCH" if live_alignment else "NONE"
         elif bool(contact["valid"]):
             success_path = "CONTACT_APPEARANCE"
         else:
@@ -2089,6 +3869,8 @@ class Agent2LandingEnv(gym.Env):
             reject_reason = "ground_or_terrain_collision"
         elif not normalized_object:
             reject_reason = "empty_collision_object"
+        elif live_match and not live_alignment:
+            reject_reason = "live_match_not_centered"
         elif not current_bottom_evidence:
             reject_reason = str(contact.get("reason", "bottom_target_not_verified")) or "bottom_target_not_verified"
         elif not object_matches_target:
@@ -2155,59 +3937,332 @@ class Agent2LandingEnv(gym.Env):
         except Exception:
             return False, "", 0
 
+    def _bbox_relative_alignment_required(self, info: dict[str, Any]) -> bool:
+        """Require footprint-relative centering only in the final approach.
+
+        ``bottom_bbox_rel_err`` scales the image-center offset by bbox size. At
+        high altitude the same safe image-space offset therefore looks worse
+        merely because the target bbox is smaller. Keeping it as an unconditional
+        descent gate prevents the vehicle from ever getting close enough for the
+        metric to become useful.
+        """
+        height = float(info.get("relative_height_to_target_m", float("inf")))
+        if not np.isfinite(height):
+            return True
+        return bool(
+            height <= float(self.cfg.landing_bbox_rel_gate_below_height_m)
+        )
+
+    def _landing_alignment_geometry(
+        self,
+        info: dict[str, Any],
+        *,
+        acquire: bool,
+        soft_catchup: bool,
+    ) -> tuple[bool, str]:
+        """Evaluate filtered landing geometry without a high-altitude deadlock.
+
+        Image-center error is always required. BBOX-relative error is added only
+        in the final approach, where it correctly asks whether the camera center
+        lies inside the target footprint.
+        """
+        center_error = float(info.get("bottom_center_error", 999.0))
+        bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
+
+        if soft_catchup:
+            center_limit = float(
+                self.cfg.catchup_descent_enter_center_error
+                if acquire
+                else self.cfg.catchup_descent_exit_center_error
+            )
+        else:
+            center_limit = float(
+                self.cfg.alignment_enter_center_error
+                if acquire
+                else self.cfg.alignment_exit_center_error
+            )
+
+        if not np.isfinite(center_error) or center_error > center_limit:
+            return False, "target_center_error_too_large"
+
+        if self._bbox_relative_alignment_required(info):
+            bbox_limit = float(
+                self.cfg.alignment_enter_bbox_rel_error
+                if acquire
+                else self.cfg.alignment_exit_bbox_rel_error
+            )
+            if not np.isfinite(bbox_rel) or bbox_rel > bbox_limit:
+                return False, "target_bbox_relative_error_too_large_near_contact"
+
+        return True, "safe_filtered_landing_geometry"
+
+    def _catchup_descent_gate(self, info: dict[str, Any]) -> tuple[bool, str]:
+        """Use stable current-frame geometry; catch-up itself is not a Z veto.
+
+        Instantaneous image velocity, metric outward velocity and attitude are
+        derived from the same visual signal used by XY. Using them as absolute
+        Z vetoes created a circular deadlock: a noisy XY correction increased
+        pitch/velocity estimates, which then prevented landing forever. A
+        confirmed LIVE identity and the filtered current-frame landing geometry
+        are the vertical safety contract.
+        """
+        if not bool(self.cfg.catchup_descent_enabled):
+            return False, "catchup_descent_disabled"
+        if not bool(info.get("bottom_match_live", False)):
+            return False, "catchup_descent_requires_live_match"
+        if not bool(info.get("bottom_match_confirmed", False)):
+            return False, "catchup_descent_requires_confirmed_match"
+        if float(info.get("bottom_similarity", 0.0)) < float(
+            self.cfg.descent_min_similarity
+        ):
+            return False, "catchup_descent_similarity_too_low"
+        geometry_ok, geometry_reason = self._landing_alignment_geometry(
+            info,
+            acquire=not bool(self._descent_alignment_latched),
+            soft_catchup=True,
+        )
+        if not geometry_ok:
+            return False, f"catchup_descent_{geometry_reason}"
+
+        # Keep one forward-looking guard, but base it on the filtered geometry
+        # and a deliberately wider hysteresis window. Derivative image speed,
+        # metric outward speed and instantaneous attitude are not vertical vetoes
+        # because they are the noisy quantities that caused the original cycle.
+        guidance = dict(getattr(self, "_last_predictive_guidance", {}) or {})
+        current_center = float(info.get("bottom_center_error", 999.0))
+        predicted_center = float(
+            guidance.get("predicted_center_error", current_center)
+        )
+        if (
+            np.isfinite(predicted_center)
+            and predicted_center
+            > float(self.cfg.catchup_descent_max_predicted_center_error)
+        ):
+            return False, "catchup_descent_predicted_center_escaping"
+        return True, "safe_filtered_live_geometry"
+
+    def _catchup_descent_speed_limit(self, info: dict[str, Any]) -> float:
+        """Return a bounded positive NED-Z speed for safe catch-up descent."""
+        limit = max(0.0, float(self.cfg.catchup_descent_max_vz_mps))
+        height = float(info.get("relative_height_to_target_m", float("inf")))
+        if np.isfinite(height) and height <= float(
+            self.cfg.catchup_descent_touchdown_height_m
+        ):
+            limit = min(
+                limit,
+                max(0.0, float(self.cfg.catchup_descent_touchdown_max_vz_mps)),
+            )
+        return float(limit)
+
+    def _bounded_descent_command(
+        self,
+        requested_vz_mps: float,
+        vertical_state: str,
+        descent_allowed: bool,
+        info: dict[str, Any],
+    ) -> tuple[float, float, bool]:
+        """Apply the state-specific positive NED-Z limit in one testable place."""
+        requested = max(0.0, float(requested_vz_mps))
+        if not bool(descent_allowed):
+            return 0.0, 0.0, False
+        soft_catchup = str(vertical_state).startswith("DESCEND_SOFT_CATCHUP")
+        if soft_catchup:
+            limit = self._catchup_descent_speed_limit(info)
+            return min(requested, limit), float(limit), True
+        return requested, requested, False
+
     def _vertical_control_state(self, info: dict[str, Any]) -> tuple[str, bool, str]:
-        """Alignment-gated descent with hysteresis and recentering."""
+        """Fast-acquire landing lock with safe catch-up descent and gap tolerance.
+
+        LIVE alignment acquires the lock. Predictive catch-up blocks descent only
+        when the target is actually escaping or the visual evidence is unsafe.
+        A confirmed, centered LIVE target may build the same landing-lock streak
+        during catch-up and then descend under a strict speed cap. A brief
+        PRED/no-detection gap still blocks Z immediately while preserving a
+        previously acquired lock.
+        """
         live_match = bool(info.get("bottom_match_live", False))
-        confirmed = bool(info.get("bottom_match_confirmed", False))
         similarity = float(info.get("bottom_similarity", 0.0))
         center_error = float(info.get("bottom_center_error", 999.0))
         bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
-        streak = int(info.get("bottom_live_match_streak", 0))
 
         if not live_match:
             self._alignment_ready_streak = 0
-            self._descent_alignment_latched = False
+            self._landing_lock_bad_live_steps = 0
+            if bool(self._descent_alignment_latched):
+                self._landing_lock_visual_gap_steps += 1
+                if self._landing_lock_visual_gap_steps <= max(
+                    0, int(self.cfg.landing_lock_max_visual_gap_steps)
+                ):
+                    return (
+                        "HOLD_LANDING_LOCK_VISUAL_GAP",
+                        False,
+                        "descent_paused_during_short_visual_gap",
+                    )
+                self._descent_alignment_latched = False
+                self._landing_lock_acquired_step = -999999
+                return (
+                    "HOLD_LANDING_LOCK_RELEASED",
+                    False,
+                    "landing_lock_released_after_sustained_visual_gap",
+                )
             return "HOLD_NO_LIVE_MATCH", False, "target_not_detected_current_frame"
-        if not confirmed or streak < int(self.cfg.descent_min_live_match_streak):
-            self._alignment_ready_streak = 0
-            self._descent_alignment_latched = False
-            return "HOLD_MATCH_CONFIRM", False, "live_match_streak_too_short"
-        if similarity < float(self.cfg.descent_min_similarity):
-            self._alignment_ready_streak = 0
-            self._descent_alignment_latched = False
-            return "HOLD_LOW_SIMILARITY", False, "resnet_similarity_below_descent_threshold"
 
-        if bool(getattr(self, "_descent_alignment_latched", False)):
-            if center_error > float(self.cfg.alignment_exit_center_error):
-                self._alignment_ready_streak = 0
-                self._descent_alignment_latched = False
-                self._episode_recenter_steps = int(getattr(self, "_episode_recenter_steps", 0)) + 1
-                return "RECENTER_XY", False, "center_error_exceeded_descent_exit_limit"
-            if bbox_rel > float(self.cfg.alignment_exit_bbox_rel_error):
-                self._alignment_ready_streak = 0
-                self._descent_alignment_latched = False
-                self._episode_recenter_steps = int(getattr(self, "_episode_recenter_steps", 0)) + 1
-                return "RECENTER_BBOX", False, "bbox_error_exceeded_descent_exit_limit"
-            return "DESCEND_TRACKING", True, ""
-
-        enter_ok = bool(
-            center_error <= float(self.cfg.alignment_enter_center_error)
-            and bbox_rel <= float(self.cfg.alignment_enter_bbox_rel_error)
+        self._landing_lock_visual_gap_steps = 0
+        similarity_ok = bool(
+            similarity >= float(self.cfg.descent_min_similarity)
         )
-        if enter_ok:
-            self._alignment_ready_streak = int(getattr(self, "_alignment_ready_streak", 0)) + 1
-        else:
+        if not similarity_ok:
             self._alignment_ready_streak = 0
+            self._landing_lock_bad_live_steps = 0
+            return (
+                "HOLD_LOW_SIMILARITY",
+                False,
+                "resnet_similarity_below_descent_threshold",
+            )
+
+        catchup_active = bool(getattr(self, "_predictive_catchup_active", False))
+        soft_catchup_ok = False
+        soft_catchup_reason = "catchup_inactive"
+        if catchup_active:
+            soft_catchup_ok, soft_catchup_reason = self._catchup_descent_gate(info)
+            if not soft_catchup_ok:
+                self._landing_lock_bad_live_steps = 0
+                if not bool(self._descent_alignment_latched):
+                    self._alignment_ready_streak = 0
+                return (
+                    "HOLD_PREDICTIVE_CATCHUP",
+                    False,
+                    soft_catchup_reason,
+                )
+
+        if bool(self._descent_alignment_latched):
+            if catchup_active:
+                keep_ok = bool(soft_catchup_ok)
+            else:
+                keep_ok, _ = self._landing_alignment_geometry(
+                    info, acquire=False, soft_catchup=False
+                )
+                keep_ok = bool(similarity_ok and keep_ok)
+            if keep_ok:
+                self._landing_lock_bad_live_steps = 0
+                if catchup_active:
+                    return (
+                        "DESCEND_SOFT_CATCHUP_LANDING_LOCK",
+                        True,
+                        "",
+                    )
+                return "DESCEND_LANDING_LOCK", True, ""
+
+            self._landing_lock_bad_live_steps += 1
+            if self._landing_lock_bad_live_steps >= max(
+                1, int(self.cfg.landing_lock_bad_live_release_steps)
+            ):
+                self._descent_alignment_latched = False
+                self._landing_lock_acquired_step = -999999
+                self._alignment_ready_streak = 0
+                self._episode_recenter_steps = int(
+                    getattr(self, "_episode_recenter_steps", 0)
+                ) + 1
+                return (
+                    "RECENTER_LANDING_LOCK_RELEASED",
+                    False,
+                    "landing_lock_released_after_sustained_live_misalignment",
+                )
+
+            return (
+                "RECENTER_LANDING_LOCK_HELD",
+                False,
+                "descent_paused_but_landing_lock_preserved",
+            )
+
+        self._landing_lock_bad_live_steps = 0
+        if catchup_active:
+            enter_ok = bool(soft_catchup_ok)
+            enter_reason = str(soft_catchup_reason)
+        else:
+            enter_ok, enter_reason = self._landing_alignment_geometry(
+                info, acquire=True, soft_catchup=False
+            )
+        if enter_ok:
+            self._alignment_ready_streak += 1
+        else:
+            self._alignment_ready_streak = max(0, self._alignment_ready_streak - 1)
 
         required = max(1, int(self.cfg.alignment_streak_required))
         if self._alignment_ready_streak >= required:
             self._descent_alignment_latched = True
-            return "DESCEND_TRACKING", True, ""
-        if center_error > float(self.cfg.alignment_enter_center_error):
-            return "ALIGN_CENTER", False, "target_center_error_too_large"
-        if bbox_rel > float(self.cfg.alignment_enter_bbox_rel_error):
-            return "ALIGN_BBOX", False, "target_bbox_relative_error_too_large"
-        return "ALIGN_STABLE_PENDING", False, "alignment_streak_too_short"
+            self._landing_lock_acquired_step = int(getattr(self, "_step", 0))
+            self._landing_lock_visual_gap_steps = 0
+            self._landing_lock_bad_live_steps = 0
+            if catchup_active:
+                return (
+                    "DESCEND_SOFT_CATCHUP_LOCK_ACQUIRED",
+                    True,
+                    "",
+                )
+            return "DESCEND_LANDING_LOCK_ACQUIRED", True, ""
+        if not enter_ok:
+            state = (
+                "ALIGN_BBOX"
+                if "bbox_relative" in str(enter_reason)
+                else "ALIGN_CENTER"
+            )
+            return state, False, str(enter_reason)
+        if catchup_active:
+            return (
+                "ALIGN_LOCK_PENDING_SOFT_CATCHUP",
+                False,
+                "safe_catchup_waiting_for_landing_lock_streak",
+            )
+        return "ALIGN_LOCK_PENDING", False, "landing_lock_streak_too_short"
+
+    def _reacquire_climb_command(
+        self,
+        info: dict[str, Any],
+    ) -> tuple[float, bool, str]:
+        """Return a bounded negative NED-Z command only for visual reacquisition."""
+        if not (
+            bool(self.cfg.parallel_dual_agent_mode)
+            and bool(self.cfg.reacquire_climb_enabled)
+        ):
+            self._reacquire_climb_started_monotonic = None
+            self._reacquire_climb_active = False
+            return 0.0, False, "disabled"
+
+        if bool(info.get("bottom_match_live", False)):
+            self._reacquire_climb_started_monotonic = None
+            self._reacquire_climb_active = False
+            return 0.0, False, "bottom_live"
+
+        no_live_s = float(info.get("bottom_no_live_duration_s", 0.0) or 0.0)
+        if no_live_s < float(self.cfg.reacquire_climb_after_s):
+            self._reacquire_climb_started_monotonic = None
+            self._reacquire_climb_active = False
+            return 0.0, False, "short_visual_gap"
+
+        height = float(info.get("relative_height_to_target_m", float("inf")))
+        if not np.isfinite(height):
+            self._reacquire_climb_active = False
+            return 0.0, False, "invalid_height"
+        if height >= float(self.cfg.reacquire_climb_target_height_m):
+            self._reacquire_climb_active = False
+            return 0.0, False, "reacquire_height_reached"
+
+        now = float(time.monotonic())
+        if self._reacquire_climb_started_monotonic is None:
+            self._reacquire_climb_started_monotonic = now
+        elapsed = float(now - self._reacquire_climb_started_monotonic)
+        if elapsed > float(self.cfg.reacquire_climb_max_duration_s):
+            self._reacquire_climb_active = False
+            return 0.0, False, "reacquire_climb_timeout"
+
+        self._reacquire_climb_active = True
+        return (
+            -abs(float(self.cfg.reacquire_climb_speed_mps)),
+            True,
+            "bottom_lost_expand_field_of_view",
+        )
 
     def step(self, action):
         self._step += 1
@@ -2240,6 +4295,19 @@ class Agent2LandingEnv(gym.Env):
         self._last_horizontal_total_speed_limit_mps = float(
             horizontal["total_speed_limit_mps"]
         )
+        self._last_predictive_guidance.update(
+            {
+                "predicted_err_x": float(horizontal.get("predicted_err_x", 0.0)),
+                "predicted_err_y": float(horizontal.get("predicted_err_y", 0.0)),
+                "predicted_center_error": float(horizontal.get("predicted_center_error", 999.0)),
+                "image_velocity_x_per_s": float(horizontal.get("image_velocity_x_per_s", 0.0)),
+                "image_velocity_y_per_s": float(horizontal.get("image_velocity_y_per_s", 0.0)),
+                "prediction_horizon_s": float(horizontal.get("prediction_horizon_s", self.cfg.cmd_duration_s)),
+                "catchup_active": bool(horizontal.get("catchup_active", False)),
+                "guidance_active": bool(horizontal.get("guidance_active", False)),
+                "prediction_only": bool(horizontal.get("prediction_only", False)),
+            }
+        )
 
         # Landing-only vertical contract:
         #   raw_z > 0  -> request descent (positive AirSim NED vz)
@@ -2249,18 +4317,37 @@ class Agent2LandingEnv(gym.Env):
         climb_command_blocked = bool(raw_vz_action < 0.0)
         requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)
         vertical_state, descent_allowed, descent_block_reason = self._vertical_control_state(pre_info)
+        vz, vertical_speed_limit, soft_catchup_descent = (
+            self._bounded_descent_command(
+                requested_vz,
+                vertical_state,
+                descent_allowed,
+                pre_info,
+            )
+        )
+        reacquire_vz, reacquire_climb_active, reacquire_climb_reason = (
+            self._reacquire_climb_command(pre_info)
+        )
         descent_requested = bool(requested_vz > 0.0)
         descent_blocked = bool(descent_requested and not descent_allowed)
-        if descent_allowed:
-            vz = float(requested_vz)
-        else:
-            vz = 0.0
+        if reacquire_climb_active:
+            vz = float(reacquire_vz)
+            vertical_state = "CLIMB_REACQUIRE_BOTTOM_VIEW"
+            descent_allowed = False
+            soft_catchup_descent = False
+            vertical_speed_limit = 0.0
+            descent_blocked = bool(descent_requested)
+            descent_block_reason = reacquire_climb_reason
 
         self._last_vertical_control_state = vertical_state
         self._last_descent_block_reason = descent_block_reason
         self._last_raw_vz_action = float(raw_vz_action)
         self._last_requested_vz_mps = float(requested_vz)
         self._last_applied_vz_mps = float(vz)
+        self._last_vertical_speed_limit_mps = float(
+            vertical_speed_limit if np.isfinite(vertical_speed_limit) else requested_vz
+        )
+        self._last_soft_catchup_descent_active = bool(soft_catchup_descent and vz > 1.0e-4)
         self._last_climb_command_blocked = bool(climb_command_blocked)
 
         if climb_command_blocked:
@@ -2274,24 +4361,25 @@ class Agent2LandingEnv(gym.Env):
         yaw_rate = float(np.clip(raw[3], -0.20, 0.20)) * self.cfg.yaw_scale_dps
         vx, vy, guard_reasons = self._horizontal_lidar_guard(vx, vy, pre_info)
 
-        # Final invariant at the AirSim boundary: Agent 2 can never transmit a
-        # negative NED vz. Even a future upstream regression cannot command up.
-        vz = max(0.0, float(vz))
+        # Negative NED-Z is legal only for the deterministic reacquisition
+        # climb. PPO remains unable to request arbitrary upward motion.
+        if reacquire_climb_active:
+            vz = min(0.0, float(vz))
+        else:
+            vz = max(0.0, float(vz))
         self._last_applied_vz_mps = float(vz)
         self._record_authorized_descent(pre_info, descent_allowed, vz)
 
         external_info: dict[str, Any] = {}
-        if self._external_command_executor is not None:
+        external_executor = getattr(self, "_external_command_executor", None)
+        if external_executor is not None:
             # Agent 1 owns XY/Yaw and sends the only physical command. Agent 2
             # contributes only its already-gated Z command.
-            external_info = dict(self._external_command_executor(vz) or {})
+            external_info = dict(external_executor(vz) or {})
             self._last_external_command_info = external_info
             vx = float(external_info.get("agent1_commanded_vx_mps", 0.0))
             vy = float(external_info.get("agent1_commanded_vy_mps", 0.0))
-            vz = max(
-                0.0,
-                float(external_info.get("agent1_commanded_vz_mps", vz)),
-            )
+            vz = float(external_info.get("agent1_commanded_vz_mps", vz))
             yaw_rate = float(
                 external_info.get("agent1_commanded_yaw_rate_dps", 0.0)
             )
@@ -2305,6 +4393,8 @@ class Agent2LandingEnv(gym.Env):
                 vehicle_name=self.cfg.vehicle_name,
             ).join()
             self._last_external_command_info = {}
+
+        self._last_applied_vz_mps = float(vz)
 
         obs, info = self._observe()
         collision_now, collision_object, collision_timestamp = self._new_collision()
@@ -2418,6 +4508,21 @@ class Agent2LandingEnv(gym.Env):
                 "parallel_target_velocity_ff_vx_mps": float(external_info.get("target_velocity_ff_vx_mps", 0.0)),
                 "parallel_target_velocity_ff_vy_mps": float(external_info.get("target_velocity_ff_vy_mps", 0.0)),
                 "parallel_target_velocity_ff_blocked_by_safety": bool(external_info.get("target_velocity_ff_blocked_by_safety", False)),
+                "parallel_bottom_guidance_live": bool(external_info.get("bottom_guidance_live", False)),
+                "parallel_bottom_guidance_active": bool(external_info.get("bottom_guidance_active", False)),
+                "parallel_bottom_guidance_prediction_only": bool(external_info.get("bottom_guidance_prediction_only", False)),
+                "parallel_bottom_guidance_landing_lock": bool(external_info.get("bottom_guidance_landing_lock", False)),
+                "parallel_bottom_guidance_blend_strength": float(external_info.get("bottom_guidance_blend_strength", 0.0)),
+                "parallel_bottom_guidance_vx_mps": float(external_info.get("bottom_guidance_vx_mps", 0.0)),
+                "parallel_bottom_guidance_vy_mps": float(external_info.get("bottom_guidance_vy_mps", 0.0)),
+                "parallel_agent1_xy_weight": float(external_info.get("agent1_xy_weight", 1.0)),
+                "parallel_bottom_relative_position_x_m": float(external_info.get("bottom_relative_position_x_m", 0.0)),
+                "parallel_bottom_relative_position_y_m": float(external_info.get("bottom_relative_position_y_m", 0.0)),
+                "parallel_bottom_relative_velocity_x_mps": float(external_info.get("bottom_relative_velocity_x_mps", 0.0)),
+                "parallel_bottom_relative_velocity_y_mps": float(external_info.get("bottom_relative_velocity_y_mps", 0.0)),
+                "parallel_bottom_predicted_relative_x_m": float(external_info.get("bottom_predicted_relative_x_m", 0.0)),
+                "parallel_bottom_predicted_relative_y_m": float(external_info.get("bottom_predicted_relative_y_m", 0.0)),
+                "parallel_bottom_controller_source": str(external_info.get("bottom_controller_source", "NONE")),
                 "parallel_physical_steps": int(external_info.get("parallel_physical_steps", 0)),
                 "commanded_vx_mps": vx,
                 "commanded_vy_mps": vy,
@@ -2425,7 +4530,11 @@ class Agent2LandingEnv(gym.Env):
                 "raw_vz_action": raw_vz_action,
                 "requested_vz_mps": requested_vz,
                 "applied_vz_mps": vz,
+                "vertical_speed_limit_mps": float(self._last_vertical_speed_limit_mps),
+                "soft_catchup_descent_active": bool(self._last_soft_catchup_descent_active),
                 "climb_command_blocked": bool(climb_command_blocked),
+                "reacquire_climb_active": bool(reacquire_climb_active),
+                "reacquire_climb_reason": str(reacquire_climb_reason),
                 "vertical_control_state": vertical_state,
                 "descent_allowed": bool(descent_allowed),
                 "descent_requested": bool(descent_requested),
@@ -2441,13 +4550,13 @@ class Agent2LandingEnv(gym.Env):
                 "horizontal_final_action_vx": float(self._last_horizontal_action_vx),
                 "horizontal_final_action_vy": float(self._last_horizontal_action_vy),
                 "horizontal_speed_limit_mps": float(self._last_horizontal_speed_limit_mps),
-                "target_velocity_valid": bool(self._target_velocity_valid),
-                "target_velocity_age_s": float(self._target_velocity_age_s),
-                "target_velocity_world_x_mps": float(self._target_velocity_world_x_mps),
-                "target_velocity_world_y_mps": float(self._target_velocity_world_y_mps),
-                "target_velocity_body_vx_mps": float(self._target_velocity_body_vx_mps),
-                "target_velocity_body_vy_mps": float(self._target_velocity_body_vy_mps),
-                "target_velocity_speed_mps": float(self._target_velocity_speed_mps),
+                "target_velocity_valid": bool(getattr(self, "_target_velocity_valid", False)),
+                "target_velocity_age_s": float(getattr(self, "_target_velocity_age_s", float("inf"))),
+                "target_velocity_world_x_mps": float(getattr(self, "_target_velocity_world_x_mps", 0.0)),
+                "target_velocity_world_y_mps": float(getattr(self, "_target_velocity_world_y_mps", 0.0)),
+                "target_velocity_body_vx_mps": float(getattr(self, "_target_velocity_body_vx_mps", 0.0)),
+                "target_velocity_body_vy_mps": float(getattr(self, "_target_velocity_body_vy_mps", 0.0)),
+                "target_velocity_speed_mps": float(getattr(self, "_target_velocity_speed_mps", 0.0)),
                 "horizontal_velocity_ff_vx_mps": float(self._last_velocity_ff_vx_mps),
                 "horizontal_velocity_ff_vy_mps": float(self._last_velocity_ff_vy_mps),
                 "horizontal_correction_vx_mps": float(self._last_horizontal_correction_vx_mps),
@@ -2527,6 +4636,22 @@ class Agent2LandingEnv(gym.Env):
                 f"A1fusion={int(bool(external_info.get('agent1_fusion_has_target', False)))} "
                 f"FF=({float(external_info.get('target_velocity_ff_vx_mps', 0.0)):+.2f},"
                 f"{float(external_info.get('target_velocity_ff_vy_mps', 0.0)):+.2f}) "
+                f"Vsrc={self._visual_motion_source} flowN={self._visual_flow_point_count} "
+                f"A1W={float(external_info.get('agent1_xy_weight', 1.0)):.2f} "
+                f"BPD=({float(external_info.get('bottom_guidance_vx_mps', 0.0)):+.2f},"
+                f"{float(external_info.get('bottom_guidance_vy_mps', 0.0)):+.2f}) "
+                f"pred=({float(external_info.get('bottom_predicted_err_x', 0.0)):+.2f},"
+                f"{float(external_info.get('bottom_predicted_err_y', 0.0)):+.2f}) "
+                f"ivel=({float(external_info.get('bottom_image_velocity_x_per_s', 0.0)):+.2f},"
+                f"{float(external_info.get('bottom_image_velocity_y_per_s', 0.0)):+.2f}) "
+                f"rel=({float(external_info.get('bottom_relative_position_x_m', 0.0)):+.2f},"
+                f"{float(external_info.get('bottom_relative_position_y_m', 0.0)):+.2f})m "
+                f"relV=({float(external_info.get('bottom_relative_velocity_x_mps', 0.0)):+.2f},"
+                f"{float(external_info.get('bottom_relative_velocity_y_mps', 0.0)):+.2f})m/s "
+                f"catch={int(bool(external_info.get('bottom_predictive_catchup', False)))} "
+                f"climb={int(bool(reacquire_climb_active))} "
+                f"lock={int(bool(getattr(self, '_descent_alignment_latched', False)))} "
+                f"bankN={len(self._adaptive_embeddings)} bankUpd={self._adaptive_embedding_updates} "
                 f"collision={collision_object or 'none'} "
                 f"liveAtTouch={int(bool(collision_decision['live_match_at_collision']))} "
                 f"contact={int(bool(collision_decision['contact_appearance_valid']))} "

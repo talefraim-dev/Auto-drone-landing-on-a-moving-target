@@ -1,20 +1,29 @@
-"""Comprehensive, non-invasive diagnostic wrapper for the current Run_train.py.
+"""Run_diag v3: comprehensive, non-invasive diagnostics for the current system.
 
 Run from RL_training:
     python Run_diag.py
 
 The wrapper imports and executes the existing Run_train.main() unchanged. It
-monkey-patches diagnostics around the active classes/functions at runtime,
-stops after 7,000 physical steps, 7,000 trainable steps, or 10 minutes, and
-always packages the run into RL_training/diag.zip.
+monkey-patches observation-only diagnostics around the live implementation and
+always packages the result into RL_training/diag.zip.
+
+This version is focused on the current parallel dual-agent landing problem. It
+records, on the same control timeline:
+- Bottom LIVE/PRED/LOST transitions and every landing-lock gate decision.
+- Current and predicted image error, image velocity, horizon and catch-up state.
+- Agent-1 XY request, target-velocity feed-forward, Bottom correction, fused XY,
+  final AirSim command, safety scaling and LiDAR distances.
+- Agent-2 raw/requested/applied Z, descent blockers, prohibited climb requests,
+  NED-Z values and relative-height sign checks.
+- Adaptive appearance-bank changes, candidates, ResNet evidence and frames at
+  every important state transition.
+- Active checkpoints, source/config snapshots, runtime-created TensorBoard/log
+  files, code-audit findings and an automatically generated diagnosis report.
 
 Important:
-- The control/reward/tracking logic in Run_train.py and the environments is not
-  reimplemented here.
+- No control, reward, tracker or training decision is reimplemented here.
 - Model/checkpoint writes are suppressed during diagnostics.
-- Raw YOLO detections, converted candidates, ResNet embeddings/similarities,
-  AirSim calls, observations, rewards, handoff state, object lifecycle, and
-  component method returns are logged separately.
+- Ctrl+C, an exception, or a diagnostic limit still produces diag.zip.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import sys
 import threading
@@ -50,15 +60,21 @@ os.environ["DRONE_DIAG_VERBOSE"] = "1"
 # ======================================================================================
 # Diagnostic limits and output policy
 # ======================================================================================
+DIAG_VERSION = "3.0-parallel-control-authority"
 MAX_PHYSICAL_STEPS = 7_000
 MAX_TRAINABLE_STEPS = 7_000
 MAX_WALL_SECONDS = 600.0
-FRAME_SAVE_EVERY = 20
-YOLO_ANNOTATED_SAVE_EVERY = 20
+# At the current simulator rate this normally gives a frame pair every few
+# seconds. Important state changes are captured independently of this interval.
+FRAME_SAVE_EVERY = 10
+YOLO_ANNOTATED_SAVE_EVERY = 10
 OBJECT_STATE_EVERY = 1
 FULL_RESNET_EMBEDDINGS = True
 METHOD_CALL_LOG_LIMIT = 2_000_000
 OBJECT_CREATION_LOG_LIMIT = 500_000
+RUNTIME_ARTIFACT_MAX_FILE_BYTES = 25 * 1024 * 1024
+RUNTIME_ARTIFACT_TOTAL_BYTES = 150 * 1024 * 1024
+EVENT_FRAME_MIN_STEP_GAP = 1
 
 BASE_DIR = Path(__file__).resolve().parent
 DIAG_ZIP = BASE_DIR / "diag.zip"
@@ -140,6 +156,17 @@ class DiagnosticSession:
         "config": "23_config_runtime_changes.jsonl",
         "identity": "24_user_target_identity.jsonl",
         "horizontal": "25_agent2_horizontal_controller.jsonl",
+        "parallel": "26_parallel_xy_arbitration.jsonl",
+        "landing_gate": "27_landing_lock_and_z_gate.jsonl",
+        "predictive": "28_bottom_predictive_controller.jsonl",
+        "vertical": "29_vertical_authority_and_height.jsonl",
+        "safety_detail": "30_safety_lidar_command_suppression.jsonl",
+        "fusion": "31_camera_fusion_authority.jsonl",
+        "kinematics": "32_target_drone_kinematics.jsonl",
+        "bookmarks": "33_critical_event_bookmarks.jsonl",
+        "checkpoints": "34_checkpoint_loading.jsonl",
+        "audit": "35_static_code_audit.jsonl",
+        "adaptive_bank": "36_adaptive_embedding_bank.jsonl",
     }
 
     def __init__(self) -> None:
@@ -147,7 +174,10 @@ class DiagnosticSession:
         (RUN_DIR / "frames" / "front").mkdir(parents=True, exist_ok=True)
         (RUN_DIR / "frames" / "bottom").mkdir(parents=True, exist_ok=True)
         (RUN_DIR / "frames" / "yolo_raw").mkdir(parents=True, exist_ok=True)
+        (RUN_DIR / "frames" / "events").mkdir(parents=True, exist_ok=True)
         (RUN_DIR / "source_snapshot").mkdir(parents=True, exist_ok=True)
+        (RUN_DIR / "active_checkpoints").mkdir(parents=True, exist_ok=True)
+        (RUN_DIR / "runtime_artifacts").mkdir(parents=True, exist_ok=True)
 
         self.start_monotonic = time.monotonic()
         self.start_wall = time.time()
@@ -174,6 +204,25 @@ class DiagnosticSession:
         self.last_info: dict[str, Any] = {}
         self.last_agent = "UNKNOWN"
         self.last_command: dict[str, Any] = {}
+        self.last_multirotor_state: Any = None
+        self.last_object_poses: dict[str, Any] = {}
+        self.control_ticks = 0
+        self.last_agent1_step_info: dict[str, Any] = {}
+        self.last_agent2_step_info: dict[str, Any] = {}
+        self.last_parallel_override: dict[str, Any] = {}
+        self.last_parallel_fuse: dict[str, Any] = {}
+        self.last_predictive_guidance: dict[str, Any] = {}
+        self.last_vertical_gate: dict[str, Any] = {}
+        self.last_horizontal_servo: dict[str, Any] = {}
+        self.last_critical_state: dict[str, Any] = {}
+        self.last_event_frame_step = -999999
+        self.transition_counts: Counter[str] = Counter()
+        self.lock_block_counts: Counter[str] = Counter()
+        self.safety_reason_counts: Counter[str] = Counter()
+        self.anomaly_counts: Counter[str] = Counter()
+        self.loaded_checkpoints: list[dict[str, Any]] = []
+        self.collision_events: list[dict[str, Any]] = []
+        self.episode_results: list[dict[str, Any]] = []
         self.timeline_fp = (RUN_DIR / "00_master_timeline.csv").open(
             "w", newline="", encoding="utf-8", buffering=1
         )
@@ -188,7 +237,8 @@ class DiagnosticSession:
             "alignment_ready_streak", "descent_alignment_latched",
             "handoff_ready", "alt_agl_m", "drone_z_ned", "target_surface_z_ned",
             "relative_height_to_target_m", "vertical_control_state", "raw_vz_action",
-            "requested_vz_mps", "applied_vz_mps", "climb_command_blocked",
+            "requested_vz_mps", "applied_vz_mps", "vertical_speed_limit_mps",
+            "soft_catchup_descent_active", "climb_command_blocked",
             "descent_allowed", "descent_blocked", "cmd_vx", "cmd_vy", "cmd_vz",
             "cmd_yaw_rate", "actual_vx",
             "actual_vy", "actual_vz", "collision", "collision_object",
@@ -200,6 +250,56 @@ class DiagnosticSession:
         ]
         self.timeline = csv.DictWriter(self.timeline_fp, fieldnames=self.timeline_fields)
         self.timeline.writeheader()
+
+        self.critical_fp = (RUN_DIR / "00_control_authority_timeline.csv").open(
+            "w", newline="", encoding="utf-8", buffering=1
+        )
+        self.critical_fields = [
+            "wall_s", "control_tick", "physical_step", "trainable_step", "episode_step",
+            "tracker_mode", "bottom_live", "bottom_confirmed", "bottom_similarity",
+            "bottom_reject_reason", "candidate_count", "adaptive_anchor_count",
+            "adaptive_updates", "err_x", "err_y", "center_error", "bbox_rel_error",
+            "bbox_rel_gate_required", "bbox_outlier_suppressed",
+            "bbox_raw_xyxy", "bbox_control_xyxy",
+            "bbox_area", "image_vel_x", "image_vel_y", "control_dt_s",
+            "predicted_err_x", "predicted_err_y", "predicted_center_error",
+            "prediction_horizon_s", "outward_speed_per_s", "catchup_active",
+            "catchup_release_streak", "no_live_duration_s", "lost_steps",
+            "landing_lock", "alignment_streak", "lock_visual_gap_steps",
+            "lock_bad_live_steps", "lock_age_steps", "vertical_gate_state",
+            "descent_allowed", "descent_block_reason", "raw_vz_action",
+            "requested_vz_mps", "applied_vz_mps", "vertical_speed_limit_mps",
+            "soft_catchup_descent_active", "climb_command_blocked",
+            "drone_z_ned", "target_surface_z_ned", "relative_height_m", "alt_agl_m",
+            "target_velocity_valid", "target_velocity_age_s", "target_vel_body_vx",
+            "actual_drone_vx", "actual_drone_vy", "actual_drone_vz",
+            "drone_world_x", "drone_world_y", "drone_world_z",
+            "target_world_x", "target_world_y", "target_world_z",
+            "relative_world_x", "relative_world_y", "relative_world_z",
+            "target_vel_body_vy", "target_speed_mps", "agent1_tracking_mode",
+            "agent1_active_camera", "agent1_fusion_has_target", "agent1_bottom_match",
+            "agent1_xy_weight", "agent1_pre_fuse_vx", "agent1_pre_fuse_vy",
+            "ff_requested_vx", "ff_requested_vy", "ff_applied_vx", "ff_applied_vy",
+            "bottom_requested_vx", "bottom_requested_vy", "bottom_applied_vx",
+            "bottom_applied_vy", "fused_expected_vx", "fused_expected_vy",
+            "physical_cmd_vx", "physical_cmd_vy", "physical_cmd_vz",
+            "bridge_active", "bridge_reason", "bridge_period_ema_s",
+            "bridge_duration_s", "bridge_measured_vx", "bridge_measured_vy",
+            "bridge_vx", "bridge_vy", "bridge_vz", "bridge_attitude_scale",
+            "parallel_xy_slew_limited", "parallel_xy_stable_vx",
+            "parallel_xy_stable_vy", "agent1_bottom_perception_shared",
+            "visual_motion_attitude_valid",
+            "visual_motion_yaw_rate_dps",
+            "horizontal_speed_limit_mps", "safety_intervention", "safety_reasons",
+            "ff_bottom_blocked_by_safety", "parallel_z_blocked_by_safety",
+            "parallel_z_limited_by_safety", "front_dist_m", "back_dist_m",
+            "left_dist_m", "right_dist_m", "collision", "collision_object",
+            "termination_reason", "reward", "anomalies",
+        ]
+        self.critical = csv.DictWriter(
+            self.critical_fp, fieldnames=self.critical_fields, extrasaction="ignore"
+        )
+        self.critical.writeheader()
 
     @property
     def elapsed(self) -> float:
@@ -359,6 +459,11 @@ class DiagnosticSession:
         try:
             self.timeline_fp.flush()
             self.timeline_fp.close()
+        except Exception:
+            pass
+        try:
+            self.critical_fp.flush()
+            self.critical_fp.close()
         except Exception:
             pass
         for writer in self.writers.values():
@@ -988,7 +1093,13 @@ def install_airsim_instrumentation(airsim_module: Any) -> None:
             duration = (time.perf_counter() - started) * 1000.0
             SESSION.write("airsim", "airsim_call", method=__name, args=args, kwargs=kwargs, result=result, duration_ms=duration)
             if __name == "getMultirotorState":
+                SESSION.last_multirotor_state = result
                 SESSION.write("physics", "multirotor_state", state=result)
+            elif __name == "simGetObjectPose":
+                object_name = str(kwargs.get("object_name", args[0] if args else "") or "")
+                if object_name:
+                    SESSION.last_object_poses[object_name] = result
+                SESSION.write("physics", "object_pose", object_name=object_name, pose=result)
             elif __name == "simGetCollisionInfo":
                 SESSION.write("physics", "collision_state", collision=result)
             elif __name == "getLidarData":
@@ -1027,6 +1138,10 @@ def env_step_post(agent: str) -> Callable[[Any, tuple[Any, ...], dict[str, Any],
             return
         info = dict(info or {})
         SESSION.increment_physical(agent)
+        if agent == "AGENT_1":
+            SESSION.last_agent1_step_info = dict(info)
+        else:
+            SESSION.last_agent2_step_info = dict(info)
         log_name = "agent1_steps" if agent == "AGENT_1" else "agent2_steps"
         action = args[0] if args else kwargs.get("action")
         SESSION.write(
@@ -1077,6 +1192,8 @@ def env_step_post(agent: str) -> Callable[[Any, tuple[Any, ...], dict[str, Any],
             )
         SESSION.write("control", "step_control_state", agent=agent, action=action, command=extract_command(info), last_airsim_command=SESSION.last_command, guards=extract_guards(info))
         SESSION.write_timeline(agent, reward, done, truncated, info)
+        if agent == "AGENT_2":
+            record_current_problem_step(self, info, reward, done, truncated)
         SESSION.snapshot_registered(f"{agent}_step")
         if SESSION.physical_steps <= 5 or SESSION.physical_steps % 20 == 0 or done:
             print(
@@ -1195,6 +1312,801 @@ def extract_guards(info: dict[str, Any]) -> dict[str, Any]:
         for key, value in info.items()
         if any(token in key.lower() for token in ("guard", "safety", "block", "obstacle", "emergency", "risk"))
     }
+
+
+
+def _num(mapping: dict[str, Any], *names: str, default: float = 0.0) -> float:
+    value = first_value(mapping, *names, default=default)
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if math.isfinite(result) else float(default)
+
+
+def _truth(mapping: dict[str, Any], *names: str, default: bool = False) -> bool:
+    value = first_value(mapping, *names, default=default)
+    return bool(value)
+
+
+def _string(mapping: dict[str, Any], *names: str, default: str = "") -> str:
+    value = first_value(mapping, *names, default=default)
+    return str(value if value is not None else default)
+
+
+def _flatten_reasons(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item)]
+    return [str(value)]
+
+
+def _frame_candidate(obj: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            continue
+        if value is not None:
+            try:
+                import numpy as np
+                arr = np.asarray(value)
+                if arr.ndim == 3 and arr.size > 0:
+                    return arr
+            except Exception:
+                continue
+    return None
+
+
+def capture_critical_frames(agent2_env: Any, label: str) -> None:
+    """Save synchronized front/bottom evidence for important control transitions."""
+    if SESSION is None:
+        return
+    if SESSION.physical_steps - SESSION.last_event_frame_step < EVENT_FRAME_MIN_STEP_GAP:
+        return
+    SESSION.last_event_frame_step = SESSION.physical_steps
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label))[:100]
+    bottom = _frame_candidate(
+        agent2_env,
+        ("_last_bottom_frame", "last_bottom_frame", "_bottom_frame"),
+    )
+    wrapper = None
+    executor = getattr(agent2_env, "_external_command_executor", None)
+    if executor is not None:
+        wrapper = getattr(executor, "__self__", None)
+    agent1_env = getattr(wrapper, "agent1_env", None) if wrapper is not None else None
+    front = _frame_candidate(
+        agent1_env,
+        ("_last_frame", "last_frame", "_front_frame", "_last_front_frame"),
+    )
+    agent1_bottom = _frame_candidate(
+        agent1_env,
+        ("_last_downward_frame", "_last_bottom_frame", "last_downward_frame"),
+    )
+
+    saved: dict[str, str] = {}
+    for kind, frame in (("bottom", bottom), ("front", front), ("agent1_bottom", agent1_bottom)):
+        if frame is None:
+            continue
+        try:
+            import cv2
+            folder = RUN_DIR / "frames" / "events"
+            file_path = folder / f"tick_{SESSION.control_ticks:06d}_{safe_label}_{kind}.jpg"
+            cv2.imwrite(str(file_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            saved[kind] = str(file_path.relative_to(RUN_DIR))
+        except Exception as exc:
+            log_exception("capture_critical_frames", exc)
+    SESSION.write("bookmarks", "critical_frames", label=label, files=saved)
+
+
+def _critical_anomalies(row: dict[str, Any]) -> list[str]:
+    anomalies: list[str] = []
+    bottom_live = bool(row.get("bottom_live"))
+    a1_weight = float(row.get("agent1_xy_weight") or 0.0)
+    if bottom_live and a1_weight > 0.05:
+        anomalies.append("bottom_live_but_agent1_xy_not_muted")
+    if not bottom_live and a1_weight < 0.95:
+        anomalies.append("bottom_not_live_but_agent1_xy_still_muted")
+
+    requested_x = (
+        float(row.get("agent1_pre_fuse_vx") or 0.0) * a1_weight
+        + float(row.get("ff_requested_vx") or 0.0)
+        + float(row.get("bottom_requested_vx") or 0.0)
+    )
+    requested_y = (
+        float(row.get("agent1_pre_fuse_vy") or 0.0) * a1_weight
+        + float(row.get("ff_requested_vy") or 0.0)
+        + float(row.get("bottom_requested_vy") or 0.0)
+    )
+    requested_mag = math.hypot(requested_x, requested_y)
+    physical_mag = math.hypot(
+        float(row.get("physical_cmd_vx") or 0.0),
+        float(row.get("physical_cmd_vy") or 0.0),
+    )
+    if requested_mag >= 0.30 and physical_mag <= 0.08:
+        anomalies.append("nonzero_xy_request_but_physical_xy_near_zero")
+    if bool(row.get("ff_bottom_blocked_by_safety")):
+        anomalies.append("target_ff_and_bottom_correction_zeroed_by_safety")
+    if bool(row.get("climb_command_blocked")):
+        anomalies.append("negative_z_action_climb_request_blocked")
+    if float(row.get("relative_height_m") or 0.0) < -0.25:
+        anomalies.append("negative_relative_height_sign_or_post_collision_anomaly")
+    if bool(row.get("bottom_live")) and float(row.get("center_error") or 999.0) < 0.30 and not bool(row.get("landing_lock")):
+        anomalies.append("bottom_centered_but_landing_lock_not_active")
+    if bool(row.get("catchup_active")) and float(row.get("applied_vz_mps") or 0.0) > 1.0e-4:
+        if not bool(row.get("soft_catchup_descent_active")):
+            anomalies.append("unclassified_descent_during_predictive_catchup")
+        elif float(row.get("applied_vz_mps") or 0.0) > float(
+            row.get("vertical_speed_limit_mps") or 0.0
+        ) + 1.0e-4:
+            anomalies.append("soft_catchup_descent_exceeded_cap")
+    if not bool(row.get("bottom_live")) and float(row.get("no_live_duration_s") or 0.0) > 1.0:
+        anomalies.append("bottom_target_missing_over_one_second")
+    return anomalies
+
+
+def record_current_problem_step(
+    agent2_env: Any,
+    info: dict[str, Any],
+    reward: Any,
+    done: Any,
+    truncated: Any,
+) -> None:
+    """Write one joined row covering perception, control authority and physics."""
+    if SESSION is None:
+        return
+    SESSION.control_ticks += 1
+    SESSION.last_agent2_step_info = dict(info)
+    a1 = dict(SESSION.last_agent1_step_info)
+    fuse = dict(SESSION.last_parallel_fuse)
+    override = dict(SESSION.last_parallel_override)
+    guidance = dict(SESSION.last_predictive_guidance)
+    vertical_gate = dict(SESSION.last_vertical_gate)
+
+    safety_reasons = _flatten_reasons(a1.get("safety_reasons"))
+    for reason in safety_reasons:
+        SESSION.safety_reason_counts[reason] += 1
+
+    drone_pos = drone_vel = None
+    multirotor_state = SESSION.last_multirotor_state
+    if multirotor_state is not None:
+        kin = getattr(multirotor_state, "kinematics_estimated", None)
+        if kin is not None:
+            drone_pos = getattr(kin, "position", None)
+            drone_vel = getattr(kin, "linear_velocity", None)
+    target_name = str(getattr(agent2_env, "_target_actor_name", "") or "")
+    target_pose = SESSION.last_object_poses.get(target_name)
+    target_pos = getattr(target_pose, "position", None) if target_pose is not None else None
+    drone_x = float(getattr(drone_pos, "x_val", 0.0) or 0.0) if drone_pos is not None else 0.0
+    drone_y = float(getattr(drone_pos, "y_val", 0.0) or 0.0) if drone_pos is not None else 0.0
+    drone_z = float(getattr(drone_pos, "z_val", 0.0) or 0.0) if drone_pos is not None else 0.0
+    target_x = float(getattr(target_pos, "x_val", 0.0) or 0.0) if target_pos is not None else 0.0
+    target_y = float(getattr(target_pos, "y_val", 0.0) or 0.0) if target_pos is not None else 0.0
+    target_z = float(getattr(target_pos, "z_val", 0.0) or 0.0) if target_pos is not None else 0.0
+
+    row: dict[str, Any] = {
+        "wall_s": round(SESSION.elapsed, 6),
+        "control_tick": SESSION.control_ticks,
+        "physical_step": SESSION.physical_steps,
+        "trainable_step": SESSION.trainable_steps,
+        "episode_step": int(getattr(agent2_env, "_step", 0)),
+        "tracker_mode": _string(info, "tracker_mode"),
+        "bottom_live": _truth(info, "bottom_match_live"),
+        "bottom_confirmed": _truth(info, "bottom_match_confirmed"),
+        "bottom_similarity": _num(info, "bottom_similarity"),
+        "bottom_reject_reason": _string(info, "bottom_match_reject_reason"),
+        "candidate_count": int(_num(info, "yolo_candidate_count")),
+        "adaptive_anchor_count": int(_num(info, "adaptive_anchor_count")),
+        "adaptive_updates": int(_num(info, "adaptive_embedding_updates")),
+        "err_x": _num(info, "bottom_err_x", default=999.0),
+        "err_y": _num(info, "bottom_err_y", default=999.0),
+        "center_error": _num(info, "bottom_center_error", default=999.0),
+        "bbox_rel_error": _num(info, "bottom_bbox_rel_err", default=999.0),
+        "bbox_rel_gate_required": _truth(info, "bottom_bbox_rel_gate_required"),
+        "bbox_outlier_suppressed": _truth(info, "bottom_bbox_outlier_suppressed"),
+        "bbox_raw_xyxy": safe_value(info.get("bottom_bbox_raw_xyxy", "")),
+        "bbox_control_xyxy": safe_value(info.get("bottom_bbox_control_xyxy", "")),
+        "bbox_area": _num(info, "bottom_bbox_area_norm"),
+        "image_vel_x": _num(info, "bottom_img_vel_x_control"),
+        "image_vel_y": _num(info, "bottom_img_vel_y_control"),
+        "control_dt_s": _num(info, "bottom_control_dt_s"),
+        "predicted_err_x": _num(info, "predicted_bottom_err_x", "parallel_bottom_predicted_err_x", default=_num(guidance, "predicted_err_x")),
+        "predicted_err_y": _num(info, "predicted_bottom_err_y", "parallel_bottom_predicted_err_y", default=_num(guidance, "predicted_err_y")),
+        "predicted_center_error": _num(info, "predicted_bottom_center_error", "parallel_bottom_predicted_center_error", default=_num(guidance, "predicted_center_error", default=999.0)),
+        "prediction_horizon_s": _num(info, "parallel_bottom_prediction_horizon_s", default=_num(guidance, "prediction_horizon_s")),
+        "outward_speed_per_s": _num(info, "parallel_bottom_outward_speed_per_s", default=_num(guidance, "outward_speed_per_s")),
+        "catchup_active": _truth(info, "predictive_bottom_catchup_active", "parallel_bottom_predictive_catchup", default=_truth(guidance, "catchup_active")),
+        "catchup_release_streak": int(getattr(agent2_env, "_predictive_catchup_release_streak", 0)),
+        "no_live_duration_s": _num(info, "bottom_no_live_duration_s"),
+        "lost_steps": int(_num(info, "lost_steps")),
+        "landing_lock": _truth(info, "landing_lock_active", "descent_alignment_latched"),
+        "alignment_streak": int(_num(info, "alignment_ready_streak")),
+        "lock_visual_gap_steps": int(_num(info, "landing_lock_visual_gap_steps")),
+        "lock_bad_live_steps": int(_num(info, "landing_lock_bad_live_steps")),
+        "lock_age_steps": int(_num(info, "landing_lock_age_steps", default=-1)),
+        "vertical_gate_state": _string(info, "vertical_control_state", default=_string(vertical_gate, "state")),
+        "descent_allowed": _truth(info, "descent_allowed"),
+        "descent_block_reason": _string(info, "descent_block_reason", default=_string(vertical_gate, "reason")),
+        "raw_vz_action": _num(info, "raw_vz_action"),
+        "requested_vz_mps": _num(info, "requested_vz_mps"),
+        "applied_vz_mps": _num(info, "applied_vz_mps", "commanded_vz_mps"),
+        "vertical_speed_limit_mps": _num(info, "vertical_speed_limit_mps"),
+        "soft_catchup_descent_active": _truth(info, "soft_catchup_descent_active"),
+        "climb_command_blocked": _truth(info, "climb_command_blocked"),
+        "drone_z_ned": _num(info, "drone_z_ned"),
+        "target_surface_z_ned": _num(info, "target_surface_z_ned"),
+        "relative_height_m": _num(info, "relative_height_to_target_m"),
+        "alt_agl_m": _num(info, "alt_agl_m"),
+        "target_velocity_valid": _truth(info, "target_velocity_valid", "parallel_target_velocity_ff_valid"),
+        "target_velocity_age_s": _num(info, "target_velocity_age_s"),
+        "actual_drone_vx": float(getattr(drone_vel, "x_val", 0.0) or 0.0) if drone_vel is not None else 0.0,
+        "actual_drone_vy": float(getattr(drone_vel, "y_val", 0.0) or 0.0) if drone_vel is not None else 0.0,
+        "actual_drone_vz": float(getattr(drone_vel, "z_val", 0.0) or 0.0) if drone_vel is not None else 0.0,
+        "drone_world_x": drone_x,
+        "drone_world_y": drone_y,
+        "drone_world_z": drone_z,
+        "target_world_x": target_x,
+        "target_world_y": target_y,
+        "target_world_z": target_z,
+        "relative_world_x": target_x - drone_x,
+        "relative_world_y": target_y - drone_y,
+        "relative_world_z": target_z - drone_z,
+        "target_vel_body_vx": _num(info, "target_velocity_body_vx_mps"),
+        "target_vel_body_vy": _num(info, "target_velocity_body_vy_mps"),
+        "target_speed_mps": _num(info, "target_velocity_speed_mps"),
+        "agent1_tracking_mode": _string(info, "parallel_agent1_tracking_mode", default=_string(a1, "tracking_mode")),
+        "agent1_active_camera": _string(info, "parallel_agent1_active_camera", default=_string(a1, "active_camera")),
+        "agent1_fusion_has_target": _truth(info, "parallel_agent1_fusion_has_target", default=_truth(a1, "fusion_has_target")),
+        "agent1_bottom_match": _truth(info, "parallel_agent1_bottom_match", default=_truth(a1, "bottom_match")),
+        "agent1_xy_weight": _num(info, "parallel_agent1_xy_weight", default=_num(override, "agent1_xy_weight", default=1.0)),
+        "agent1_pre_fuse_vx": _num(fuse, "agent1_vx"),
+        "agent1_pre_fuse_vy": _num(fuse, "agent1_vy"),
+        "ff_requested_vx": _num(info, "parallel_target_velocity_ff_vx_mps", default=_num(override, "feedforward_vx_mps")),
+        "ff_requested_vy": _num(info, "parallel_target_velocity_ff_vy_mps", default=_num(override, "feedforward_vy_mps")),
+        "ff_applied_vx": _num(a1, "parallel_target_velocity_ff_vx_mps"),
+        "ff_applied_vy": _num(a1, "parallel_target_velocity_ff_vy_mps"),
+        "bottom_requested_vx": _num(info, "parallel_bottom_guidance_vx_mps", default=_num(override, "bottom_correction_vx_mps")),
+        "bottom_requested_vy": _num(info, "parallel_bottom_guidance_vy_mps", default=_num(override, "bottom_correction_vy_mps")),
+        "bottom_applied_vx": _num(a1, "parallel_bottom_correction_vx_mps"),
+        "bottom_applied_vy": _num(a1, "parallel_bottom_correction_vy_mps"),
+        "fused_expected_vx": _num(fuse, "result_vx"),
+        "fused_expected_vy": _num(fuse, "result_vy"),
+        "physical_cmd_vx": _num(info, "commanded_vx_mps", default=_num(a1, "commanded_vx_mps")),
+        "physical_cmd_vy": _num(info, "commanded_vy_mps", default=_num(a1, "commanded_vy_mps")),
+        "physical_cmd_vz": _num(info, "commanded_vz_mps", default=_num(a1, "commanded_vz_mps")),
+        "bridge_active": _truth(a1, "command_bridge_active"),
+        "bridge_reason": _string(a1, "command_bridge_reason"),
+        "bridge_period_ema_s": _num(a1, "command_bridge_period_ema_s"),
+        "bridge_duration_s": _num(a1, "command_bridge_duration_s"),
+        "bridge_measured_vx": _num(a1, "command_bridge_measured_vx_mps"),
+        "bridge_measured_vy": _num(a1, "command_bridge_measured_vy_mps"),
+        "bridge_vx": _num(a1, "command_bridge_vx_mps"),
+        "bridge_vy": _num(a1, "command_bridge_vy_mps"),
+        "bridge_vz": _num(a1, "command_bridge_vz_mps"),
+        "bridge_attitude_scale": _num(a1, "command_bridge_attitude_scale", default=1.0),
+        "parallel_xy_slew_limited": _truth(a1, "parallel_xy_slew_limited"),
+        "parallel_xy_stable_vx": _num(a1, "parallel_xy_stable_vx_mps"),
+        "parallel_xy_stable_vy": _num(a1, "parallel_xy_stable_vy_mps"),
+        "agent1_bottom_perception_shared": _truth(a1, "agent1_bottom_perception_shared"),
+        "visual_motion_attitude_valid": _truth(info, "visual_motion_attitude_valid"),
+        "visual_motion_yaw_rate_dps": _num(info, "visual_motion_yaw_rate_dps"),
+        "horizontal_speed_limit_mps": _num(info, "horizontal_total_speed_limit_mps", "horizontal_speed_limit_mps", default=_num(fuse, "speed_limit_mps")),
+        "safety_intervention": _truth(a1, "safety_intervention"),
+        "safety_reasons": "|".join(safety_reasons),
+        "ff_bottom_blocked_by_safety": _truth(info, "parallel_target_velocity_ff_blocked_by_safety", default=_truth(a1, "parallel_target_velocity_ff_blocked_by_safety")),
+        "parallel_z_blocked_by_safety": _truth(a1, "parallel_z_blocked_by_safety"),
+        "parallel_z_limited_by_safety": _truth(a1, "parallel_z_limited_by_safety"),
+        "front_dist_m": _num(a1, "front_dist_m", default=_num(info, "front_dist_m", default=999.0)),
+        "back_dist_m": _num(a1, "back_dist_m", default=_num(info, "back_dist_m", default=999.0)),
+        "left_dist_m": _num(a1, "left_dist_m", default=_num(info, "left_dist_m", default=999.0)),
+        "right_dist_m": _num(a1, "right_dist_m", default=_num(info, "right_dist_m", default=999.0)),
+        "collision": _truth(info, "collision_new"),
+        "collision_object": _string(info, "collision_object_name"),
+        "termination_reason": _string(info, "termination_reason"),
+        "reward": scalar_or_empty(reward),
+    }
+    anomalies = _critical_anomalies(row)
+    row["anomalies"] = "|".join(anomalies)
+    for anomaly in anomalies:
+        SESSION.anomaly_counts[anomaly] += 1
+
+    block_reason = str(row["descent_block_reason"] or "")
+    if block_reason:
+        SESSION.lock_block_counts[block_reason] += 1
+
+    previous = SESSION.last_critical_state
+    transition_keys = (
+        "tracker_mode", "bottom_live", "landing_lock", "catchup_active",
+        "vertical_gate_state", "agent1_active_camera", "agent1_xy_weight",
+        "ff_bottom_blocked_by_safety", "bridge_active",
+        "agent1_bottom_perception_shared", "collision", "termination_reason",
+    )
+    changed = [
+        key for key in transition_keys
+        if previous and previous.get(key) != row.get(key)
+    ]
+    for key in changed:
+        SESSION.transition_counts[f"{key}:{previous.get(key)}->{row.get(key)}"] += 1
+
+    try:
+        SESSION.critical.writerow({key: scalar_or_empty(row.get(key, "")) for key in SESSION.critical_fields})
+    except Exception as exc:
+        SESSION.write("exceptions", "critical_timeline_write_failed", error=repr(exc), row=row)
+
+    SESSION.write("parallel", "joined_parallel_control_tick", state=row, override=override, fuse=fuse)
+    SESSION.write("landing_gate", "joined_landing_gate_tick", state={
+        key: row.get(key) for key in (
+            "bottom_live", "bottom_confirmed", "bottom_similarity", "center_error",
+            "bbox_rel_error", "bbox_rel_gate_required",
+            "bbox_outlier_suppressed", "predicted_center_error", "catchup_active",
+            "landing_lock", "alignment_streak", "lock_visual_gap_steps",
+            "lock_bad_live_steps", "vertical_gate_state", "descent_allowed",
+            "descent_block_reason", "raw_vz_action", "requested_vz_mps",
+            "applied_vz_mps", "climb_command_blocked",
+        )
+    }, method_gate=vertical_gate)
+    SESSION.write("predictive", "joined_predictive_tick", state={
+        key: row.get(key) for key in (
+            "err_x", "err_y", "image_vel_x", "image_vel_y", "control_dt_s",
+            "predicted_err_x", "predicted_err_y", "predicted_center_error",
+            "prediction_horizon_s", "outward_speed_per_s", "catchup_active",
+            "bottom_requested_vx", "bottom_requested_vy", "physical_cmd_vx",
+            "physical_cmd_vy",
+        )
+    }, guidance=guidance, horizontal_servo=SESSION.last_horizontal_servo)
+    SESSION.write("vertical", "joined_vertical_tick", state={
+        key: row.get(key) for key in (
+            "raw_vz_action", "requested_vz_mps", "applied_vz_mps",
+            "climb_command_blocked", "descent_allowed", "descent_block_reason",
+            "drone_z_ned", "target_surface_z_ned", "relative_height_m", "alt_agl_m",
+        )
+    })
+    SESSION.write("safety_detail", "joined_safety_tick", state={
+        key: row.get(key) for key in (
+            "safety_intervention", "safety_reasons", "ff_bottom_blocked_by_safety",
+            "ff_requested_vx", "ff_requested_vy", "ff_applied_vx", "ff_applied_vy",
+            "bottom_requested_vx", "bottom_requested_vy", "bottom_applied_vx",
+            "bottom_applied_vy", "fused_expected_vx", "fused_expected_vy",
+            "physical_cmd_vx", "physical_cmd_vy", "front_dist_m", "back_dist_m",
+            "left_dist_m", "right_dist_m",
+        )
+    })
+    SESSION.write("fusion", "joined_camera_authority_tick", state={
+        key: row.get(key) for key in (
+            "tracker_mode", "bottom_live", "agent1_tracking_mode",
+            "agent1_active_camera", "agent1_fusion_has_target", "agent1_bottom_match",
+            "agent1_xy_weight",
+        )
+    })
+    SESSION.write("kinematics", "joined_kinematics_tick", state={
+        key: row.get(key) for key in (
+            "target_velocity_valid", "target_velocity_age_s", "target_vel_body_vx",
+            "actual_drone_vx", "actual_drone_vy", "actual_drone_vz",
+            "drone_world_x", "drone_world_y", "drone_world_z",
+            "target_world_x", "target_world_y", "target_world_z",
+            "relative_world_x", "relative_world_y", "relative_world_z",
+            "target_vel_body_vy", "target_speed_mps", "physical_cmd_vx",
+            "physical_cmd_vy", "physical_cmd_vz", "relative_height_m",
+        )
+    })
+
+    previous_anomalies = {item for item in str(previous.get("anomalies", "")).split("|") if item}
+    event_reasons = [item for item in anomalies if item not in previous_anomalies]
+    event_reasons.extend(f"transition_{key}" for key in changed)
+    if bool(done) or bool(truncated):
+        event_reasons.append("episode_finished")
+        episode = {
+            "control_tick": SESSION.control_ticks,
+            "episode_step": row["episode_step"],
+            "termination_reason": row["termination_reason"],
+            "reward": row["reward"],
+            "collision_object": row["collision_object"],
+            "bottom_live": row["bottom_live"],
+            "center_error": row["center_error"],
+            "landing_lock": row["landing_lock"],
+        }
+        SESSION.episode_results.append(episode)
+    if bool(row["collision"]):
+        event_reasons.append("collision")
+        SESSION.collision_events.append(dict(row))
+
+    if event_reasons:
+        label = "__".join(event_reasons[:4])
+        SESSION.write("bookmarks", "critical_transition", reasons=event_reasons, state=row)
+        capture_critical_frames(agent2_env, label)
+
+    SESSION.last_critical_state = dict(row)
+
+
+def install_current_problem_instrumentation(modules: dict[str, Any]) -> None:
+    """Install exact probes around the current v12.x control-authority path."""
+    agent2_module = modules.get("agent2_landing_env")
+    wrapper_module = modules.get("agent1p2_env")
+    drone_module = modules.get("drone_env")
+
+    if agent2_module is not None:
+        Agent2 = agent2_module.Agent2LandingEnv
+
+        if hasattr(Agent2, "_vertical_control_state"):
+            original_vertical = Agent2._vertical_control_state
+            @functools.wraps(original_vertical)
+            def vertical_wrapper(self, info, *args, __orig=original_vertical, **kwargs):
+                before = {
+                    "alignment_streak": getattr(self, "_alignment_ready_streak", None),
+                    "landing_lock": getattr(self, "_descent_alignment_latched", None),
+                    "visual_gap_steps": getattr(self, "_landing_lock_visual_gap_steps", None),
+                    "bad_live_steps": getattr(self, "_landing_lock_bad_live_steps", None),
+                    "predictive_catchup": getattr(self, "_predictive_catchup_active", None),
+                }
+                result = __orig(self, info, *args, **kwargs)
+                state, allowed, reason = result
+                record = {
+                    "state": state,
+                    "allowed": bool(allowed),
+                    "reason": reason,
+                    "input": {key: info.get(key) for key in (
+                        "tracker_mode", "bottom_match_live", "bottom_match_confirmed",
+                        "bottom_similarity", "bottom_center_error", "bottom_bbox_rel_err",
+                        "bottom_bbox_area_norm", "predicted_bottom_center_error",
+                        "predictive_bottom_catchup_active", "bottom_no_live_duration_s",
+                    )},
+                    "before": before,
+                    "after": {
+                        "alignment_streak": getattr(self, "_alignment_ready_streak", None),
+                        "landing_lock": getattr(self, "_descent_alignment_latched", None),
+                        "visual_gap_steps": getattr(self, "_landing_lock_visual_gap_steps", None),
+                        "bad_live_steps": getattr(self, "_landing_lock_bad_live_steps", None),
+                        "lock_acquired_step": getattr(self, "_landing_lock_acquired_step", None),
+                    },
+                    "thresholds": {
+                        "descent_min_similarity": getattr(self.cfg, "descent_min_similarity", None),
+                        "alignment_enter_center_error": getattr(self.cfg, "alignment_enter_center_error", None),
+                        "alignment_enter_bbox_rel_error": getattr(self.cfg, "alignment_enter_bbox_rel_error", None),
+                        "alignment_exit_center_error": getattr(self.cfg, "alignment_exit_center_error", None),
+                        "alignment_exit_bbox_rel_error": getattr(self.cfg, "alignment_exit_bbox_rel_error", None),
+                        "alignment_streak_required": getattr(self.cfg, "alignment_streak_required", None),
+                        "landing_lock_max_visual_gap_steps": getattr(self.cfg, "landing_lock_max_visual_gap_steps", None),
+                        "landing_lock_bad_live_release_steps": getattr(self.cfg, "landing_lock_bad_live_release_steps", None),
+                    },
+                }
+                SESSION.last_vertical_gate = record
+                SESSION.write("landing_gate", "vertical_control_state_decision", **record)
+                return result
+            patch_attr(Agent2, "_vertical_control_state", vertical_wrapper)
+
+        if hasattr(Agent2, "_compute_predictive_bottom_guidance"):
+            original_guidance = Agent2._compute_predictive_bottom_guidance
+            @functools.wraps(original_guidance)
+            def guidance_wrapper(self, info, *args, __orig=original_guidance, **kwargs):
+                before_catch = bool(getattr(self, "_predictive_catchup_active", False))
+                result = __orig(self, info, *args, **kwargs)
+                record = dict(result or {})
+                record["input"] = {key: info.get(key) for key in (
+                    "bottom_match_live", "bottom_similarity", "bottom_err_x",
+                    "bottom_err_y", "bottom_center_error", "bottom_bbox_area_norm",
+                    "bottom_img_vel_x_control", "bottom_img_vel_y_control",
+                    "bottom_control_dt_s", "relative_height_to_target_m",
+                )}
+                record["catchup_before"] = before_catch
+                record["catchup_after"] = bool(getattr(self, "_predictive_catchup_active", False))
+                record["release_streak"] = int(getattr(self, "_predictive_catchup_release_streak", 0))
+                record["thresholds"] = {
+                    name: getattr(self.cfg, name, None) for name in (
+                        "predictive_bottom_extra_latency_s",
+                        "predictive_bottom_horizon_min_s",
+                        "predictive_bottom_horizon_max_s",
+                        "predictive_bottom_kp_y_to_vx_mps",
+                        "predictive_bottom_kd_y_to_vx_mps",
+                        "predictive_bottom_kp_x_to_vy_mps",
+                        "predictive_bottom_kd_x_to_vy_mps",
+                        "predictive_bottom_normal_correction_max_mps",
+                        "predictive_bottom_catchup_correction_max_mps",
+                        "predictive_bottom_touchdown_catchup_max_mps",
+                        "predictive_bottom_catchup_enter_center_error",
+                        "predictive_bottom_catchup_exit_center_error",
+                        "predictive_bottom_catchup_enter_outward_speed_per_s",
+                        "predictive_bottom_catchup_exit_outward_speed_per_s",
+                        "predictive_bottom_catchup_exit_image_speed_per_s",
+                    )
+                }
+                SESSION.last_predictive_guidance = record
+                SESSION.write("predictive", "predictive_guidance_decision", state=record)
+                return result
+            patch_attr(Agent2, "_compute_predictive_bottom_guidance", guidance_wrapper)
+
+        if hasattr(Agent2, "_horizontal_visual_servo"):
+            original_servo = Agent2._horizontal_visual_servo
+            @functools.wraps(original_servo)
+            def servo_wrapper(self, raw, info, *args, __orig=original_servo, **kwargs):
+                result = __orig(self, raw, info, *args, **kwargs)
+                vx, vy, details = result
+                record = {
+                    "raw_action": raw,
+                    "input": {key: info.get(key) for key in (
+                        "bottom_match_live", "bottom_match_confirmed", "bottom_err_x",
+                        "bottom_err_y", "bottom_center_error", "bottom_bbox_rel_err",
+                        "relative_height_to_target_m", "target_velocity_valid",
+                        "target_velocity_body_vx_mps", "target_velocity_body_vy_mps",
+                    )},
+                    "vx": vx,
+                    "vy": vy,
+                    "details": details,
+                }
+                SESSION.last_horizontal_servo = record
+                SESSION.write("horizontal", "horizontal_visual_servo_decision", **record)
+                return result
+            patch_attr(Agent2, "_horizontal_visual_servo", servo_wrapper)
+
+        if hasattr(Agent2, "_update_control_image_velocity"):
+            original_img_vel = Agent2._update_control_image_velocity
+            @functools.wraps(original_img_vel)
+            def image_velocity_wrapper(self, metrics, live_match, *args, __orig=original_img_vel, **kwargs):
+                before = {
+                    "vel_x": getattr(self, "_control_img_vel_x", 0.0),
+                    "vel_y": getattr(self, "_control_img_vel_y", 0.0),
+                    "last_err_x": getattr(self, "_last_control_err_x", 0.0),
+                    "last_err_y": getattr(self, "_last_control_err_y", 0.0),
+                    "last_live": getattr(self, "_last_control_had_live_match", False),
+                }
+                result = __orig(self, metrics, live_match, *args, **kwargs)
+                after = {
+                    "vel_x": getattr(self, "_control_img_vel_x", 0.0),
+                    "vel_y": getattr(self, "_control_img_vel_y", 0.0),
+                    "dt_s": getattr(self, "_last_control_dt_s", 0.0),
+                    "last_err_x": getattr(self, "_last_control_err_x", 0.0),
+                    "last_err_y": getattr(self, "_last_control_err_y", 0.0),
+                    "last_live": getattr(self, "_last_control_had_live_match", False),
+                }
+                SESSION.write("predictive", "image_velocity_update", metrics=metrics, live_match=live_match, before=before, after=after)
+                return result
+            patch_attr(Agent2, "_update_control_image_velocity", image_velocity_wrapper)
+
+        if hasattr(Agent2, "_maybe_update_adaptive_embedding_bank"):
+            original_bank = Agent2._maybe_update_adaptive_embedding_bank
+            @functools.wraps(original_bank)
+            def bank_wrapper(self, *args, __orig=original_bank, **kwargs):
+                before = {
+                    "count": len(getattr(self, "_adaptive_embeddings", [])),
+                    "steps": list(getattr(self, "_adaptive_embedding_steps", [])),
+                    "updates": getattr(self, "_adaptive_embedding_updates", 0),
+                }
+                result = __orig(self, *args, **kwargs)
+                after = {
+                    "count": len(getattr(self, "_adaptive_embeddings", [])),
+                    "steps": list(getattr(self, "_adaptive_embedding_steps", [])),
+                    "updates": getattr(self, "_adaptive_embedding_updates", 0),
+                }
+                SESSION.write("adaptive_bank", "adaptive_bank_update_attempt", args=args, kwargs=kwargs, result=result, before=before, after=after)
+                return result
+            patch_attr(Agent2, "_maybe_update_adaptive_embedding_bank", bank_wrapper)
+
+    if wrapper_module is not None:
+        Agent1P2 = wrapper_module.Agent1P2Env
+        if hasattr(Agent1P2, "_execute_parallel_command"):
+            original_execute = Agent1P2._execute_parallel_command
+            @functools.wraps(original_execute)
+            def execute_wrapper(self, agent2_vz_mps, *args, __orig=original_execute, **kwargs):
+                result = __orig(self, agent2_vz_mps, *args, **kwargs)
+                SESSION.write(
+                    "parallel", "parallel_command_executor_return",
+                    agent2_vz_mps=agent2_vz_mps,
+                    result=result,
+                    agent1_info=getattr(self, "_agent1_last_info", {}),
+                    bottom_guidance=getattr(getattr(self, "agent2_env", None), "_last_predictive_guidance", {}),
+                )
+                return result
+            patch_attr(Agent1P2, "_execute_parallel_command", execute_wrapper)
+
+    if drone_module is not None:
+        DroneEnv = drone_module.DroneEnv
+        if hasattr(DroneEnv, "set_parallel_control_overrides"):
+            original_overrides = DroneEnv.set_parallel_control_overrides
+            @functools.wraps(original_overrides)
+            def overrides_wrapper(self, *args, __orig=original_overrides, **kwargs):
+                names = (
+                    "vz_mps", "feedforward_vx_mps", "feedforward_vy_mps",
+                    "bottom_correction_vx_mps", "bottom_correction_vy_mps",
+                    "agent1_xy_weight", "horizontal_speed_limit_mps",
+                )
+                values = {name: kwargs.get(name, args[index] if index < len(args) else None) for index, name in enumerate(names)}
+                SESSION.last_parallel_override = values
+                SESSION.write("parallel", "parallel_override_requested", state=values)
+                return __orig(self, *args, **kwargs)
+            patch_attr(DroneEnv, "set_parallel_control_overrides", overrides_wrapper)
+
+        if hasattr(DroneEnv, "_fuse_parallel_xy"):
+            original_fuse = DroneEnv._fuse_parallel_xy
+            @functools.wraps(original_fuse)
+            def fuse_wrapper(*args, __orig=original_fuse, **kwargs):
+                names = (
+                    "agent1_vx", "agent1_vy", "agent1_weight", "feedforward_vx",
+                    "feedforward_vy", "bottom_correction_vx", "bottom_correction_vy",
+                    "speed_limit_mps",
+                )
+                values = {name: kwargs.get(name, args[index] if index < len(args) else None) for index, name in enumerate(names)}
+                result = __orig(*args, **kwargs)
+                record = dict(values)
+                record["result_vx"] = result[0]
+                record["result_vy"] = result[1]
+                SESSION.last_parallel_fuse = record
+                SESSION.write("parallel", "parallel_xy_fuse", state=record)
+                return result
+            patch_attr(DroneEnv, "_fuse_parallel_xy", staticmethod(fuse_wrapper))
+
+
+def snapshot_model_inventory() -> None:
+    entries: list[dict[str, Any]] = []
+    model_root = BASE_DIR / "models"
+    if model_root.exists():
+        for path in sorted(model_root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+                record = {
+                    "path": str(path.relative_to(BASE_DIR)),
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "sha256": sha256_bytes(path.read_bytes()),
+                }
+                match = re.search(r"(\d+)_steps", path.name)
+                record["numbered_steps"] = int(match.group(1)) if match else None
+                entries.append(record)
+            except Exception as exc:
+                entries.append({"path": str(path), "error": repr(exc)})
+    (RUN_DIR / "model_checkpoint_inventory.json").write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+    )
+    SESSION.write("checkpoints", "checkpoint_inventory", entries=entries)
+
+
+def snapshot_code_audit() -> None:
+    """Record exact source lines relevant to the current control deadlock."""
+    patterns = [
+        ("negative_vz_clipping", re.compile(r"max\s*\(\s*0\.0\s*,.*vz", re.IGNORECASE)),
+        ("parallel_safety_zeroing", re.compile(r"ff_vx\s*=\s*0\.0|bottom_vx\s*=\s*0\.0")),
+        ("safety_obstacle_token_gate", re.compile(r"obstacle.*horizontal.*lidar|for token in \(\"obstacle\"", re.IGNORECASE)),
+        ("bottom_live_xy_authority", re.compile(r"bottom_live_agent1_xy_weight|if bottom_live else 1\.0")),
+        ("landing_lock_gate", re.compile(r"_descent_alignment_latched|alignment_streak_required")),
+        ("predictive_catchup_gate", re.compile(r"HOLD_PREDICTIVE_CATCHUP|predictive_bottom_catchup")),
+        ("relative_height_equation", re.compile(r"target_surface_z_ned\s*-\s*drone_z_ned")),
+    ]
+    findings: list[dict[str, Any]] = []
+    for file_name in ("drone_env.py", "agent1p2_env.py", "agent2_landing_env.py", "config/flow_config.py"):
+        file_path = BASE_DIR / file_name
+        if not file_path.exists():
+            continue
+        lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line_no, line in enumerate(lines, start=1):
+            for finding_name, pattern in patterns:
+                if pattern.search(line):
+                    findings.append({
+                        "finding": finding_name,
+                        "file": file_name,
+                        "line": line_no,
+                        "text": line.strip(),
+                    })
+    (RUN_DIR / "static_code_audit.json").write_text(
+        json.dumps(findings, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+    )
+    md = ["# Static control-path audit", "", "These are observations only; Run_diag does not alter the source.", ""]
+    for item in findings:
+        md.append(f"- **{item['finding']}** — `{item['file']}:{item['line']}` — `{item['text']}`")
+    (RUN_DIR / "static_code_audit.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    SESSION.write("audit", "static_code_audit", findings=findings)
+
+
+def copy_runtime_artifacts() -> None:
+    """Copy files created or modified by this diagnostic run from logs/results."""
+    destination = RUN_DIR / "runtime_artifacts"
+    total = 0
+    copied: list[dict[str, Any]] = []
+    cutoff = SESSION.start_wall - 3.0
+    for root_name in ("logs", "results"):
+        root = BASE_DIR / root_name
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+                if stat.st_mtime < cutoff:
+                    continue
+                if stat.st_size > RUNTIME_ARTIFACT_MAX_FILE_BYTES:
+                    copied.append({"path": str(path.relative_to(BASE_DIR)), "skipped": "file_too_large", "size": stat.st_size})
+                    continue
+                if total + stat.st_size > RUNTIME_ARTIFACT_TOTAL_BYTES:
+                    copied.append({"path": str(path.relative_to(BASE_DIR)), "skipped": "total_limit", "size": stat.st_size})
+                    continue
+                target = destination / path.relative_to(BASE_DIR)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+                total += stat.st_size
+                copied.append({"path": str(path.relative_to(BASE_DIR)), "copied": True, "size": stat.st_size})
+            except Exception as exc:
+                copied.append({"path": str(path), "error": repr(exc)})
+    (RUN_DIR / "runtime_artifacts_manifest.json").write_text(
+        json.dumps(copied, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+    )
+
+
+def write_automatic_findings() -> None:
+    """Produce a human-readable first-pass diagnosis from the collected counters."""
+    lines = [
+        "# Automatic diagnostic findings",
+        "",
+        f"Diagnostic version: `{DIAG_VERSION}`",
+        "",
+        "This report is generated from runtime evidence. It does not replace inspection of",
+        "`00_control_authority_timeline.csv` and the event-frame pairs.",
+        "",
+        "## Run totals",
+        "",
+        f"- Control ticks: **{SESSION.control_ticks}**",
+        f"- Instrumented environment step returns: **{SESSION.physical_steps}**",
+        f"- Trainable PPO steps: **{SESSION.trainable_steps}**",
+        f"- Episodes completed: **{len(SESSION.episode_results)}**",
+        f"- Collisions captured: **{len(SESSION.collision_events)}**",
+        "",
+        "## Most frequent descent/landing-lock blockers",
+        "",
+    ]
+    if SESSION.lock_block_counts:
+        for reason, count in SESSION.lock_block_counts.most_common(20):
+            lines.append(f"- `{reason}`: **{count}**")
+    else:
+        lines.append("- No block reason was recorded.")
+
+    lines.extend(["", "## Safety reasons", ""])
+    if SESSION.safety_reason_counts:
+        for reason, count in SESSION.safety_reason_counts.most_common(20):
+            lines.append(f"- `{reason}`: **{count}**")
+    else:
+        lines.append("- No safety reason was recorded.")
+
+    lines.extend(["", "## Automatically detected anomalies", ""])
+    if SESSION.anomaly_counts:
+        for reason, count in SESSION.anomaly_counts.most_common(30):
+            lines.append(f"- `{reason}`: **{count}**")
+    else:
+        lines.append("- No predefined anomaly was detected.")
+
+    lines.extend(["", "## Authority/state transitions", ""])
+    if SESSION.transition_counts:
+        for transition, count in SESSION.transition_counts.most_common(30):
+            lines.append(f"- `{transition}`: **{count}**")
+    else:
+        lines.append("- No transition was recorded.")
+
+    lines.extend(["", "## Episode results", ""])
+    if SESSION.episode_results:
+        for index, episode in enumerate(SESSION.episode_results, start=1):
+            lines.append(
+                f"- Episode {index}: `{episode.get('termination_reason')}` | "
+                f"reward={episode.get('reward')} | collision=`{episode.get('collision_object')}` | "
+                f"center={episode.get('center_error')} | lock={episode.get('landing_lock')}"
+            )
+    else:
+        lines.append("- The diagnostic stopped before an episode completed.")
+
+    lines.extend([
+        "",
+        "## Files to inspect first",
+        "",
+        "1. `00_control_authority_timeline.csv` — joined perception/control/safety/Z timeline.",
+        "2. `27_landing_lock_and_z_gate.jsonl` — exact reason for every Z decision.",
+        "3. `26_parallel_xy_arbitration.jsonl` — requested versus fused XY components.",
+        "4. `30_safety_lidar_command_suppression.jsonl` — commands removed by safety.",
+        "5. `28_bottom_predictive_controller.jsonl` — t+1 prediction and derivative state.",
+        "6. `frames/events/` — synchronized visual evidence at each anomaly/transition.",
+        "7. `static_code_audit.md` — exact source lines for clipping and authority gates.",
+        "",
+    ])
+    (RUN_DIR / "DIAGNOSTIC_FINDINGS.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def tracker_state_from_env(env: Any) -> dict[str, Any]:
@@ -1350,6 +2262,8 @@ def install_component_instrumentation(modules: dict[str, Any]) -> None:
         if drone_env is not None and getattr(drone_env, "compute_follow_reward", None) is original:
             patch_attr(drone_env, "compute_follow_reward", reward_wrapper)
 
+    install_current_problem_instrumentation(modules)
+
 
 def install_sb3_instrumentation(run_train_module: Any) -> None:
     try:
@@ -1381,7 +2295,33 @@ def install_sb3_instrumentation(run_train_module: Any) -> None:
         except TypeError:
             pass
         SESSION.register_object(model, created_by="stable_baselines3.PPO.load", args=args, kwargs=kwargs)
-        SESSION.write("sb3", "ppo_loaded", args=args, kwargs=kwargs, model_id=hex(id(model)), observation_space=getattr(model, "observation_space", None), action_space=getattr(model, "action_space", None), duration_ms=(time.perf_counter() - started) * 1000.0)
+        checkpoint_record: dict[str, Any] = {}
+        try:
+            requested = kwargs.get("path", args[0] if args else None)
+            source_path = Path(str(requested))
+            if not source_path.is_absolute():
+                source_path = (Path.cwd() / source_path).resolve()
+            if not source_path.exists() and source_path.suffix.lower() != ".zip":
+                zipped = source_path.with_suffix(".zip")
+                if zipped.exists():
+                    source_path = zipped
+            if source_path.exists() and source_path.is_file():
+                target = RUN_DIR / "active_checkpoints" / source_path.name
+                if target.exists():
+                    target = target.with_name(f"{target.stem}_{len(SESSION.loaded_checkpoints)}{target.suffix}")
+                shutil.copy2(source_path, target)
+                checkpoint_record = {
+                    "requested": str(requested),
+                    "resolved": str(source_path),
+                    "copied_to": str(target.relative_to(RUN_DIR)),
+                    "size": source_path.stat().st_size,
+                    "sha256": sha256_bytes(source_path.read_bytes()),
+                }
+                SESSION.loaded_checkpoints.append(checkpoint_record)
+                SESSION.write("checkpoints", "active_checkpoint_copied", **checkpoint_record)
+        except Exception as exc:
+            SESSION.write("exceptions", "active_checkpoint_copy_failed", error=repr(exc), args=args, kwargs=kwargs)
+        SESSION.write("sb3", "ppo_loaded", args=args, kwargs=kwargs, model_id=hex(id(model)), observation_space=getattr(model, "observation_space", None), action_space=getattr(model, "action_space", None), duration_ms=(time.perf_counter() - started) * 1000.0, checkpoint=checkpoint_record)
         return model
     patch_attr(PPO, "load", load_wrapper)
 
@@ -1597,11 +2537,13 @@ def write_method_statistics() -> None:
 
 def write_summary() -> None:
     summary = {
+        "diagnostic_version": DIAG_VERSION,
         "started_unix": SESSION.start_wall,
         "finished_unix": time.time(),
         "elapsed_s": SESSION.elapsed,
         "stop_reason": SESSION.stop_reason,
         "physical_steps": SESSION.physical_steps,
+        "control_ticks": SESSION.control_ticks,
         "trainable_steps": SESSION.trainable_steps,
         "agent1_physical_steps": SESSION.agent1_steps,
         "agent2_physical_steps": SESSION.agent2_steps,
@@ -1617,6 +2559,13 @@ def write_summary() -> None:
         },
         "log_counts": {name: writer.count for name, writer in SESSION.writers.items()},
         "event_counts": dict(SESSION.event_counts),
+        "transition_counts": dict(SESSION.transition_counts),
+        "landing_lock_block_counts": dict(SESSION.lock_block_counts),
+        "safety_reason_counts": dict(SESSION.safety_reason_counts),
+        "anomaly_counts": dict(SESSION.anomaly_counts),
+        "loaded_checkpoints": SESSION.loaded_checkpoints,
+        "episode_results": SESSION.episode_results,
+        "collision_events": safe_value(SESSION.collision_events),
         "limits": {
             "physical_steps": MAX_PHYSICAL_STEPS,
             "trainable_steps": MAX_TRAINABLE_STEPS,
@@ -1650,12 +2599,14 @@ def main() -> None:
     sys.stderr = Tee(original_stderr, console_fp)
 
     print("=" * 110)
-    print("[DIAG] Wrapping the CURRENT Run_train.py without reimplementing its flow")
+    print(f"[DIAG] Run_diag {DIAG_VERSION} wrapping the CURRENT Run_train.py")
     print(f"[DIAG] Project root          : {BASE_DIR}")
     print(f"[DIAG] Physical step limit   : {MAX_PHYSICAL_STEPS}")
     print(f"[DIAG] Trainable step limit  : {MAX_TRAINABLE_STEPS}")
     print(f"[DIAG] Wall-time limit       : {MAX_WALL_SECONDS:.0f}s")
     print(f"[DIAG] Full ResNet vectors   : {FULL_RESNET_EMBEDDINGS}")
+    print("[DIAG] Joined authority CSV  : 00_control_authority_timeline.csv")
+    print("[DIAG] Critical event frames : frames/events/")
     print(f"[DIAG] Final archive         : {DIAG_ZIP}")
     print("[DIAG] Model/checkpoint writes are disabled for this diagnostic run")
     print("=" * 110)
@@ -1664,6 +2615,8 @@ def main() -> None:
     try:
         snapshot_runtime_environment()
         snapshot_source()
+        snapshot_model_inventory()
+        snapshot_code_audit()
         modules = import_project_modules()
         snapshot_configs(modules)
         install_component_instrumentation(modules)
@@ -1696,6 +2649,8 @@ def main() -> None:
         print("[DIAG] All collected data will still be packaged.")
     finally:
         try:
+            copy_runtime_artifacts()
+            write_automatic_findings()
             write_method_statistics()
             write_summary()
         except Exception as exc:

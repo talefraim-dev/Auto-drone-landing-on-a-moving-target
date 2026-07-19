@@ -1,0 +1,296 @@
+[
+  {
+    "finding": "negative_vz_clipping",
+    "file": "drone_env.py",
+    "line": 479,
+    "text": "self._parallel_external_vz_mps = max(0.0, float(vz_mps))"
+  },
+  {
+    "finding": "safety_obstacle_token_gate",
+    "file": "drone_env.py",
+    "line": 3516,
+    "text": "for token in (\"obstacle\", \"horizontal\", \"lidar\")"
+  },
+  {
+    "finding": "parallel_safety_zeroing",
+    "file": "drone_env.py",
+    "line": 3519,
+    "text": "ff_vx = 0.0"
+  },
+  {
+    "finding": "parallel_safety_zeroing",
+    "file": "drone_env.py",
+    "line": 3521,
+    "text": "bottom_vx = 0.0"
+  },
+  {
+    "finding": "bottom_live_xy_authority",
+    "file": "agent1p2_env.py",
+    "line": 100,
+    "text": "bottom_live_agent1_xy_weight: float = 0.0,"
+  },
+  {
+    "finding": "bottom_live_xy_authority",
+    "file": "agent1p2_env.py",
+    "line": 144,
+    "text": "self.bottom_live_agent1_xy_weight = float("
+  },
+  {
+    "finding": "bottom_live_xy_authority",
+    "file": "agent1p2_env.py",
+    "line": 145,
+    "text": "np.clip(bottom_live_agent1_xy_weight, 0.0, 1.0)"
+  },
+  {
+    "finding": "bottom_live_xy_authority",
+    "file": "agent1p2_env.py",
+    "line": 306,
+    "text": "self.bottom_live_agent1_xy_weight if bottom_live else 1.0"
+  },
+  {
+    "finding": "negative_vz_clipping",
+    "file": "agent1p2_env.py",
+    "line": 318,
+    "text": "vz_mps=max(0.0, float(agent2_vz_mps)),"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 126,
+    "text": "predictive_bottom_catchup_correction_max_mps: float = 2.20"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 128,
+    "text": "predictive_bottom_catchup_enter_center_error: float = 0.24"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 129,
+    "text": "predictive_bottom_catchup_exit_center_error: float = 0.13"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 130,
+    "text": "predictive_bottom_catchup_enter_outward_speed_per_s: float = 0.10"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 131,
+    "text": "predictive_bottom_catchup_exit_outward_speed_per_s: float = 0.03"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 132,
+    "text": "predictive_bottom_catchup_exit_image_speed_per_s: float = 0.16"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 133,
+    "text": "predictive_bottom_catchup_release_streak: int = 2"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 143,
+    "text": "alignment_streak_required: int = 2"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 383,
+    "text": "self._descent_alignment_latched = False"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 473,
+    "text": "landing_lock = bool(self._descent_alignment_latched)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 547,
+    "text": ">= float(self.cfg.predictive_bottom_catchup_enter_center_error)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 549,
+    "text": ">= float(self.cfg.predictive_bottom_catchup_enter_outward_speed_per_s)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 553,
+    "text": "<= float(self.cfg.predictive_bottom_catchup_exit_center_error)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 555,
+    "text": "<= float(self.cfg.predictive_bottom_catchup_exit_outward_speed_per_s)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 557,
+    "text": "<= float(self.cfg.predictive_bottom_catchup_exit_image_speed_per_s)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 567,
+    "text": "1, int(self.cfg.predictive_bottom_catchup_release_streak)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 592,
+    "text": "self.cfg.predictive_bottom_catchup_correction_max_mps"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 639,
+    "text": "result[\"landing_lock\"] = bool(self._descent_alignment_latched)"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1177,
+    "text": "self._descent_alignment_latched = False"
+  },
+  {
+    "finding": "relative_height_equation",
+    "file": "agent2_landing_env.py",
+    "line": 1463,
+    "text": "relative_height = float(self._target_surface_z_ned - drone_z_ned)"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1813,
+    "text": "\"predictive_bottom_catchup_active\": bool(self._predictive_catchup_active),"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1815,
+    "text": "\"descent_alignment_latched\": bool(self._descent_alignment_latched),"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1816,
+    "text": "\"landing_lock_active\": bool(self._descent_alignment_latched),"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1821,
+    "text": "if self._descent_alignment_latched"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1876,
+    "text": "if live_match and not bool(self._descent_alignment_latched):"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1879,
+    "text": "f\"{int(self.cfg.alignment_streak_required)})\""
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1881,
+    "text": "elif live_match and bool(self._descent_alignment_latched):"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 1939,
+    "text": "f\"LOCK={int(bool(self._descent_alignment_latched))} \""
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2720,
+    "text": "if bool(self._descent_alignment_latched):"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2730,
+    "text": "self._descent_alignment_latched = False"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2746,
+    "text": "if not bool(self._descent_alignment_latched):"
+  },
+  {
+    "finding": "predictive_catchup_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2749,
+    "text": "\"HOLD_PREDICTIVE_CATCHUP\","
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2754,
+    "text": "if bool(self._descent_alignment_latched):"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2768,
+    "text": "self._descent_alignment_latched = False"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2804,
+    "text": "required = max(1, int(self.cfg.alignment_streak_required))"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 2806,
+    "text": "self._descent_alignment_latched = True"
+  },
+  {
+    "finding": "negative_vz_clipping",
+    "file": "agent2_landing_env.py",
+    "line": 2866,
+    "text": "requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)"
+  },
+  {
+    "finding": "negative_vz_clipping",
+    "file": "agent2_landing_env.py",
+    "line": 2895,
+    "text": "vz = max(0.0, float(vz))"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 3084,
+    "text": "\"descent_alignment_latched\": bool(getattr(self, \"_descent_alignment_latched\", False)),"
+  },
+  {
+    "finding": "landing_lock_gate",
+    "file": "agent2_landing_env.py",
+    "line": 3160,
+    "text": "f\"lock={int(bool(getattr(self, '_descent_alignment_latched', False)))} \""
+  }
+]

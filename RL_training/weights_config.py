@@ -48,6 +48,45 @@ class EnvConfig:
     cmd_duration_s: float = 0.10
     max_episode_steps: int = 2000
 
+    # Safe command bridge:
+    # The PPO policy was trained with a 0.10 s velocity pulse. The pulse is
+    # preserved exactly. After it finishes, drone_env samples the velocity that
+    # the simulator actually achieved and holds only that measured, bounded XY
+    # velocity while perception runs. This avoids both failure modes:
+    #   1. braking almost to zero between slow visual updates;
+    #   2. holding a 5-6 m/s policy pulse continuously.
+    command_bridge_enabled: bool = True
+    command_bridge_period_initial_s: float = 0.55
+    command_bridge_period_ema_alpha: float = 0.25
+    command_bridge_duration_scale: float = 1.15
+    command_bridge_min_duration_s: float = 0.25
+    command_bridge_max_duration_s: float = 0.90
+    command_bridge_match_max_speed_mps: float = 1.20
+    command_bridge_pred_max_speed_mps: float = 0.85
+    command_bridge_lost_max_speed_mps: float = 0.45
+    command_bridge_bottom_max_speed_mps: float = 0.70
+    command_bridge_landing_max_speed_mps: float = 0.38
+    command_bridge_velocity_ema_alpha: float = 0.65
+    command_bridge_min_speed_mps: float = 0.03
+    command_bridge_attitude_soft_limit_deg: float = 10.0
+    command_bridge_attitude_hard_limit_deg: float = 16.0
+    # Keep legacy non-parallel bridge Z at zero. In parallel landing mode the
+    # already-authorized Agent-2 descent may be refreshed conservatively so a
+    # 0.10 s pulse is not immediately cancelled by the XY bridge.
+    command_bridge_zero_vertical_velocity: bool = True
+    command_bridge_parallel_vertical_enabled: bool = True
+    command_bridge_parallel_vertical_max_mps: float = 0.35
+    command_bridge_parallel_vertical_min_mps: float = 1.0e-4
+    # Physical down-LiDAR safety is applied after Agent-2 Z ownership. When the
+    # safety filter requests a near-ground descent limit, cap both the pulse and
+    # its bridge to this conservative NED-Z speed.
+    parallel_vertical_near_ground_max_mps: float = 0.12
+    # Physical down-LiDAR safety is applied after Agent-2 Z ownership. When the
+    # safety filter requests a near-ground descent limit, cap both the pulse and
+    # its bridge to this conservative NED-Z speed.
+    parallel_vertical_near_ground_max_mps: float = 0.12
+    command_bridge_zero_yaw_rate: bool = True
+
     # -----------------------------
     # Reset / takeoff
     # -----------------------------
@@ -273,7 +312,11 @@ class EnvConfig:
     # When the target is temporarily lost, the policy needs enough yaw authority
     # to search aggressively before the lost-target timeout ends.
     recovery_yaw_rate_scale_dps: float = 130.0
+    # Keep the old slowdown only for a true LOST state. A short Kalman PRED
+    # bridge still has a target estimate; slowing it by 35% made the moving car
+    # pull away exactly when the detector flickered.
     recovery_forward_scale: float = 0.65
+    prediction_forward_scale: float = 1.00
 
     # Heuristic overshoot detector:
     # If the target was very close/large and then disappears, this is usually the
@@ -515,6 +558,30 @@ class EnvConfig:
     dual_full_trackers_enabled: bool = True
     bottom_full_tracker_enabled: bool = True
     bottom_full_tracker_update_every_n_steps: int = 1
+
+    # Bottom-perception scheduler. Full YOLO+ResNet bottom tracking is useful
+    # only when the car can geometrically enter the downward FOV or when recent
+    # bottom evidence already exists. Far away, use a sparse probe instead of
+    # paying for a full second camera pipeline on every Agent-1 step.
+    bottom_geometric_scan_enabled: bool = True
+    bottom_camera_hfov_deg: float = 90.0
+    bottom_geometric_target_margin_m: float = 2.5
+    bottom_far_probe_every_n_steps: int = 12
+    bottom_near_probe_every_n_steps: int = 3
+    bottom_live_update_every_n_steps: int = 1
+    parallel_share_agent2_bottom_perception: bool = True
+    # Agent 2 publishes the exact frame and filtered bbox after its bottom
+    # observation. Agent 1 can spend multiple seconds in front-camera inference
+    # before consuming that snapshot; use a window larger than the measured
+    # inference cycle so it does not silently fall back to a second tracker.
+    parallel_bottom_snapshot_stale_after_s: float = 4.00
+
+    # Parallel bottom-guided XY stabilization. These limits apply only after
+    # Agent 2 owns bottom guidance; Agent-1 search/reacquire remains unchanged.
+    parallel_xy_slew_enabled: bool = True
+    parallel_xy_max_delta_per_step_mps: float = 0.60
+    parallel_bottom_live_speed_cap_mps: float = 1.60
+    parallel_bottom_pred_speed_cap_mps: float = 1.10
     bottom_full_tracker_match_similarity_fallback: float = 0.78
     bottom_full_tracker_pred_similarity_fallback: float = 0.42
     bottom_full_tracker_lost_similarity_fallback: float = 0.0

@@ -1,0 +1,93 @@
+{
+  "created_utc": "2026-07-19T14:52:48.914476+00:00",
+  "base_package": "/mnt/data/RL_training_19_TRUE_ROOT_FIX.zip",
+  "base_package_sha256": "5fff22cf4c01f2a0cfc7517ba0636b4e8d4394f24253561d5681880258a0b629",
+  "purpose": "Allow bounded Agent-2 descent during visually safe predictive catch-up and prevent the Agent-1 bridge from cancelling or bypassing safety for Z.",
+  "changed_files": [
+    "BASELINE_CORE_SHA256.json",
+    "CATCHUP_DESCENT_FIX_README_HE.md",
+    "CATCHUP_DESCENT_FIX_REPORT_HE.md",
+    "Run_diag.py",
+    "Run_train.py",
+    "agent2_landing_env.py",
+    "config/flow_config.py",
+    "drone_env.py",
+    "test_agent2_catchup_descent_fix.py",
+    "test_agent2_horizontal_v5.py",
+    "test_agent2_safe_training.py",
+    "test_agent2_vertical_v4.py",
+    "test_true_realtime_control_fix.py",
+    "test_user_target_identity.py",
+    "weights_config.py"
+  ],
+  "unchanged_critical_files": {
+    "follow_reward_v37.py": {
+      "sha256": "204433f409496f3cd18aaab2e73ad28674a02663d99d9aae1306b45a6a3ad025",
+      "matches_base": true
+    },
+    "observation_builder.py": {
+      "sha256": "579f17ac5d9ddfe7f96d6c77fac37f020c2aa9b9b1088b6bbc41572a421b88c3",
+      "matches_base": true
+    },
+    "safety_filter.py": {
+      "sha256": "bbd1c1a7d23eee0e24d9c62e0c5cdbd33d2cf93826f3881e781efbc6818f2b70",
+      "matches_base": true
+    },
+    "lidar_processor.py": {
+      "sha256": "9bc93e46068ad75b11225ff9e8c753ce1d3151dc9781a66236b87efca76fe90c",
+      "matches_base": true
+    },
+    "object_tracker.py": {
+      "sha256": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
+      "matches_base": true
+    },
+    "resnet_yolo_tracker.py": {
+      "sha256": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
+      "matches_base": true
+    },
+    "agent1p2_env.py": {
+      "sha256": "1f2ae2baaaf25c7d523d457b7f8f3f73150855a44fda0bee06e758bdbf0a0b7f",
+      "matches_base": true
+    }
+  },
+  "safety_limits": {
+    "soft_catchup_descent_max_vz_mps": 0.28,
+    "soft_catchup_touchdown_max_vz_mps": 0.12,
+    "soft_catchup_touchdown_height_m": 1.0,
+    "bridge_vertical_max_mps": 0.35,
+    "parallel_vertical_near_ground_max_mps": 0.12,
+    "bridge_negative_reacquire_climb_persisted": false
+  },
+  "tests_passed": [
+    "test_agent2_catchup_descent_fix.py (6/6)",
+    "test_true_realtime_control_fix.py",
+    "test_agent2_horizontal_v5.py (8/8)",
+    "test_agent2_safe_training.py (7/7)",
+    "test_agent2_vertical_v4.py (5/5)",
+    "test_safe_isolated_flow.py",
+    "test_user_target_identity.py",
+    "compileall",
+    "AST parse of 155 Python files"
+  ],
+  "known_preexisting_test_failures": [
+    {
+      "test": "test_agent2_collision_reward_v6.py",
+      "reason": "Also fails in the TRUE_ROOT_FIX base; stale assertion expects TOTAL_AGENT2_TIMESTEPS = 10_240."
+    },
+    {
+      "test": "test_agent2_collision_reward_v8.py",
+      "reason": "Also fails in the TRUE_ROOT_FIX base; stale collision-age expectation."
+    },
+    {
+      "test": "test_servo_final.py",
+      "reason": "gymnasium is unavailable in the validation container."
+    },
+    {
+      "test": "test_yolo_resnet_tracker.py",
+      "reason": "cosysairsim is unavailable in the validation container."
+    }
+  ],
+  "limitations": [
+    "No live Unreal/AirSim flight was possible in the validation container. Run Run_diag.py before any new training."
+  ]
+}

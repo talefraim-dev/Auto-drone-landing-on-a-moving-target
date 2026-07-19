@@ -42,6 +42,88 @@ def _train_agent2(mode: str) -> None:
     if mode == "AGENT_1P2":
         from agent1p2_env import Agent1P2Env
 
+        # A faster velocity EMA reduces lag when the moving target accelerates
+        # or changes pace. This modifies only the deterministic feed-forward
+        # path and keeps the PPO observation/action shapes unchanged.
+        cfg.target_velocity_ema_alpha = float(
+            flow.PARALLEL_TARGET_VELOCITY_EMA_ALPHA
+        )
+        cfg.horizontal_velocity_ema_alpha = float(
+            flow.PARALLEL_BOTTOM_RELATIVE_VELOCITY_EMA_ALPHA
+        )
+        cfg.predictive_bottom_extra_latency_s = float(
+            flow.PARALLEL_BOTTOM_PREDICTION_EXTRA_LATENCY_S
+        )
+        cfg.predictive_bottom_horizon_min_s = float(
+            flow.PARALLEL_BOTTOM_PREDICTION_HORIZON_MIN_S
+        )
+        cfg.predictive_bottom_horizon_max_s = float(
+            flow.PARALLEL_BOTTOM_PREDICTION_HORIZON_MAX_S
+        )
+        cfg.predictive_bottom_normal_correction_max_mps = float(
+            flow.PARALLEL_BOTTOM_NORMAL_CORRECTION_MAX_MPS
+        )
+        cfg.predictive_bottom_catchup_correction_max_mps = float(
+            flow.PARALLEL_BOTTOM_CATCHUP_CORRECTION_MAX_MPS
+        )
+        cfg.predictive_bottom_catchup_enter_center_error = float(
+            flow.PARALLEL_BOTTOM_CATCHUP_ENTER_CENTER_ERROR
+        )
+        cfg.predictive_bottom_catchup_exit_center_error = float(
+            flow.PARALLEL_BOTTOM_CATCHUP_EXIT_CENTER_ERROR
+        )
+        cfg.catchup_descent_enabled = bool(
+            flow.PARALLEL_CATCHUP_DESCENT_ENABLED
+        )
+        cfg.catchup_descent_max_vz_mps = float(
+            flow.PARALLEL_CATCHUP_DESCENT_MAX_VZ_MPS
+        )
+        cfg.catchup_descent_touchdown_max_vz_mps = float(
+            flow.PARALLEL_CATCHUP_DESCENT_TOUCHDOWN_MAX_VZ_MPS
+        )
+        cfg.catchup_descent_touchdown_height_m = float(
+            flow.PARALLEL_CATCHUP_DESCENT_TOUCHDOWN_HEIGHT_M
+        )
+        cfg.catchup_descent_max_predicted_center_error = float(
+            flow.PARALLEL_CATCHUP_DESCENT_MAX_PREDICTED_CENTER_ERROR
+        )
+        cfg.catchup_descent_max_image_speed_per_s = float(
+            flow.PARALLEL_CATCHUP_DESCENT_MAX_IMAGE_SPEED_PER_S
+        )
+        cfg.catchup_descent_max_outward_speed_per_s = float(
+            flow.PARALLEL_CATCHUP_DESCENT_MAX_OUTWARD_SPEED_PER_S
+        )
+        cfg.catchup_descent_max_metric_outward_speed_mps = float(
+            flow.PARALLEL_CATCHUP_DESCENT_MAX_METRIC_OUTWARD_SPEED_MPS
+        )
+        cfg.predictive_metric_kp_position_per_s = float(
+            flow.PARALLEL_BOTTOM_METRIC_KP
+        )
+        cfg.predictive_metric_kd_relative_velocity = float(
+            flow.PARALLEL_BOTTOM_METRIC_KD
+        )
+        cfg.bottom_camera_hfov_deg = float(
+            flow.PARALLEL_BOTTOM_CAMERA_HFOV_DEG
+        )
+        cfg.optical_flow_enabled = bool(
+            flow.PARALLEL_BOTTOM_OPTICAL_FLOW_ENABLED
+        )
+        cfg.visual_kalman_enabled = bool(
+            flow.PARALLEL_BOTTOM_VISUAL_KALMAN_ENABLED
+        )
+        cfg.reacquire_climb_enabled = bool(
+            flow.PARALLEL_REACQUIRE_CLIMB_ENABLED
+        )
+        cfg.reacquire_climb_after_s = float(
+            flow.PARALLEL_REACQUIRE_CLIMB_AFTER_S
+        )
+        cfg.reacquire_climb_speed_mps = float(
+            flow.PARALLEL_REACQUIRE_CLIMB_SPEED_MPS
+        )
+        cfg.reacquire_climb_target_height_m = float(
+            flow.PARALLEL_REACQUIRE_CLIMB_TARGET_HEIGHT_M
+        )
+
         env_raw = Agent1P2Env(
             agent1_model_path=str(flow.AGENT_1_MODEL_PATH),
             deterministic=bool(flow.AGENT_1_DETERMINISTIC),
@@ -54,6 +136,18 @@ def _train_agent2(mode: str) -> None:
             ),
             horizontal_total_speed_max_mps=float(
                 flow.PARALLEL_HORIZONTAL_TOTAL_SPEED_MAX_MPS
+            ),
+            agent1_min_xy_weight_near_landing=float(
+                flow.PARALLEL_AGENT1_MIN_XY_WEIGHT_NEAR_LANDING
+            ),
+            bottom_live_agent1_xy_weight=float(
+                flow.PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_LIVE
+            ),
+            bottom_pred_agent1_xy_weight=float(
+                flow.PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_PRED
+            ),
+            bottom_pd_correction_gain=float(
+                flow.PARALLEL_BOTTOM_PD_CORRECTION_GAIN
             ),
         )
     else:
@@ -101,11 +195,43 @@ def _train_agent2(mode: str) -> None:
     print("=" * 92)
     print(f"[FLOW] TRAINING_MODE    : {mode}")
     print("[FLOW] Agent 1 runtime  : always active, frozen, front+bottom fusion")
-    print("[FLOW] Agent 1 owns     : XY + Yaw + target-velocity matching")
+    print("[FLOW] Agent 1 owns     : XY search/reacquire + Yaw; Bottom owns landing XY")
     print("[FLOW] Agent 2 runtime  : always active landing controller")
     print("[FLOW] Agent 2 owns     : Z only (AirSim API NED-Z)")
     print("[FLOW] AirSim commands  : exactly one fused command per step")
     print("[FLOW] Lost bottom view : descent blocked; Agent 1 keeps chasing/searching")
+    print(
+        "[FLOW] Target velocity   : BOTTOM VISION + DRONE EGO VELOCITY ONLY | "
+        f"gain={float(flow.PARALLEL_TARGET_VELOCITY_FEEDFORWARD_GAIN):.2f} "
+        f"ema={float(flow.PARALLEL_TARGET_VELOCITY_EMA_ALPHA):.2f}"
+    )
+    print(
+        "[FLOW] XY mixer          : bottom LIVE predictive authority + target velocity; "
+        f"A1W_bottom={float(flow.PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_LIVE):.2f} "
+        f"A1W_pred={float(flow.PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_PRED):.2f} "
+        f"bottomGain={float(flow.PARALLEL_BOTTOM_PD_CORRECTION_GAIN):.2f}"
+    )
+    print(
+        "[FLOW] Bottom prediction : metric t+1 + bbox/optical-flow + Kalman velocity | "
+        f"horizon={float(flow.PARALLEL_BOTTOM_PREDICTION_HORIZON_MIN_S):.2f}-"
+        f"{float(flow.PARALLEL_BOTTOM_PREDICTION_HORIZON_MAX_S):.2f}s"
+    )
+    print(
+        "[FLOW] Catch-up mode     : predicted drift pauses Z; "
+        f"normalMax={float(flow.PARALLEL_BOTTOM_NORMAL_CORRECTION_MAX_MPS):.2f}m/s "
+        f"catchMax={float(flow.PARALLEL_BOTTOM_CATCHUP_CORRECTION_MAX_MPS):.2f}m/s"
+    )
+    print("[FLOW] Front camera      : search/reacquire fallback; never overrides Bottom LIVE XY")
+    print(
+        "[FLOW] Lost Bottom       : hold Z, then bounded CLIMB_REACQUIRE | "
+        f"after={float(flow.PARALLEL_REACQUIRE_CLIMB_AFTER_S):.2f}s "
+        f"vz=-{float(flow.PARALLEL_REACQUIRE_CLIMB_SPEED_MPS):.2f}m/s "
+        f"targetHeight={float(flow.PARALLEL_REACQUIRE_CLIMB_TARGET_HEIGHT_M):.2f}m"
+    )
+    print("[FLOW] Target actor XY API: DISABLED (Z-only target surface query remains)")
+    print("[FLOW] Landing lock      : 2-frame acquire; short PRED gaps pause Z without reset")
+    print("[FLOW] Appearance bank   : immutable identity + bounded adaptive landing views")
+    print("[FLOW] Touchdown gate   : bad LIVE centering cannot use appearance fallback")
     print("[FLOW] Recovery cycles  : removed")
     print("[FLOW] Reward           : landing-only, collision-gated")
     print("=" * 92)

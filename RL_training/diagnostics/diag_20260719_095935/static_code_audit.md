@@ -1,0 +1,51 @@
+# Static control-path audit
+
+These are observations only; Run_diag does not alter the source.
+
+- **safety_obstacle_token_gate** — `drone_env.py:3538` — `for token in ("obstacle", "horizontal", "lidar")`
+- **parallel_safety_zeroing** — `drone_env.py:3554` — `ff_vx = 0.0`
+- **parallel_safety_zeroing** — `drone_env.py:3556` — `bottom_vx = 0.0`
+- **bottom_live_xy_authority** — `agent1p2_env.py:101` — `bottom_live_agent1_xy_weight: float = 0.0,`
+- **bottom_live_xy_authority** — `agent1p2_env.py:146` — `self.bottom_live_agent1_xy_weight = float(`
+- **bottom_live_xy_authority** — `agent1p2_env.py:147` — `np.clip(bottom_live_agent1_xy_weight, 0.0, 1.0)`
+- **bottom_live_xy_authority** — `agent1p2_env.py:317` — `agent1_xy_weight = float(self.bottom_live_agent1_xy_weight)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:161` — `predictive_bottom_catchup_correction_max_mps: float = 3.20`
+- **predictive_catchup_gate** — `agent2_landing_env.py:163` — `predictive_bottom_catchup_enter_center_error: float = 0.24`
+- **predictive_catchup_gate** — `agent2_landing_env.py:164` — `predictive_bottom_catchup_exit_center_error: float = 0.13`
+- **predictive_catchup_gate** — `agent2_landing_env.py:165` — `predictive_bottom_catchup_enter_outward_speed_per_s: float = 0.10`
+- **predictive_catchup_gate** — `agent2_landing_env.py:166` — `predictive_bottom_catchup_exit_outward_speed_per_s: float = 0.03`
+- **predictive_catchup_gate** — `agent2_landing_env.py:167` — `predictive_bottom_catchup_exit_image_speed_per_s: float = 0.16`
+- **predictive_catchup_gate** — `agent2_landing_env.py:168` — `predictive_bottom_catchup_release_streak: int = 2`
+- **landing_lock_gate** — `agent2_landing_env.py:191` — `alignment_streak_required: int = 2`
+- **landing_lock_gate** — `agent2_landing_env.py:458` — `self._descent_alignment_latched = False`
+- **landing_lock_gate** — `agent2_landing_env.py:564` — `landing_lock = bool(self._descent_alignment_latched)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:703` — `>= float(self.cfg.predictive_bottom_catchup_enter_center_error)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:705` — `>= float(self.cfg.predictive_bottom_catchup_enter_outward_speed_per_s)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:709` — `<= float(self.cfg.predictive_bottom_catchup_exit_center_error)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:711` — `<= float(self.cfg.predictive_bottom_catchup_exit_outward_speed_per_s)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:713` — `<= float(self.cfg.predictive_bottom_catchup_exit_image_speed_per_s)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:725` — `1, int(self.cfg.predictive_bottom_catchup_release_streak)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:766` — `self.cfg.predictive_bottom_catchup_correction_max_mps`
+- **landing_lock_gate** — `agent2_landing_env.py:825` — `result["landing_lock"] = bool(self._descent_alignment_latched)`
+- **landing_lock_gate** — `agent2_landing_env.py:1365` — `self._descent_alignment_latched = False`
+- **relative_height_equation** — `agent2_landing_env.py:1651` — `relative_height = float(self._target_surface_z_ned - drone_z_ned)`
+- **predictive_catchup_gate** — `agent2_landing_env.py:2543` — `"predictive_bottom_catchup_active": bool(self._predictive_catchup_active),`
+- **landing_lock_gate** — `agent2_landing_env.py:2545` — `"descent_alignment_latched": bool(self._descent_alignment_latched),`
+- **landing_lock_gate** — `agent2_landing_env.py:2546` — `"landing_lock_active": bool(self._descent_alignment_latched),`
+- **landing_lock_gate** — `agent2_landing_env.py:2551` — `if self._descent_alignment_latched`
+- **landing_lock_gate** — `agent2_landing_env.py:2646` — `if live_match and not bool(self._descent_alignment_latched):`
+- **landing_lock_gate** — `agent2_landing_env.py:2649` — `f"{int(self.cfg.alignment_streak_required)})"`
+- **landing_lock_gate** — `agent2_landing_env.py:2651` — `elif live_match and bool(self._descent_alignment_latched):`
+- **landing_lock_gate** — `agent2_landing_env.py:2709` — `f"LOCK={int(bool(self._descent_alignment_latched))} "`
+- **landing_lock_gate** — `agent2_landing_env.py:3499` — `if bool(self._descent_alignment_latched):`
+- **landing_lock_gate** — `agent2_landing_env.py:3509` — `self._descent_alignment_latched = False`
+- **landing_lock_gate** — `agent2_landing_env.py:3525` — `if not bool(self._descent_alignment_latched):`
+- **predictive_catchup_gate** — `agent2_landing_env.py:3528` — `"HOLD_PREDICTIVE_CATCHUP",`
+- **landing_lock_gate** — `agent2_landing_env.py:3533` — `if bool(self._descent_alignment_latched):`
+- **landing_lock_gate** — `agent2_landing_env.py:3547` — `self._descent_alignment_latched = False`
+- **landing_lock_gate** — `agent2_landing_env.py:3583` — `required = max(1, int(self.cfg.alignment_streak_required))`
+- **landing_lock_gate** — `agent2_landing_env.py:3585` — `self._descent_alignment_latched = True`
+- **negative_vz_clipping** — `agent2_landing_env.py:3694` — `requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)`
+- **negative_vz_clipping** — `agent2_landing_env.py:3735` — `vz = max(0.0, float(vz))`
+- **landing_lock_gate** — `agent2_landing_env.py:3934` — `"descent_alignment_latched": bool(getattr(self, "_descent_alignment_latched", False)),`
+- **landing_lock_gate** — `agent2_landing_env.py:4016` — `f"lock={int(bool(getattr(self, '_descent_alignment_latched', False)))} "`

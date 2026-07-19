@@ -1,4 +1,5 @@
 import time
+import math
 import numpy as np
 import cv2
 import gymnasium as gym
@@ -436,11 +437,52 @@ class DroneEnv(gym.Env):
         self._parallel_external_vz_mps = 0.0
         self._parallel_feedforward_vx_mps = 0.0
         self._parallel_feedforward_vy_mps = 0.0
+        self._parallel_bottom_correction_vx_mps = 0.0
+        self._parallel_bottom_correction_vy_mps = 0.0
+        self._parallel_agent1_xy_weight = 1.0
         self._parallel_horizontal_speed_limit_mps = 6.0
+        self._parallel_bottom_guidance_active = False
+        self._parallel_bottom_measurement_live = False
+        self._parallel_reacquire_climb_active = False
         self._last_parallel_feedforward_vx_mps = 0.0
         self._last_parallel_feedforward_vy_mps = 0.0
+        self._last_parallel_bottom_correction_vx_mps = 0.0
+        self._last_parallel_bottom_correction_vy_mps = 0.0
+        self._last_parallel_agent1_xy_weight = 1.0
+        self._parallel_fused_prev_vx_mps = 0.0
+        self._parallel_fused_prev_vy_mps = 0.0
+        self._parallel_fused_slew_limited = False
         self._last_parallel_z_override_mps = 0.0
         self._last_parallel_feedforward_blocked_by_safety = False
+        self._last_parallel_z_blocked_by_safety = False
+        self._last_parallel_z_limited_by_safety = False
+
+        # Safe post-pulse bridge state. The high-level PPO command remains the
+        # original short pulse. Only the velocity actually achieved by AirSim is
+        # held while the next visual observation is computed.
+        self._command_bridge_last_dispatch_monotonic = None
+        self._command_bridge_period_ema_s = float(
+            getattr(self.cfg, "command_bridge_period_initial_s", 0.55)
+        )
+        self._command_bridge_prev_vx_mps = 0.0
+        self._command_bridge_prev_vy_mps = 0.0
+        self._command_bridge_last_duration_s = 0.0
+        self._command_bridge_last_measured_vx_mps = 0.0
+        self._command_bridge_last_measured_vy_mps = 0.0
+        self._command_bridge_last_vx_mps = 0.0
+        self._command_bridge_last_vy_mps = 0.0
+        self._command_bridge_last_vz_mps = 0.0
+        self._command_bridge_last_attitude_scale = 1.0
+        self._command_bridge_last_reason = "INIT"
+        self._command_bridge_active = False
+        self._command_bridge_future = None
+
+        # Agent 2 may publish the already-computed bottom perception snapshot in
+        # parallel mode. Agent 1 consumes it instead of running a second bottom
+        # YOLO+ResNet pipeline on a later frame.
+        self._parallel_bottom_perception_snapshot = None
+        self._parallel_bottom_snapshot_monotonic = 0.0
+        self._agent1_bottom_perception_shared = False
 
     def set_parallel_dual_agent_mode(self, enabled: bool) -> None:
         """Enable continuous Agent-1 tracking after landing authority begins."""
@@ -449,26 +491,533 @@ class DroneEnv(gym.Env):
             self._parallel_external_vz_mps = 0.0
             self._parallel_feedforward_vx_mps = 0.0
             self._parallel_feedforward_vy_mps = 0.0
+            self._parallel_bottom_correction_vx_mps = 0.0
+            self._parallel_bottom_correction_vy_mps = 0.0
+            self._parallel_agent1_xy_weight = 1.0
+            self._parallel_bottom_guidance_active = False
+            self._parallel_bottom_measurement_live = False
+            self._parallel_reacquire_climb_active = False
+            self._parallel_fused_prev_vx_mps = 0.0
+            self._parallel_fused_prev_vy_mps = 0.0
+            self._parallel_fused_slew_limited = False
+            self._last_parallel_z_blocked_by_safety = False
+            self._last_parallel_z_limited_by_safety = False
+
+    def set_parallel_bottom_perception_snapshot(self, snapshot: dict | None) -> None:
+        """Receive Agent-2's current bottom perception for the next Agent-1 step."""
+        if not snapshot:
+            self._parallel_bottom_perception_snapshot = None
+            self._parallel_bottom_snapshot_monotonic = 0.0
+            return
+        self._parallel_bottom_perception_snapshot = dict(snapshot)
+        self._parallel_bottom_snapshot_monotonic = float(time.monotonic())
+
+    def _reset_command_bridge_state(self) -> None:
+        self._command_bridge_last_dispatch_monotonic = None
+        self._command_bridge_period_ema_s = float(
+            getattr(self.cfg, "command_bridge_period_initial_s", 0.55)
+        )
+        self._command_bridge_prev_vx_mps = 0.0
+        self._command_bridge_prev_vy_mps = 0.0
+        self._command_bridge_last_duration_s = 0.0
+        self._command_bridge_last_measured_vx_mps = 0.0
+        self._command_bridge_last_measured_vy_mps = 0.0
+        self._command_bridge_last_vx_mps = 0.0
+        self._command_bridge_last_vy_mps = 0.0
+        self._command_bridge_last_vz_mps = 0.0
+        self._command_bridge_last_attitude_scale = 1.0
+        self._command_bridge_last_reason = "RESET"
+        self._command_bridge_active = False
+        self._command_bridge_future = None
+
+    def _measure_command_bridge_period(self) -> float:
+        now = float(time.monotonic())
+        previous = getattr(self, "_command_bridge_last_dispatch_monotonic", None)
+        self._command_bridge_last_dispatch_monotonic = now
+        if previous is None:
+            measured = float(
+                getattr(self.cfg, "command_bridge_period_initial_s", 0.55)
+            )
+        else:
+            measured = float(np.clip(now - float(previous), 0.10, 3.0))
+        alpha = float(
+            np.clip(
+                getattr(self.cfg, "command_bridge_period_ema_alpha", 0.25),
+                0.0,
+                1.0,
+            )
+        )
+        old = float(getattr(self, "_command_bridge_period_ema_s", measured))
+        self._command_bridge_period_ema_s = float(
+            alpha * measured + (1.0 - alpha) * old
+        )
+        return self._command_bridge_period_ema_s
+
+    @staticmethod
+    def _clip_xy_vector(vx: float, vy: float, limit: float) -> tuple[float, float]:
+        limit = max(0.0, float(limit))
+        speed = float(math.hypot(vx, vy))
+        if speed <= max(1.0e-9, limit):
+            return float(vx), float(vy)
+        scale = float(limit / speed)
+        return float(vx * scale), float(vy * scale)
+
+    def _read_command_bridge_state(self) -> dict:
+        """Read achieved body velocity and attitude immediately after the pulse."""
+        result = {
+            "valid": False,
+            "body_vx_mps": 0.0,
+            "body_vy_mps": 0.0,
+            "pitch_deg": 0.0,
+            "roll_deg": 0.0,
+        }
+        try:
+            state = self.client.getMultirotorState(
+                vehicle_name=self.cfg.vehicle_name
+            )
+            k = state.kinematics_estimated
+            pitch, roll, yaw = airsim.to_eularian_angles(k.orientation)
+            world_vx = float(k.linear_velocity.x_val)
+            world_vy = float(k.linear_velocity.y_val)
+            c = float(math.cos(float(yaw)))
+            s = float(math.sin(float(yaw)))
+            # world = R(yaw) * body, therefore body = R(-yaw) * world.
+            body_vx = c * world_vx + s * world_vy
+            body_vy = -s * world_vx + c * world_vy
+            result.update(
+                {
+                    "valid": bool(
+                        np.isfinite(body_vx)
+                        and np.isfinite(body_vy)
+                        and np.isfinite(float(pitch))
+                        and np.isfinite(float(roll))
+                    ),
+                    "body_vx_mps": float(body_vx),
+                    "body_vy_mps": float(body_vy),
+                    "pitch_deg": float(abs(np.degrees(float(pitch)))),
+                    "roll_deg": float(abs(np.degrees(float(roll)))),
+                }
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    def _command_bridge_speed_limit(self, tracking_mode: str) -> float:
+        stage = str(getattr(self, "_speed_stage", "CHASE_FAST") or "CHASE_FAST")
+        if stage == "BOTTOM_LANDING_READY":
+            return float(
+                getattr(self.cfg, "command_bridge_landing_max_speed_mps", 0.38)
+            )
+        if stage == "BOTTOM_VELOCITY_MATCH":
+            return float(
+                getattr(self.cfg, "command_bridge_bottom_max_speed_mps", 0.70)
+            )
+        mode = str(tracking_mode or "LOST").upper()
+        if mode == "MATCH":
+            return float(
+                getattr(self.cfg, "command_bridge_match_max_speed_mps", 1.20)
+            )
+        if mode == "PRED":
+            return float(
+                getattr(self.cfg, "command_bridge_pred_max_speed_mps", 0.85)
+            )
+        return float(
+            getattr(self.cfg, "command_bridge_lost_max_speed_mps", 0.45)
+        )
+
+    def _cancel_command_bridge(
+        self, reason: str = "CANCEL", *, send_zero: bool = True
+    ) -> None:
+        """Clear bridge state; optionally send an explicit safety stop."""
+        self._command_bridge_prev_vx_mps = 0.0
+        self._command_bridge_prev_vy_mps = 0.0
+        self._command_bridge_last_vx_mps = 0.0
+        self._command_bridge_last_vy_mps = 0.0
+        self._command_bridge_last_vz_mps = 0.0
+        self._command_bridge_active = False
+        self._command_bridge_last_reason = str(reason)
+        if not send_zero:
+            self._command_bridge_future = None
+            return
+        try:
+            self._command_bridge_future = self.client.moveByVelocityBodyFrameAsync(
+                vx=0.0,
+                vy=0.0,
+                vz=0.0,
+                duration=max(0.10, float(getattr(self.cfg, "cmd_duration_s", 0.10))),
+                yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                vehicle_name=self.cfg.vehicle_name,
+            )
+        except Exception:
+            self._command_bridge_future = None
+
+    def _parallel_bridge_vz_mps(self) -> float:
+        """Return a bounded Agent-2 descent refresh for the post-pulse bridge."""
+        if not bool(getattr(self, "_parallel_dual_agent_mode", False)):
+            return 0.0
+        if not bool(
+            getattr(self.cfg, "command_bridge_parallel_vertical_enabled", True)
+        ):
+            return 0.0
+        requested = float(
+            getattr(
+                self,
+                "_last_parallel_z_override_mps",
+                getattr(self, "_parallel_external_vz_mps", 0.0),
+            )
+        )
+        # Read the actual safety-filtered Z sent in the high-level pulse, not the
+        # raw Agent-2 request. This prevents the bridge from reintroducing a
+        # descent that LiDAR/altitude safety just blocked or limited.
+        # Negative NED-Z is the deterministic reacquisition climb. It remains a
+        # short explicit pulse and is never persisted by the bridge.
+        if requested <= float(
+            getattr(self.cfg, "command_bridge_parallel_vertical_min_mps", 1.0e-4)
+        ):
+            return 0.0
+        maximum = max(
+            0.0,
+            float(
+                getattr(self.cfg, "command_bridge_parallel_vertical_max_mps", 0.35)
+            ),
+        )
+        return float(np.clip(requested, 0.0, maximum))
+
+    def _issue_command_bridge(
+        self,
+        *,
+        requested_vx_mps: float,
+        requested_vy_mps: float,
+        tracking_mode: str,
+        safety_info: dict,
+        control_period_s: float,
+    ) -> None:
+        """Bridge achieved XY and a bounded authorized landing-Z while vision runs.
+
+        Raw 3-6 m/s PPO XY commands are never persisted. XY comes only from the
+        measured velocity achieved after the original 0.10 s pulse. In parallel
+        landing mode, Agent 2's already-gated positive NED-Z may also be refreshed
+        under a separate low cap; this prevents the XY bridge from cancelling
+        descent immediately after every pulse.
+        """
+        if not bool(getattr(self.cfg, "command_bridge_enabled", True)):
+            self._command_bridge_active = False
+            self._command_bridge_last_reason = "DISABLED"
+            return
+
+        reasons = [
+            str(x).lower() for x in (safety_info.get("safety_reasons", []) or [])
+        ]
+        hard_safety = bool(
+            any(
+                token in reason
+                for reason in reasons
+                for token in (
+                    "collision",
+                    "emergency",
+                    "takeoff_failed",
+                    "altitude_emergency",
+                )
+            )
+        )
+        if hard_safety:
+            self._cancel_command_bridge("HARD_SAFETY")
+            return
+
+        state = self._read_command_bridge_state()
+        if not bool(state.get("valid", False)):
+            self._command_bridge_active = False
+            self._command_bridge_last_reason = "STATE_UNAVAILABLE"
+            self._command_bridge_last_vz_mps = 0.0
+            return
+
+        measured_vx = float(state["body_vx_mps"])
+        measured_vy = float(state["body_vy_mps"])
+        self._command_bridge_last_measured_vx_mps = measured_vx
+        self._command_bridge_last_measured_vy_mps = measured_vy
+
+        bridge_vz = self._parallel_bridge_vz_mps()
+        vertical_active = bool(bridge_vz > 0.0)
+        requested_norm = float(math.hypot(requested_vx_mps, requested_vy_mps))
+        measured_norm = float(math.hypot(measured_vx, measured_vy))
+        min_speed = float(
+            getattr(self.cfg, "command_bridge_min_speed_mps", 0.03)
+        )
+
+        xy_active = bool(requested_norm > 1.0e-4 and measured_norm >= min_speed)
+        if xy_active:
+            # Never hold a rebound/braking velocity opposite to the policy pulse.
+            dot = float(
+                measured_vx * float(requested_vx_mps)
+                + measured_vy * float(requested_vy_mps)
+            )
+            xy_active = bool(dot > 0.0)
+
+        hold_vx = 0.0
+        hold_vy = 0.0
+        if xy_active:
+            speed_limit = max(0.05, self._command_bridge_speed_limit(tracking_mode))
+            hold_vx, hold_vy = self._clip_xy_vector(
+                measured_vx, measured_vy, speed_limit
+            )
+            previous_vx = float(getattr(self, "_command_bridge_prev_vx_mps", 0.0))
+            previous_vy = float(getattr(self, "_command_bridge_prev_vy_mps", 0.0))
+            alpha = float(
+                np.clip(
+                    getattr(self.cfg, "command_bridge_velocity_ema_alpha", 0.65),
+                    0.0,
+                    1.0,
+                )
+            )
+            if previous_vx * hold_vx + previous_vy * hold_vy < 0.0:
+                alpha = 1.0
+            hold_vx = float(alpha * hold_vx + (1.0 - alpha) * previous_vx)
+            hold_vy = float(alpha * hold_vy + (1.0 - alpha) * previous_vy)
+            hold_vx, hold_vy = self._clip_xy_vector(
+                hold_vx, hold_vy, speed_limit
+            )
+
+        angle = max(abs(float(state["pitch_deg"])), abs(float(state["roll_deg"])))
+        soft = float(
+            getattr(self.cfg, "command_bridge_attitude_soft_limit_deg", 10.0)
+        )
+        hard = max(
+            soft + 1.0,
+            float(
+                getattr(self.cfg, "command_bridge_attitude_hard_limit_deg", 16.0)
+            ),
+        )
+        if angle <= soft:
+            attitude_scale = 1.0
+        elif angle >= hard:
+            attitude_scale = 0.0
+        else:
+            attitude_scale = float((hard - angle) / (hard - soft))
+        hold_vx *= attitude_scale
+        hold_vy *= attitude_scale
+        bridge_vz *= attitude_scale
+        self._command_bridge_last_attitude_scale = attitude_scale
+
+        xy_active = bool(math.hypot(hold_vx, hold_vy) >= min_speed)
+        vertical_active = bool(bridge_vz > 0.0)
+        if not xy_active and not vertical_active:
+            reason = (
+                "ATTITUDE_GUARD"
+                if attitude_scale <= 0.0
+                else "NO_ACHIEVED_XY_OR_LANDING_Z"
+            )
+            self._cancel_command_bridge(reason, send_zero=False)
+            return
+
+        duration = float(
+            np.clip(
+                float(control_period_s)
+                * float(getattr(self.cfg, "command_bridge_duration_scale", 1.15)),
+                float(getattr(self.cfg, "command_bridge_min_duration_s", 0.25)),
+                float(getattr(self.cfg, "command_bridge_max_duration_s", 0.90)),
+            )
+        )
+        bridge_yaw = 0.0 if bool(
+            getattr(self.cfg, "command_bridge_zero_yaw_rate", True)
+        ) else float(self._last_commanded_yaw_rate_dps)
+
+        self._command_bridge_future = self.client.moveByVelocityBodyFrameAsync(
+            vx=float(hold_vx),
+            vy=float(hold_vy),
+            vz=float(bridge_vz),
+            duration=duration,
+            yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=float(bridge_yaw)),
+            vehicle_name=self.cfg.vehicle_name,
+        )
+        self._command_bridge_prev_vx_mps = float(hold_vx)
+        self._command_bridge_prev_vy_mps = float(hold_vy)
+        self._command_bridge_last_vx_mps = float(hold_vx)
+        self._command_bridge_last_vy_mps = float(hold_vy)
+        self._command_bridge_last_vz_mps = float(bridge_vz)
+        self._command_bridge_last_duration_s = float(duration)
+        if xy_active and vertical_active:
+            self._command_bridge_last_reason = "ACHIEVED_XY_PLUS_LANDING_Z_HOLD"
+        elif vertical_active:
+            self._command_bridge_last_reason = "LANDING_Z_HOLD"
+        else:
+            self._command_bridge_last_reason = "ACHIEVED_VELOCITY_HOLD"
+        self._command_bridge_active = True
+
+    def _apply_parallel_vertical_safety(
+        self,
+        requested_vz_mps: float,
+        safety_reasons_lower: list[str],
+        *,
+        hard_safety: bool,
+    ) -> tuple[float, bool, bool]:
+        """Apply physical safety to Agent-2's exclusive NED-Z command.
+
+        Agent 2 owns mission-level Z, but it may not bypass the single physical
+        safety boundary. Hard safety or an explicit down-LiDAR block cancels
+        descent. A landing proximity limit keeps descent positive but caps it.
+        Deterministic negative-Z reacquisition climb is preserved unless hard
+        safety is active.
+        """
+        requested = float(requested_vz_mps)
+        blocked = bool(
+            hard_safety
+            or (
+                requested > 0.0
+                and any("block_descent" in reason for reason in safety_reasons_lower)
+            )
+        )
+        limited = bool(
+            requested > 0.0
+            and any("limit_descent" in reason for reason in safety_reasons_lower)
+        )
+        if blocked:
+            return 0.0, True, False
+        if limited:
+            capped = min(
+                requested,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            self.cfg,
+                            "parallel_vertical_near_ground_max_mps",
+                            0.12,
+                        )
+                    ),
+                ),
+            )
+            return float(capped), False, bool(capped < requested)
+        return requested, False, False
 
     def set_parallel_control_overrides(
         self,
         vz_mps: float,
         feedforward_vx_mps: float = 0.0,
         feedforward_vy_mps: float = 0.0,
+        bottom_correction_vx_mps: float = 0.0,
+        bottom_correction_vy_mps: float = 0.0,
+        agent1_xy_weight: float = 1.0,
         horizontal_speed_limit_mps: float = 6.0,
+        bottom_guidance_active: bool = False,
+        bottom_measurement_live: bool = False,
+        reacquire_climb_active: bool = False,
     ) -> None:
-        """Set the command components owned by Agent 2/shared target motion.
+        """Set the components used by the single parallel command mixer.
 
-        Values are body-frame m/s. Agent 1 still computes its normal tracking
-        correction and yaw command; these terms are fused immediately before
-        the one AirSim command is transmitted.
+        Agent 1 remains active on every step and always owns yaw/search. During
+        Bottom LIVE, its front/PRED XY may be muted so bottom-camera predictive
+        tracking becomes authoritative. Target-velocity feed-forward is added
+        independently, and Agent 2 keeps exclusive ownership of NED-Z.
         """
-        self._parallel_external_vz_mps = max(0.0, float(vz_mps))
+        self._parallel_external_vz_mps = float(vz_mps)
         self._parallel_feedforward_vx_mps = float(feedforward_vx_mps)
         self._parallel_feedforward_vy_mps = float(feedforward_vy_mps)
+        self._parallel_bottom_correction_vx_mps = float(
+            bottom_correction_vx_mps
+        )
+        self._parallel_bottom_correction_vy_mps = float(
+            bottom_correction_vy_mps
+        )
+        self._parallel_agent1_xy_weight = float(
+            np.clip(agent1_xy_weight, 0.0, 1.0)
+        )
         self._parallel_horizontal_speed_limit_mps = max(
             0.1, float(horizontal_speed_limit_mps)
         )
+        self._parallel_bottom_guidance_active = bool(bottom_guidance_active)
+        self._parallel_bottom_measurement_live = bool(bottom_measurement_live)
+        self._parallel_reacquire_climb_active = bool(reacquire_climb_active)
+
+    @staticmethod
+    def _fuse_parallel_xy(
+        agent1_vx: float,
+        agent1_vy: float,
+        agent1_weight: float,
+        feedforward_vx: float,
+        feedforward_vy: float,
+        bottom_correction_vx: float,
+        bottom_correction_vy: float,
+        speed_limit_mps: float,
+    ) -> tuple[float, float]:
+        """Fuse search/chase, target velocity, and bottom predictive correction."""
+        weight = float(np.clip(agent1_weight, 0.0, 1.0))
+        vx = (
+            weight * float(agent1_vx)
+            + float(feedforward_vx)
+            + float(bottom_correction_vx)
+        )
+        vy = (
+            weight * float(agent1_vy)
+            + float(feedforward_vy)
+            + float(bottom_correction_vy)
+        )
+        limit = max(0.1, float(speed_limit_mps))
+        speed = float(np.hypot(vx, vy))
+        if speed > limit:
+            scale = limit / max(speed, 1.0e-6)
+            vx *= scale
+            vy *= scale
+        return float(vx), float(vy)
+
+    def _stabilize_parallel_xy_command(
+        self,
+        vx: float,
+        vy: float,
+        *,
+        bottom_live: bool,
+        bottom_guidance_active: bool,
+    ) -> tuple[float, float]:
+        """Bound bottom-guided speed and prevent one-frame command reversals.
+
+        The bottom controller is fed by visual measurements separated by a slow
+        inference cycle. Even after bbox filtering, a single estimate must not
+        change a body-frame velocity command by several metres per second. When
+        bottom guidance is active, apply a phase-specific speed cap and a vector
+        slew limit. Search/reacquire without bottom guidance remains owned by the
+        frozen Agent-1 policy and is left unchanged.
+        """
+        if not bool(bottom_guidance_active):
+            self._parallel_fused_prev_vx_mps = float(vx)
+            self._parallel_fused_prev_vy_mps = float(vy)
+            self._parallel_fused_slew_limited = False
+            return float(vx), float(vy)
+
+        if bool(bottom_live):
+            speed_cap = float(
+                getattr(self.cfg, "parallel_bottom_live_speed_cap_mps", 1.60)
+            )
+        else:
+            speed_cap = float(
+                getattr(self.cfg, "parallel_bottom_pred_speed_cap_mps", 1.10)
+            )
+        vx, vy = self._clip_xy_vector(vx, vy, max(0.10, speed_cap))
+
+        if not bool(getattr(self.cfg, "parallel_xy_slew_enabled", True)):
+            self._parallel_fused_prev_vx_mps = float(vx)
+            self._parallel_fused_prev_vy_mps = float(vy)
+            self._parallel_fused_slew_limited = False
+            return float(vx), float(vy)
+
+        previous_vx = float(getattr(self, "_parallel_fused_prev_vx_mps", 0.0))
+        previous_vy = float(getattr(self, "_parallel_fused_prev_vy_mps", 0.0))
+        delta_x = float(vx - previous_vx)
+        delta_y = float(vy - previous_vy)
+        delta = float(math.hypot(delta_x, delta_y))
+        max_delta = max(
+            0.05,
+            float(getattr(self.cfg, "parallel_xy_max_delta_per_step_mps", 0.60)),
+        )
+        limited = bool(delta > max_delta)
+        if limited:
+            scale = max_delta / max(delta, 1.0e-6)
+            vx = previous_vx + delta_x * scale
+            vy = previous_vy + delta_y * scale
+
+        vx, vy = self._clip_xy_vector(vx, vy, max(0.10, speed_cap))
+        self._parallel_fused_prev_vx_mps = float(vx)
+        self._parallel_fused_prev_vy_mps = float(vy)
+        self._parallel_fused_slew_limited = limited
+        return float(vx), float(vy)
 
     @staticmethod
     def _deg(rad: float) -> float:
@@ -1000,7 +1549,89 @@ class DroneEnv(gym.Env):
         )
         return result
 
-    def _update_soft_handoff_state(self, current_distance_m, front_tracking_mode: str, obs_dict: dict, obstacle_dict: dict | None = None):
+    def _apply_parallel_bottom_perception_snapshot(self) -> bool:
+        """Apply Agent-2's already-computed bottom result without a second inference."""
+        self._agent1_bottom_perception_shared = False
+        if not (
+            bool(getattr(self, "_parallel_dual_agent_mode", False))
+            and bool(getattr(self.cfg, "parallel_share_agent2_bottom_perception", True))
+        ):
+            return False
+
+        snapshot = getattr(self, "_parallel_bottom_perception_snapshot", None)
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False
+
+        received_at = float(
+            getattr(self, "_parallel_bottom_snapshot_monotonic", 0.0) or 0.0
+        )
+        max_age = max(0.05, float(
+            getattr(self.cfg, "parallel_bottom_snapshot_stale_after_s", 4.00)
+        ))
+        now = float(time.monotonic())
+        source_at = float(snapshot.get("source_monotonic", received_at) or received_at)
+        if (
+            received_at <= 0.0
+            or now - received_at > max_age
+            or source_at <= 0.0
+            or now - source_at > max_age
+        ):
+            return False
+
+        bbox = snapshot.get("bbox_xyxy", None)
+        if bbox is not None:
+            try:
+                bbox = np.asarray(bbox, dtype=np.float32).reshape(-1)[:4].copy()
+                if bbox.size < 4 or not np.all(np.isfinite(bbox)):
+                    bbox = None
+            except Exception:
+                bbox = None
+
+        shared_frame = snapshot.get("frame_bgr", None)
+        if isinstance(shared_frame, np.ndarray) and shared_frame.ndim == 3:
+            self._cached_downward_frame = shared_frame.copy()
+
+        live_match = bool(snapshot.get("match", False))
+        mode = str(snapshot.get("mode", "MATCH" if live_match else "PRED") or "LOST").upper()
+        self._bottom_match = live_match
+        self._bottom_bbox_xyxy = bbox
+        self._bottom_stable_bbox_xyxy = bbox
+        self._bottom_similarity = float(snapshot.get("similarity", 0.0) or 0.0)
+        self._bottom_err_x = float(snapshot.get("err_x", 0.0) or 0.0)
+        self._bottom_err_y = float(snapshot.get("err_y", 0.0) or 0.0)
+        self._bottom_bbox_area_norm = float(snapshot.get("bbox_area_norm", 0.0) or 0.0)
+        self._bottom_bbox_rel_err = float(snapshot.get("bbox_rel_err", 999.0) or 999.0)
+        self._bottom_bbox_rel_err_x = float(snapshot.get("bbox_rel_err_x", self._bottom_bbox_rel_err) or self._bottom_bbox_rel_err)
+        self._bottom_bbox_rel_err_y = float(snapshot.get("bbox_rel_err_y", self._bottom_bbox_rel_err) or self._bottom_bbox_rel_err)
+        self._bottom_full_tracker_mode = mode
+        self._bottom_full_tracker_raw_mode = str(snapshot.get("raw_mode", "AGENT2_SHARED") or "AGENT2_SHARED")
+        self._bottom_full_tracker_confidence = float(snapshot.get("tracker_confidence", self._bottom_similarity) or 0.0)
+        self._bottom_full_tracker_similarity = self._bottom_similarity
+        self._bottom_candidate_count = int(snapshot.get("candidate_count", 0) or 0)
+        self._bottom_candidate_scan_score = self._bottom_similarity
+        self._last_bottom_scan_step = int(self.step_in_episode)
+
+        if live_match:
+            snapshot_streak = max(1, int(snapshot.get("live_match_streak", 1) or 1))
+            self._bottom_match_streak = max(
+                int(getattr(self, "_bottom_match_streak", 0)) + 1,
+                snapshot_streak,
+            )
+            self._last_bottom_match_step = int(self.step_in_episode)
+        elif mode == "LOST":
+            self._bottom_match_streak = 0
+
+        self._agent1_bottom_perception_shared = True
+        return True
+
+    def _update_soft_handoff_state(
+        self,
+        current_distance_m,
+        front_tracking_mode: str,
+        obs_dict: dict,
+        obstacle_dict: dict | None = None,
+        altitude_m: float | None = None,
+    ):
         """
         Update front/bottom perception weights for soft handoff.
 
@@ -1037,35 +1668,56 @@ class DroneEnv(gym.Env):
             self._handoff_visual_score >= float(getattr(self.cfg, "handoff_visual_scan_score_threshold", 2.5))
         )
 
-        self._handoff_candidate_gate = bool(
-            dist <= scan_distance
-            or bool(self._handoff_visual_lidar_trigger)
-            or bool(self._handoff_visual_scan_trigger)
-        )
+        # Geometric downward-FOV gate. A front-camera bbox can look large while
+        # the car is still physically ahead of the downward camera. Do not run a
+        # second YOLO+ResNet pipeline every step in that geometry.
+        geometric_limit = scan_distance
+        if bool(getattr(self.cfg, "bottom_geometric_scan_enabled", True)):
+            try:
+                altitude = float(altitude_m)
+            except Exception:
+                altitude = float("nan")
+            if np.isfinite(altitude) and altitude > 0.05:
+                half_fov_rad = math.radians(
+                    float(getattr(self.cfg, "bottom_camera_hfov_deg", 90.0))
+                ) * 0.5
+                fov_radius = altitude * math.tan(half_fov_rad)
+                geometric_limit = min(
+                    scan_distance,
+                    fov_radius
+                    + float(getattr(self.cfg, "bottom_geometric_target_margin_m", 2.5)),
+                )
 
-        # Important separation:
-        #   - candidate_gate opens bottom scanning in the old handoff path.
-        #   - dual_camera_fusion_enabled makes the bottom tracker run in parallel
-        #     even before a hard handoff gate is open.
-        fusion_enabled = bool(getattr(self.cfg, "dual_camera_fusion_enabled", True))
-        full_bottom_enabled = bool(getattr(self.cfg, "dual_full_trackers_enabled", True))
-        fusion_update_every = max(1, int(getattr(self.cfg, "dual_camera_fusion_scan_every_n_steps", update_every)))
-        bottom_full_update_every = max(1, int(getattr(self.cfg, "bottom_full_tracker_update_every_n_steps", fusion_update_every)))
+        if np.isfinite(dist):
+            self._handoff_candidate_gate = bool(
+                dist <= geometric_limit
+                or bool(self._handoff_visual_lidar_trigger)
+            )
+        else:
+            self._handoff_candidate_gate = bool(
+                self._handoff_visual_lidar_trigger
+                or self._handoff_visual_scan_trigger
+            )
 
-        should_scan = bool(
-            (
-                self._handoff_candidate_gate
-                and self.step_in_episode - int(getattr(self, "_last_bottom_scan_step", -999999)) >= update_every
-            )
-            or (
-                fusion_enabled
-                and self.step_in_episode - int(getattr(self, "_last_bottom_scan_step", -999999)) >= fusion_update_every
-            )
-            or (
-                full_bottom_enabled
-                and self.step_in_episode - int(getattr(self, "_last_bottom_scan_step", -999999)) >= bottom_full_update_every
-            )
+        shared_bottom = self._apply_parallel_bottom_perception_snapshot()
+        steps_since_scan = int(self.step_in_episode) - int(
+            getattr(self, "_last_bottom_scan_step", -999999)
         )
+        recent_bottom_evidence = bool(
+            getattr(self, "_bottom_match", False)
+            or int(self.step_in_episode)
+            - int(getattr(self, "_last_bottom_match_step", -999999))
+            <= max(2, int(getattr(self.cfg, "bottom_scan_hold_steps", 20)))
+            or str(getattr(self, "_active_camera", "front")).lower() == "bottom"
+        )
+        if recent_bottom_evidence:
+            scan_interval = max(1, int(getattr(self.cfg, "bottom_live_update_every_n_steps", 1)))
+        elif self._handoff_candidate_gate:
+            scan_interval = max(1, int(getattr(self.cfg, "bottom_near_probe_every_n_steps", 3)))
+        else:
+            scan_interval = max(1, int(getattr(self.cfg, "bottom_far_probe_every_n_steps", 12)))
+
+        should_scan = bool((not shared_bottom) and steps_since_scan >= scan_interval)
 
         if (not self._handoff_candidate_gate) and (not bool(getattr(self.cfg, "dual_camera_fusion_enabled", True))):
             # Do not let a stale or accidental bottom detection promote a handoff
@@ -2650,6 +3302,10 @@ class DroneEnv(gym.Env):
         self._cached_downward_frame = None
         self._cached_downward_frame_step = -1
         self._airborne_reset_completed = False
+        self._parallel_bottom_perception_snapshot = None
+        self._parallel_bottom_snapshot_monotonic = 0.0
+        self._agent1_bottom_perception_shared = False
+        self._reset_command_bridge_state()
 
         self.tracker_manager = self._create_tracker_manager()
         self._tracking_result = None
@@ -3404,20 +4060,39 @@ class DroneEnv(gym.Env):
         # While the previous observation was not a clean MATCH, give yaw more
         # authority and reduce forward motion. This gives the policy a real chance
         # to spin/search quickly before focus_fail_sec ends.
-        recovery_mode_active = (
-            str(getattr(self, "_prev_tracking_mode", "LOST")) != "MATCH"
-            or not bool(getattr(self, "_prev_had_target", False))
-        )
+        previous_mode = str(getattr(self, "_prev_tracking_mode", "LOST") or "LOST").upper()
+        previous_had_target = bool(getattr(self, "_prev_had_target", False))
+        recovery_mode_active = bool(previous_mode != "MATCH" or not previous_had_target)
+        lost_recovery_active = bool(previous_mode == "LOST" or not previous_had_target)
+        prediction_recovery_active = bool(previous_mode == "PRED" and previous_had_target)
 
         yaw_scale_dps = float(self.cfg.yaw_rate_scale_dps)
 
         if recovery_mode_active:
-            yaw_scale_dps = float(getattr(self.cfg, "recovery_yaw_rate_scale_dps", yaw_scale_dps))
+            yaw_scale_dps = float(
+                getattr(self.cfg, "recovery_yaw_rate_scale_dps", yaw_scale_dps)
+            )
 
-            forward_scale = float(getattr(self.cfg, "recovery_forward_scale", 1.0))
-            if vx_cmd > 0.0:
+        if vx_cmd > 0.0:
+            if lost_recovery_active:
+                forward_scale = float(
+                    getattr(self.cfg, "recovery_forward_scale", 1.0)
+                )
                 vx_cmd *= float(np.clip(forward_scale, 0.0, 1.0))
-                safety_info.setdefault("safety_reasons", []).append("recovery_forward_slowdown")
+                safety_info.setdefault("safety_reasons", []).append(
+                    "lost_recovery_forward_slowdown"
+                )
+            elif prediction_recovery_active:
+                # PRED is a short visual bridge, not a true loss. Slowing the
+                # pursuit here made the drone fall behind whenever one detector
+                # frame flickered. Keep the learned pulse amplitude unchanged.
+                prediction_scale = float(
+                    getattr(self.cfg, "prediction_forward_scale", 1.0)
+                )
+                vx_cmd *= float(np.clip(prediction_scale, 0.0, 1.25))
+                safety_info.setdefault("safety_reasons", []).append(
+                    "prediction_forward_preserved"
+                )
 
         yaw_rate_cmd = float(safe_action[3]) * yaw_scale_dps
 
@@ -3444,20 +4119,52 @@ class DroneEnv(gym.Env):
         if bool(getattr(self, "_parallel_dual_agent_mode", False)):
             ff_vx = float(getattr(self, "_parallel_feedforward_vx_mps", 0.0))
             ff_vy = float(getattr(self, "_parallel_feedforward_vy_mps", 0.0))
+            bottom_vx = float(
+                getattr(self, "_parallel_bottom_correction_vx_mps", 0.0)
+            )
+            bottom_vy = float(
+                getattr(self, "_parallel_bottom_correction_vy_mps", 0.0)
+            )
+            agent1_weight = float(
+                getattr(self, "_parallel_agent1_xy_weight", 1.0)
+            )
             safety_reasons_lower = [
                 str(reason).lower()
                 for reason in safety_info.get("safety_reasons", [])
             ]
-            ff_blocked_by_safety = any(
+            hard_safety = any(
+                token in reason
+                for reason in safety_reasons_lower
+                for token in (
+                    "emergency",
+                    "collision",
+                    "takeoff_failed",
+                    "altitude_emergency",
+                )
+            )
+            soft_horizontal_proximity = any(
                 token in reason
                 for reason in safety_reasons_lower
                 for token in ("obstacle", "horizontal", "lidar")
             )
+            # When a verified bottom-camera controller is active, the moving
+            # landing platform itself may legitimately appear as a nearby
+            # horizontal LiDAR return. Do not erase the visual catch-up command
+            # for a soft proximity warning. Hard emergency/collision safety is
+            # still absolute. Outside trusted bottom guidance, preserve the old
+            # conservative blocking behavior.
+            trusted_bottom_guidance = bool(
+                getattr(self, "_parallel_bottom_guidance_active", False)
+            )
+            ff_blocked_by_safety = bool(
+                hard_safety
+                or (soft_horizontal_proximity and not trusted_bottom_guidance)
+            )
             if ff_blocked_by_safety:
                 ff_vx = 0.0
                 ff_vy = 0.0
-            vx_cmd = float(vx_cmd + ff_vx)
-            vy_cmd = float(vy_cmd + ff_vy)
+                bottom_vx = 0.0
+                bottom_vy = 0.0
 
             horizontal_limit = max(
                 0.1,
@@ -3469,20 +4176,52 @@ class DroneEnv(gym.Env):
                     )
                 ),
             )
-            horizontal_speed = float(np.hypot(vx_cmd, vy_cmd))
-            if horizontal_speed > horizontal_limit:
-                scale = horizontal_limit / max(horizontal_speed, 1.0e-6)
-                vx_cmd *= scale
-                vy_cmd *= scale
+            if soft_horizontal_proximity and trusted_bottom_guidance and not hard_safety:
+                # Keep enough authority to catch the moving platform, but do
+                # not allow the full global limit while a soft proximity return
+                # is present.
+                horizontal_limit = min(horizontal_limit, 3.50)
+            vx_cmd, vy_cmd = self._fuse_parallel_xy(
+                agent1_vx=float(vx_cmd),
+                agent1_vy=float(vy_cmd),
+                agent1_weight=agent1_weight,
+                feedforward_vx=ff_vx,
+                feedforward_vy=ff_vy,
+                bottom_correction_vx=bottom_vx,
+                bottom_correction_vy=bottom_vy,
+                speed_limit_mps=horizontal_limit,
+            )
+            vx_cmd, vy_cmd = self._stabilize_parallel_xy_command(
+                vx_cmd,
+                vy_cmd,
+                bottom_live=bool(
+                    getattr(self, "_parallel_bottom_measurement_live", False)
+                ),
+                bottom_guidance_active=bool(trusted_bottom_guidance),
+            )
 
-            # Z authority is exclusive: no Agent-1 altitude-hold or chase
-            # command is allowed to overwrite the landing controller.
-            vz_cmd = max(
-                0.0,
-                float(getattr(self, "_parallel_external_vz_mps", 0.0)),
+            # Z authority is exclusive, but Agent-1's physical safety layer
+            # remains authoritative at the single command boundary. In
+            # particular, a down-LiDAR block/limit must not be bypassed by the
+            # external Agent-2 override. Positive NED-Z is descent; negative is
+            # the bounded deterministic reacquisition climb.
+            requested_parallel_vz = float(
+                getattr(self, "_parallel_external_vz_mps", 0.0)
+            )
+            (
+                vz_cmd,
+                self._last_parallel_z_blocked_by_safety,
+                self._last_parallel_z_limited_by_safety,
+            ) = self._apply_parallel_vertical_safety(
+                requested_parallel_vz,
+                safety_reasons_lower,
+                hard_safety=hard_safety,
             )
             self._last_parallel_feedforward_vx_mps = ff_vx
             self._last_parallel_feedforward_vy_mps = ff_vy
+            self._last_parallel_bottom_correction_vx_mps = bottom_vx
+            self._last_parallel_bottom_correction_vy_mps = bottom_vy
+            self._last_parallel_agent1_xy_weight = agent1_weight
             self._last_parallel_z_override_mps = float(vz_cmd)
             self._last_parallel_feedforward_blocked_by_safety = bool(
                 ff_blocked_by_safety
@@ -3490,8 +4229,16 @@ class DroneEnv(gym.Env):
         else:
             self._last_parallel_feedforward_vx_mps = 0.0
             self._last_parallel_feedforward_vy_mps = 0.0
+            self._last_parallel_bottom_correction_vx_mps = 0.0
+            self._last_parallel_bottom_correction_vy_mps = 0.0
+            self._last_parallel_agent1_xy_weight = 1.0
+            self._parallel_fused_prev_vx_mps = 0.0
+            self._parallel_fused_prev_vy_mps = 0.0
+            self._parallel_fused_slew_limited = False
             self._last_parallel_z_override_mps = 0.0
             self._last_parallel_feedforward_blocked_by_safety = False
+            self._last_parallel_z_blocked_by_safety = False
+            self._last_parallel_z_limited_by_safety = False
 
         # Persist the actual command for the wrapper and diagnostics.
         self._last_commanded_vx_mps = float(vx_cmd)
@@ -3499,6 +4246,11 @@ class DroneEnv(gym.Env):
         self._last_commanded_vz_mps = float(vz_cmd)
         self._last_commanded_yaw_rate_dps = float(yaw_rate_cmd)
 
+        # Preserve the exact high-level pulse duration used during Agent-1
+        # training. Raw 3-6 m/s policy outputs must never be held throughout the
+        # slow vision cycle. After the pulse finishes, bridge only the much lower
+        # XY velocity that the vehicle actually achieved.
+        control_period_s = self._measure_command_bridge_period()
         self.client.moveByVelocityBodyFrameAsync(
             vx=vx_cmd,
             vy=vy_cmd,
@@ -3507,6 +4259,13 @@ class DroneEnv(gym.Env):
             yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate_cmd),
             vehicle_name=self.cfg.vehicle_name,
         ).join()
+        self._issue_command_bridge(
+            requested_vx_mps=float(vx_cmd),
+            requested_vy_mps=float(vy_cmd),
+            tracking_mode=previous_mode,
+            safety_info=safety_info,
+            control_period_s=float(control_period_s),
+        )
 
         frame = self._get_frame()
         bbox_raw = self.tracker.update(frame)
@@ -3609,6 +4368,7 @@ class DroneEnv(gym.Env):
             front_tracking_mode=current_tracking_mode_for_rules,
             obs_dict=obs_dict,
             obstacle_dict=obstacle_dict,
+            altitude_m=float(drone_state.altitude_m),
         )
 
         # ------------------------------------------------------------------
@@ -4062,12 +4822,14 @@ class DroneEnv(gym.Env):
             "best_distance_not_improved_too_long",
             "distance_damage_too_large",
             "altitude_too_low",
-            "altitude_too_high",
             "episode_timeout",
             "focused_centered_yaw_hard_fail",
         }:
             done = False
             term_reason = ""
+
+        if done:
+            self._cancel_command_bridge(f"TERMINAL:{term_reason or 'UNKNOWN'}")
 
         current_has_target = bool(float(obs_dict.get("has_target", 0.0)) > 0.5)
         current_tracking_mode = str(tracking_mode or "LOST")
@@ -4713,10 +5475,31 @@ class DroneEnv(gym.Env):
             "commanded_vy_mps": float(getattr(self, "_last_commanded_vy_mps", 0.0)),
             "commanded_vz_mps": float(getattr(self, "_last_commanded_vz_mps", 0.0)),
             "commanded_yaw_rate_dps": float(getattr(self, "_last_commanded_yaw_rate_dps", 0.0)),
+            "command_bridge_active": bool(getattr(self, "_command_bridge_active", False)),
+            "command_bridge_reason": str(getattr(self, "_command_bridge_last_reason", "UNKNOWN")),
+            "command_bridge_period_ema_s": float(getattr(self, "_command_bridge_period_ema_s", 0.0)),
+            "command_bridge_duration_s": float(getattr(self, "_command_bridge_last_duration_s", 0.0)),
+            "command_bridge_measured_vx_mps": float(getattr(self, "_command_bridge_last_measured_vx_mps", 0.0)),
+            "command_bridge_measured_vy_mps": float(getattr(self, "_command_bridge_last_measured_vy_mps", 0.0)),
+            "command_bridge_vx_mps": float(getattr(self, "_command_bridge_last_vx_mps", 0.0)),
+            "command_bridge_vy_mps": float(getattr(self, "_command_bridge_last_vy_mps", 0.0)),
+            "command_bridge_vz_mps": float(getattr(self, "_command_bridge_last_vz_mps", 0.0)),
+            "command_bridge_attitude_scale": float(getattr(self, "_command_bridge_last_attitude_scale", 1.0)),
+            "agent1_bottom_perception_shared": bool(getattr(self, "_agent1_bottom_perception_shared", False)),
             "parallel_target_velocity_ff_vx_mps": float(getattr(self, "_last_parallel_feedforward_vx_mps", 0.0)),
             "parallel_target_velocity_ff_vy_mps": float(getattr(self, "_last_parallel_feedforward_vy_mps", 0.0)),
-            "parallel_agent2_vz_override_mps": float(getattr(self, "_last_parallel_z_override_mps", 0.0)),
+            "parallel_bottom_correction_vx_mps": float(getattr(self, "_last_parallel_bottom_correction_vx_mps", 0.0)),
+            "parallel_bottom_correction_vy_mps": float(getattr(self, "_last_parallel_bottom_correction_vy_mps", 0.0)),
+            "parallel_agent1_xy_weight": float(getattr(self, "_last_parallel_agent1_xy_weight", 1.0)),
+            "parallel_xy_slew_limited": bool(getattr(self, "_parallel_fused_slew_limited", False)),
+            "parallel_xy_stable_vx_mps": float(getattr(self, "_parallel_fused_prev_vx_mps", 0.0)),
+            "parallel_xy_stable_vy_mps": float(getattr(self, "_parallel_fused_prev_vy_mps", 0.0)),
             "parallel_target_velocity_ff_blocked_by_safety": bool(getattr(self, "_last_parallel_feedforward_blocked_by_safety", False)),
+            "parallel_z_blocked_by_safety": bool(getattr(self, "_last_parallel_z_blocked_by_safety", False)),
+            "parallel_z_limited_by_safety": bool(getattr(self, "_last_parallel_z_limited_by_safety", False)),
+            "parallel_bottom_guidance_active": bool(getattr(self, "_parallel_bottom_guidance_active", False)),
+            "parallel_bottom_measurement_live": bool(getattr(self, "_parallel_bottom_measurement_live", False)),
+            "parallel_reacquire_climb_active": bool(getattr(self, "_parallel_reacquire_climb_active", False)),
             "reward_parts": reward_parts,
             "pitch_deg": float(getattr(self, "_last_pitch_deg", 0.0)),
             "pitch_rate_dps": float(getattr(self, "_last_pitch_rate_dps", 0.0)),

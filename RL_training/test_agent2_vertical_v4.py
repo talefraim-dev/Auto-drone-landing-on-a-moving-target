@@ -222,7 +222,7 @@ def test_actor_pose_z_is_not_converted_with_abs():
     )
     env._read_target_surface_altitude()
     assert env._target_surface_z_ned == 1.72
-    assert env._target_surface_source == "api_object_pose_z_ned"
+    assert env._target_surface_source == "api_object_pose_z_ned_only"
 
 
 if __name__ == "__main__":

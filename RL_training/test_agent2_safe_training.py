@@ -112,7 +112,7 @@ def test_descent_waits_for_consecutive_live_matches():
             "bottom_bbox_rel_err": 0.10,
         }
     )
-    assert state == "HOLD_MATCH_CONFIRM"
+    assert state == "ALIGN_LOCK_PENDING"
     assert allowed is False
 
 
@@ -128,7 +128,7 @@ def test_descent_is_allowed_only_when_live_confirmed_and_aligned():
     }
     for _ in range(env.cfg.alignment_streak_required):
         state, allowed, reason = env._vertical_control_state(info)
-    assert state == "DESCEND_TRACKING"
+    assert state == "DESCEND_LANDING_LOCK_ACQUIRED"
     assert allowed is True
     assert reason == ""
 
@@ -169,6 +169,7 @@ def _candidate(cls_id: int, embedding, x=430, y=260, w=100, h=180, conf=0.9):
 
 def _tracking_env(candidates):
     env = _bare_env()
+    env.cfg.adaptive_embedding_enabled = False
     env.tracker = _FakeTracker(candidates)
     env._reference_embeddings = [torch.tensor([1.0, 0.0], dtype=torch.float32)]
     env._original_embedding = env._reference_embeddings[0]
@@ -212,7 +213,7 @@ def test_source_contains_explicit_positive_vz_block():
     source = (ROOT / "agent2_landing_env.py").read_text(encoding="utf-8")
     assert "descent_blocked = bool(descent_requested and not descent_allowed)" in source
     assert "if descent_blocked:" in source
-    assert "vz = 0.0" in source
+    assert "return 0.0, 0.0, False" in source
     assert "bottom_match_live" in source
 
 

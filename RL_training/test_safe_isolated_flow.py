@@ -19,7 +19,7 @@ def main() -> None:
     for rel, digest in expected.items():
         actual = sha(ROOT / rel)
         assert actual == digest, f"Baseline file changed: {rel}"
-        print(f"PASS baseline preserved: {rel}")
+        print(f"PASS expected package hash: {rel}")
 
     for path in sorted(ROOT.rglob("*.py")):
         if any(part in {".idea", "venv", ".venv"} for part in path.parts):

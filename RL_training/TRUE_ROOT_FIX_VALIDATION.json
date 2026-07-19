@@ -1,0 +1,201 @@
+{
+  "source_zip": "/mnt/data/RL_training(19)(1).zip",
+  "source_zip_sha256": "446d0e7fb77309ce6b2dd0db16b411d2418a7e0f4757fd413c24ff733ee6029f",
+  "design_guards": {
+    "ppo_pulse_duration_preserved_s": 0.1,
+    "raw_policy_command_persisted": false,
+    "bridge_source": "measured achieved body-frame XY velocity after PPO pulse",
+    "bridge_duration_range_s": [
+      0.25,
+      0.9
+    ],
+    "bridge_speed_caps_mps": {
+      "MATCH": 1.2,
+      "PRED": 0.85,
+      "LOST": 0.45,
+      "BOTTOM_VELOCITY_MATCH": 0.7,
+      "BOTTOM_LANDING_READY": 0.38
+    },
+    "bridge_z_mps": 0.0,
+    "bridge_yaw_rate_dps": 0.0,
+    "attitude_soft_limit_deg": 10.0,
+    "attitude_hard_limit_deg": 16.0,
+    "prediction_forward_scale": 1.0,
+    "lost_recovery_forward_scale": 0.65,
+    "prediction_horizon_unchanged_s": [
+      0.1,
+      0.6
+    ],
+    "agent1_agent2_shared_bottom_perception": true
+  },
+  "empirical_original_run_metrics": {
+    "diag_20260719_022726": {
+      "steps": 16,
+      "mean_command_interval_s": 1.947,
+      "min_command_interval_s": 1.734,
+      "max_command_interval_s": 2.406,
+      "max_raw_pulse_vx_mps": 5.8,
+      "achieved_vx_at_plus_0_15_s_range_mps": [
+        0.186,
+        0.536
+      ],
+      "vx_before_next_command_range_mps": [
+        -0.18,
+        -0.026
+      ]
+    },
+    "diag_20260719_095935": {
+      "steps": 8,
+      "mean_command_interval_s": 2.212,
+      "min_command_interval_s": 2.0,
+      "max_command_interval_s": 2.64,
+      "max_raw_pulse_vx_mps": 5.8,
+      "achieved_vx_at_plus_0_15_s_range_mps": [
+        0.157,
+        0.499
+      ],
+      "vx_before_next_command_range_mps": [
+        -0.279,
+        -0.052
+      ]
+    }
+  },
+  "original_method_costs": {
+    "diag_20260719_022726": {
+      "drone_env.DroneEnv._get_downward_frame": {
+        "count": 17,
+        "mean_ms": 159.536
+      },
+      "drone_env.DroneEnv._update_bottom_full_tracker": {
+        "count": 17,
+        "mean_ms": 404.882
+      },
+      "drone_env.DroneEnv._update_soft_handoff_state": {
+        "count": 17,
+        "mean_ms": 827.833
+      },
+      "drone_env.DroneEnv.step": {
+        "count": 17,
+        "mean_ms": 1833.619
+      }
+    },
+    "diag_20260719_095935": {
+      "drone_env.DroneEnv._get_downward_frame": {
+        "count": 9,
+        "mean_ms": 172.018
+      },
+      "drone_env.DroneEnv._update_bottom_full_tracker": {
+        "count": 9,
+        "mean_ms": 480.411
+      },
+      "drone_env.DroneEnv._update_soft_handoff_state": {
+        "count": 9,
+        "mean_ms": 945.161
+      },
+      "drone_env.DroneEnv.step": {
+        "count": 9,
+        "mean_ms": 2004.181
+      }
+    }
+  },
+  "protected_files": {
+    "follow_reward_v37.py": {
+      "original_sha256": "204433f409496f3cd18aaab2e73ad28674a02663d99d9aae1306b45a6a3ad025",
+      "fixed_sha256": "204433f409496f3cd18aaab2e73ad28674a02663d99d9aae1306b45a6a3ad025",
+      "unchanged": true
+    },
+    "observation_builder.py": {
+      "original_sha256": "579f17ac5d9ddfe7f96d6c77fac37f020c2aa9b9b1088b6bbc41572a421b88c3",
+      "fixed_sha256": "579f17ac5d9ddfe7f96d6c77fac37f020c2aa9b9b1088b6bbc41572a421b88c3",
+      "unchanged": true
+    },
+    "object_tracker.py": {
+      "original_sha256": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
+      "fixed_sha256": "ceca68653b9b8a304a23184d33d81d5b1a0b9529b053c70d5770a5aaad725156",
+      "unchanged": true
+    },
+    "resnet_yolo_tracker.py": {
+      "original_sha256": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
+      "fixed_sha256": "e7b5fb098738d27df4fb82b438fd865a477d791c95a7d288a546457053f3309f",
+      "unchanged": true
+    },
+    "safety_filter.py": {
+      "original_sha256": "bbd1c1a7d23eee0e24d9c62e0c5cdbd33d2cf93826f3881e781efbc6818f2b70",
+      "fixed_sha256": "bbd1c1a7d23eee0e24d9c62e0c5cdbd33d2cf93826f3881e781efbc6818f2b70",
+      "unchanged": true
+    },
+    "lidar_processor.py": {
+      "original_sha256": "9bc93e46068ad75b11225ff9e8c753ce1d3151dc9781a66236b87efca76fe90c",
+      "fixed_sha256": "9bc93e46068ad75b11225ff9e8c753ce1d3151dc9781a66236b87efca76fe90c",
+      "unchanged": true
+    }
+  },
+  "changed_files": [
+    {
+      "path": "BASELINE_CORE_SHA256.json",
+      "status": "modified",
+      "original_sha256": "75334a666c3e8bd7d1e58c1e4282964ce1ca3d4efca6d45d4ad91fb5cc6457c5",
+      "fixed_sha256": "c6030261b1721a2abf623d55dd16c200adf801744b8dc1aba08e1f7559abfb53"
+    },
+    {
+      "path": "Run_diag.py",
+      "status": "modified",
+      "original_sha256": "bfa3a006f44814ee84b8b73d60f8c7db3de27e0069272e1723f52b993b1655f8",
+      "fixed_sha256": "4d9af045f2b46c5fb5f5cc56f744951d6dbf123f45a12f631cd179d52b90bcd4"
+    },
+    {
+      "path": "TRUE_ROOT_FIX_README_HE.md",
+      "status": "added",
+      "sha256": "7bf662e3e85d005fc703b223279587ccda452e6f082648a04cd5b3b43cad4019"
+    },
+    {
+      "path": "agent1p2_env.py",
+      "status": "modified",
+      "original_sha256": "8cb1bbf5380dd22fc948c15c47a5d78f14b672e08b1ba61ad40456fcb0ab815a",
+      "fixed_sha256": "1f2ae2baaaf25c7d523d457b7f8f3f73150855a44fda0bee06e758bdbf0a0b7f"
+    },
+    {
+      "path": "agent2_landing_env.py",
+      "status": "modified",
+      "original_sha256": "ee0c7a86c37b6d6d7e76089967d699b4b1d9113331c6c1be580b5080e76223cd",
+      "fixed_sha256": "7090ccbbe6ec0c9fd63416f2930ef5a16e905ec463f83137bf1a358573faa675"
+    },
+    {
+      "path": "drone_env.py",
+      "status": "modified",
+      "original_sha256": "c99bcca382413b5a4fa33d113724d3a5742174cb0b40fcb3118a657f08afed65",
+      "fixed_sha256": "54fe9cc6a89d563a464b4d8b69576ac6c93296fe215b567615dc959f5a20da08"
+    },
+    {
+      "path": "test_safe_isolated_flow.py",
+      "status": "modified",
+      "original_sha256": "6feb2245db74d1fc8d7e806490397a997802830388a8b0bce6d01178368af518",
+      "fixed_sha256": "286c6b32079898e5ff0a17951ff5cd77eb99795d6d020b14557973d3437a6192"
+    },
+    {
+      "path": "test_true_realtime_control_fix.py",
+      "status": "added",
+      "sha256": "8900c263f52c9da85f3e5f99c1f29abe19c1390bb9206aac857e065ae947dfc2"
+    },
+    {
+      "path": "test_user_target_identity.py",
+      "status": "modified",
+      "original_sha256": "cf18f3369a0934f209cff21bd0021c183ff534582e833061ac64bea59bb2b8f2",
+      "fixed_sha256": "c1b8d7df9bf1a79b9161da80e4234cc263438eda9b9e31cded037fd302ed448b"
+    },
+    {
+      "path": "weights_config.py",
+      "status": "modified",
+      "original_sha256": "73212787d1f65bb6d3bd724b07d9a164cd7a53f45b97f3b17e7f69bffa1e708b",
+      "fixed_sha256": "4dfb753feefd7696d0c7a897f98726c9224a2b4c06e78adc9ac3ce1ac075ffb8"
+    }
+  ],
+  "python_file_count": 154,
+  "tests": {
+    "test_safe_isolated_flow.py": "PASS",
+    "test_user_target_identity.py": "PASS",
+    "test_true_realtime_control_fix.py": "PASS",
+    "compileall": "PASS",
+    "live_cosys_airsim_flight": "NOT_AVAILABLE_IN_THIS_ENVIRONMENT"
+  }
+}
