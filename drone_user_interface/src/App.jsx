@@ -5,6 +5,7 @@ import './App.css';
 import { usePixelStreaming } from './hooks/usePixelStreaming';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useDroneLogic } from './hooks/useDroneLogic';
+import { useLogger } from './hooks/useLogger';
 
 // Components
 import VideoFeed from './components/VideoFeed';
@@ -12,17 +13,24 @@ import Minimap from './components/Minimap';
 import Footer from './components/Footer';
 
 function App() {
-  const videoRef = useRef(null); 
-  
-  const stream = usePixelStreaming(videoRef, (msg, type) => console.log(msg));
+  const videoRef = useRef(null);
+
+  const { logs, addLog } = useLogger();
+  const stream = usePixelStreaming(videoRef, addLog);
 
   const { telemetry } = useTelemetry(stream);
-  const { mode, target, logs, abortConfirm, addLog, handleCommand, handleTargetLock } = useDroneLogic(stream);
+  const { mode, target, abortConfirm, handleCommand, handleTargetLock } = useDroneLogic(stream, addLog);
 
   const onVideoClick = (e) => {
     if (mode === 'LANDING' || mode === 'EMERGENCY') return;
     const rect = e.target.getBoundingClientRect();
-    handleTargetLock(e.clientX - rect.left, e.clientY - rect.top);
+    const pixelX = e.clientX - rect.left;
+    const pixelY = e.clientY - rect.top;
+    // Normalized (0-1) coordinates are resolution-independent, unlike raw pixel offsets,
+    // so they stay meaningful to the simulator regardless of how the video element is scaled.
+    const normX = rect.width > 0 ? pixelX / rect.width : 0;
+    const normY = rect.height > 0 ? pixelY / rect.height : 0;
+    handleTargetLock(pixelX, pixelY, normX, normY);
   };
 
   return (

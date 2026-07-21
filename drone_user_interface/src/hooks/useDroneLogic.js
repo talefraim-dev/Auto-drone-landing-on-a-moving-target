@@ -1,15 +1,17 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
-export const useDroneLogic = (stream) => {
+export const useDroneLogic = (stream, addLog) => {
   const [mode, setMode] = useState('MANUAL');
-  const [target, setTarget] = useState({ x: 0, y: 0, status: 'IDLE' }); 
-  const [logs, setLogs] = useState([]); 
+  const [preHoverMode, setPreHoverMode] = useState('MANUAL');
+  const [target, setTarget] = useState({ x: 0, y: 0, status: 'IDLE' });
   const [abortConfirm, setAbortConfirm] = useState(false);
+  const targetLockTimeoutRef = useRef(null);
 
-  const addLog = (message, type = 'INFO') => {
-    const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
-    setLogs(prev => [{ id: crypto.randomUUID(), time, message, type }, ...prev].slice(0, 50));
-  };
+  useEffect(() => {
+    return () => {
+      if (targetLockTimeoutRef.current) clearTimeout(targetLockTimeoutRef.current);
+    };
+  }, []);
 
   const sendToSimulator = (commandObj) => {
     if (stream) {
@@ -30,9 +32,9 @@ export const useDroneLogic = (stream) => {
             setMode('EMERGENCY');
             setAbortConfirm(false);
             setTarget({ ...target, status: 'IDLE' });
-            sendToSimulator({ Command: "SetMode", Mode: "ABORT" }); 
+            sendToSimulator({ Command: "SetMode", Mode: "ABORT" });
         }
-        return; 
+        return;
     }
 
     if (abortConfirm) setAbortConfirm(false);
@@ -41,41 +43,60 @@ export const useDroneLogic = (stream) => {
         const newMode = mode === 'MANUAL' ? 'AUTO' : 'MANUAL';
         setMode(newMode);
         addLog(`${newMode} Mode Engaged`, newMode === 'AUTO' ? "WARN" : "INFO");
-        sendToSimulator({ Command: "SetMode", Mode: newMode }); 
+        sendToSimulator({ Command: "SetMode", Mode: newMode });
     }
     else if (cmd === 'HOVER') {
-        const newMode = mode === 'HOVER' ? 'MANUAL' : 'HOVER';
-        setMode(newMode);
-        addLog(newMode === 'HOVER' ? "Position Hold Engaged" : "Hover Cancelled", "INFO");
-        sendToSimulator({ Command: "SetMode", Mode: newMode }); 
+        if (mode === 'HOVER') {
+            // Return to whatever mode was active before HOVER was engaged, not always MANUAL.
+            setMode(preHoverMode);
+            addLog("Hover Cancelled", "INFO");
+            sendToSimulator({ Command: "SetMode", Mode: preHoverMode });
+        } else {
+            setPreHoverMode(mode);
+            setMode('HOVER');
+            addLog("Position Hold Engaged", "WARN");
+            sendToSimulator({ Command: "SetMode", Mode: "HOVER" });
+        }
     }
     else if (cmd === 'RTH') {
         addLog("Initiating Return to Home...", "WARN");
         setMode('RTH');
-        sendToSimulator({ Command: "SetMode", Mode: "RTH" }); 
+        sendToSimulator({ Command: "SetMode", Mode: "RTH" });
     }
     else if (cmd === 'LAND') {
         if (target.status === 'LOCKED') {
             addLog("LANDING SEQUENCE STARTED", "WARN");
             setMode('LANDING');
-            sendToSimulator({ Command: "ExecuteLanding" }); 
+            sendToSimulator({ Command: "ExecuteLanding" });
         } else {
             addLog("Landing Aborted: No valid target", "ERROR");
         }
     }
+    else if (cmd === 'SYNC') {
+        addLog("Requesting telemetry re-sync with simulator...", "INFO");
+        sendToSimulator({ Command: "SyncTelemetry" });
+    }
   };
 
-  const handleTargetLock = (x, y) => {
-      setTarget({ x, y, status: 'SEARCHING' });
-      addLog(`Acquiring target...`, "INFO");
-      
-      sendToSimulator({ Command: "SetTarget", TargetX: x, TargetY: y }); 
+  // pixelX/pixelY position the target overlay in screen space; normX/normY (0-1, resolution
+  // independent) are what actually gets sent to Unreal, since raw video-element pixels don't
+  // mean anything to the simulator if the feed is scaled/letterboxed in the browser.
+  const handleTargetLock = (pixelX, pixelY, normX, normY) => {
+      if (targetLockTimeoutRef.current) {
+          clearTimeout(targetLockTimeoutRef.current);
+      }
 
-      setTimeout(() => {
+      setTarget({ x: pixelX, y: pixelY, status: 'SEARCHING' });
+      addLog(`Acquiring target...`, "INFO");
+
+      sendToSimulator({ Command: "SetTarget", TargetX: normX, TargetY: normY });
+
+      targetLockTimeoutRef.current = setTimeout(() => {
           setTarget(prev => ({ ...prev, status: 'LOCKED' }));
           addLog("Target Locked. Confidence: 98%", "SUCCESS");
+          targetLockTimeoutRef.current = null;
       }, 1000);
   };
 
-  return { mode, target, logs, abortConfirm, addLog, handleCommand, handleTargetLock };
+  return { mode, target, abortConfirm, handleCommand, handleTargetLock };
 };
