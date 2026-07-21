@@ -8,5 +8,5 @@ export const useLogger = () => {
     setLogs(prev => [{ id: crypto.randomUUID(), time, message, type }, ...prev].slice(0, 50));
   }, []);
 
-  return { logs, addLog };
+  return { logs, addLog  };
 };
