@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { MapContainer, ImageOverlay, Popup, CircleMarker, useMapEvents } from 'react-leaflet';
-import 'leaflet/dist/leaflet.css'; 
+import 'leaflet/dist/leaflet.css';
+import miniMapImage from '../assets/mini_map_v2.png';
 
 const DynamicZoomMarker = ({ lat, lng, markerColor, isConnected }) => {
     const [currentZoom, setCurrentZoom] = useState(14);
@@ -61,7 +62,7 @@ const Minimap = ({ lat, lng, isConnected }) => {
             style={{height: '100%', width: '100%', backgroundColor: '#0a0a0a'}}
         >
             <ImageOverlay 
-                url="src/assets/mini_map_v2.png" 
+                url={miniMapImage}
                 bounds={mapBounds} 
                 zIndex={1}
             />
