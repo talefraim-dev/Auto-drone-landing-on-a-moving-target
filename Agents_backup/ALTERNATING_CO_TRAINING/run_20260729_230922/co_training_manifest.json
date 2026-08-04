@@ -1,0 +1,10 @@
+{
+  "started_at": "20260729_230922",
+  "cycles": 10,
+  "steps_per_agent1_phase": 20480,
+  "steps_per_agent2_phase": 20480,
+  "initial_agent1_checkpoint": "models\\PPO_Tracker\\tracking\\tracking_20260703_155756\\tracking_ppo_280000_steps.zip",
+  "initial_agent2_checkpoint": "models\\AGENT_1P2\\agent2_20260717_164700\\agent2_ppo_30720_steps.zip",
+  "rpc_success_reward": 8000.0,
+  "terminal_without_rpc_penalty": 4000.0
+}

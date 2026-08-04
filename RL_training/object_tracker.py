@@ -145,9 +145,13 @@ class tracker:
 
         self.last_identity_metrics = {
             "score": score,
-            "resnet_score": score,
+            "resnet_score": float(getattr(self.core, "last_bank_similarity", score) or score),
             "core_mode": raw_mode,
             "target_class_id": -1 if self.target_class_id is None else int(self.target_class_id),
+            "scale_bank_size": int(len(getattr(self.core, "template_bank", []) or [])),
+            "scale_bank_updates": int(getattr(self.core, "template_bank_updates", 0) or 0),
+            "candidate_scale": float(getattr(self.core, "last_candidate_scale", 0.0) or 0.0),
+            "matched_template_scale": float(getattr(self.core, "last_matched_template_scale", 0.0) or 0.0),
         }
 
         return self.last_bbox
@@ -182,7 +186,7 @@ class tracker:
 
             t = torch.from_numpy(arr).float().to(self.device)
             t = F.normalize(t, dim=0)
-            self.core.target_embedding = t
+            self.core.restore_target_embedding(t)
             self.target_fingerprint = arr.copy()
             return None
 
@@ -251,7 +255,8 @@ class tracker:
             if emb is None:
                 continue
 
-            app = float(torch.dot(self.core.target_embedding, emb).detach().cpu().item())
+            candidate_scale = self.core._bbox_scale(cand.bbox, frame.shape)
+            app, _ = self.core._bank_similarity(emb, candidate_scale)
             if app > best_app:
                 best_app = app
                 best = cand

@@ -17,6 +17,7 @@ Expected input:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -113,14 +114,32 @@ def point_inside_bbox(x: int, y: int, bbox: BBox, pad: int = 0) -> bool:
 
 
 def crop_bgr(frame_bgr: np.ndarray, bbox: BBox, pad_ratio: float = 0.15) -> Optional[np.ndarray]:
+    """Crop an XYWH bounding box safely, including float tracker boxes."""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None
+
     h_img, w_img = frame_bgr.shape[:2]
-    x, y, w, h = bbox
-    pad_x = int(w * pad_ratio)
-    pad_y = int(h * pad_ratio)
-    x1 = max(0, x - pad_x)
-    y1 = max(0, y - pad_y)
-    x2 = min(w_img, x + w + pad_x)
-    y2 = min(h_img, y + h + pad_y)
+    try:
+        values = np.asarray(bbox, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if values.size < 4 or not np.all(np.isfinite(values[:4])):
+        return None
+
+    x, y, w, h = map(float, values[:4])
+    if w <= 0.0 or h <= 0.0:
+        return None
+
+    pad_x = w * float(pad_ratio)
+    pad_y = h * float(pad_ratio)
+
+    # NumPy slice indices must be integers. Floor the upper-left corner and
+    # ceil the lower-right corner so a transferred/sub-pixel box is not shrunk.
+    x1 = max(0, int(math.floor(x - pad_x)))
+    y1 = max(0, int(math.floor(y - pad_y)))
+    x2 = min(w_img, int(math.ceil(x + w + pad_x)))
+    y2 = min(h_img, int(math.ceil(y + h + pad_y)))
+
     if x2 <= x1 or y2 <= y1:
         return None
     crop = frame_bgr[y1:y2, x1:x2]
@@ -178,6 +197,21 @@ class YoloResNetTracker:
         self.last_score: float = 0.0
         self.last_mode: str = "IDLE"
         self.frame_index: int = 0
+
+        # Scale-aware appearance memory. The immutable target_embedding remains
+        # the original identity anchor, while this bank learns a few verified
+        # views as the target grows from far -> near -> contact scale.
+        self.template_bank: List[Tuple[torch.Tensor, float, int]] = []
+        self.max_template_bank_size: int = 10
+        self.template_scale_step_ratio: float = 1.18
+        self.template_update_min_similarity: float = 0.68
+        self.template_update_min_total_score: float = 0.68
+        self.template_update_cooldown_frames: int = 3
+        self.template_bank_updates: int = 0
+        self.last_template_update_frame: int = -10_000
+        self.last_candidate_scale: float = 0.0
+        self.last_matched_template_scale: float = 0.0
+        self.last_bank_similarity: float = 0.0
 
         if self.verbose:
             print(f"[YOLO+RESNET] device={self.device}, yolo_model={yolo_model_path}")
@@ -278,6 +312,118 @@ class YoloResNetTracker:
     def _embedding_from_bbox(self, frame_bgr: np.ndarray, bbox: BBox) -> Optional[torch.Tensor]:
         crop = crop_bgr(frame_bgr, bbox)
         return self._embedding_from_crop(crop)
+
+    @staticmethod
+    def _bbox_scale(bbox: BBox, frame_shape: Tuple[int, int, int]) -> float:
+        """Return a resolution-independent linear scale for an XYWH bbox."""
+        h_img, w_img = frame_shape[:2]
+        _, _, bw, bh = [float(v) for v in bbox]
+        area_fraction = max(1.0, bw * bh) / max(1.0, float(w_img * h_img))
+        return float(math.sqrt(area_fraction))
+
+    def _reset_template_bank(self, embedding: torch.Tensor, bbox: Optional[BBox], frame_shape) -> None:
+        self.template_bank = []
+        self.template_bank_updates = 0
+        self.last_template_update_frame = -10_000
+        if embedding is None or bbox is None or frame_shape is None:
+            return
+        scale = self._bbox_scale(bbox, frame_shape)
+        self.template_bank.append((embedding.detach().clone(), float(scale), int(self.frame_index)))
+        self.last_candidate_scale = float(scale)
+        self.last_matched_template_scale = float(scale)
+        self.last_bank_similarity = 1.0
+
+    def restore_target_embedding(self, embedding: torch.Tensor) -> None:
+        """Restore the immutable identity anchor and reset per-flight scale memory."""
+        self.target_embedding = F.normalize(embedding.detach().to(self.device), dim=0)
+        self.template_bank = []
+        self.template_bank_updates = 0
+        self.last_template_update_frame = -10_000
+        self.last_candidate_scale = 0.0
+        self.last_matched_template_scale = 0.0
+        self.last_bank_similarity = 0.0
+
+    def _bank_similarity(self, embedding: torch.Tensor, candidate_scale: float) -> Tuple[float, float]:
+        """Best appearance similarity, mildly preferring templates of nearby scale."""
+        entries = self.template_bank
+        if not entries and self.target_embedding is not None:
+            entries = [(self.target_embedding, float(candidate_scale), 0)]
+
+        best_adjusted = -1.0
+        best_raw = -1.0
+        best_scale = float(candidate_scale)
+        for template, template_scale, _ in entries:
+            raw = float(torch.dot(template, embedding).detach().cpu().item())
+            scale_distance = abs(math.log(max(candidate_scale, 1e-6) / max(template_scale, 1e-6)))
+            # Small preference only; identity remains the dominant signal.
+            adjusted = raw - 0.025 * min(scale_distance, 2.0)
+            if adjusted > best_adjusted:
+                best_adjusted = adjusted
+                best_raw = raw
+                best_scale = float(template_scale)
+        return float(best_raw), float(best_scale)
+
+    def _maybe_add_scale_template(
+        self,
+        embedding: torch.Tensor,
+        candidate_scale: float,
+        similarity: float,
+        total_score: float,
+    ) -> bool:
+        """Add a verified template only after a meaningful scale transition."""
+        if embedding is None:
+            return False
+        if similarity < self.template_update_min_similarity:
+            return False
+        if total_score < self.template_update_min_total_score:
+            return False
+        if self.frame_index - self.last_template_update_frame < self.template_update_cooldown_frames:
+            return False
+
+        if not self.template_bank:
+            self.template_bank.append((embedding.detach().clone(), float(candidate_scale), int(self.frame_index)))
+            self.last_template_update_frame = int(self.frame_index)
+            self.template_bank_updates += 1
+            return True
+
+        nearest_log_distance = min(
+            abs(math.log(max(candidate_scale, 1e-6) / max(scale, 1e-6)))
+            for _, scale, _ in self.template_bank
+        )
+        required = math.log(self.template_scale_step_ratio)
+        if nearest_log_distance < required:
+            return False
+
+        self.template_bank.append((embedding.detach().clone(), float(candidate_scale), int(self.frame_index)))
+        self.template_bank.sort(key=lambda row: row[1])
+
+        # Preserve coverage across the scale range instead of keeping only the
+        # newest frames. If full, remove the most redundant interior template.
+        if len(self.template_bank) > self.max_template_bank_size:
+            best_remove = None
+            best_gap = float("inf")
+            for idx in range(1, len(self.template_bank) - 1):
+                prev_scale = self.template_bank[idx - 1][1]
+                cur_scale = self.template_bank[idx][1]
+                next_scale = self.template_bank[idx + 1][1]
+                gap = abs(math.log(max(cur_scale, 1e-6) / max(prev_scale, 1e-6))) + abs(
+                    math.log(max(next_scale, 1e-6) / max(cur_scale, 1e-6))
+                )
+                if gap < best_gap:
+                    best_gap = gap
+                    best_remove = idx
+            if best_remove is None:
+                best_remove = 1
+            self.template_bank.pop(best_remove)
+
+        self.last_template_update_frame = int(self.frame_index)
+        self.template_bank_updates += 1
+        if self.verbose:
+            print(
+                f"[SCALE BANK] add scale={candidate_scale:.4f} sim={similarity:.3f} "
+                f"total={total_score:.3f} bank={len(self.template_bank)} updates={self.template_bank_updates}"
+            )
+        return True
 
     def _detect_candidates(self, frame_bgr: np.ndarray) -> List[Candidate]:
         global _CUDA_YOLO_DISABLED_AFTER_OOM
@@ -410,6 +556,7 @@ class YoloResNetTracker:
         self.last_score = 1.0
         self.last_mode = "INIT"
         self.frame_index = 0
+        self._reset_template_bank(emb, bbox, frame_bgr.shape)
         if self.verbose:
             print(f"[RESNET INIT] bbox={bbox} class_id={self.target_class_id}")
         return bbox.copy()
@@ -434,11 +581,15 @@ class YoloResNetTracker:
 
         best: Optional[Candidate] = None
         best_score = -1.0
+        best_embedding: Optional[torch.Tensor] = None
+        best_scale = 0.0
+        best_template_scale = 0.0
         for cand in candidates:
             emb = self._embedding_from_bbox(frame_bgr, cand.bbox)
             if emb is None:
                 continue
-            appearance = float(torch.dot(self.target_embedding, emb).detach().cpu().item())
+            candidate_scale = self._bbox_scale(cand.bbox, frame_bgr.shape)
+            appearance, matched_template_scale = self._bank_similarity(emb, candidate_scale)
             motion = self._motion_score(cand.bbox, frame_bgr.shape)
             total = self.appearance_weight * appearance + self.motion_weight * motion + 0.05 * cand.conf
             cand.appearance_score = appearance
@@ -447,24 +598,41 @@ class YoloResNetTracker:
             if total > best_score:
                 best = cand
                 best_score = total
+                best_embedding = emb
+                best_scale = float(candidate_scale)
+                best_template_scale = float(matched_template_scale)
         if best is None:
             self.last_mode = "PRED_NO_EMB"
             self.last_score = 0.0
             return self.last_bbox.copy()
 
         self.last_score = best.total_score
+        self.last_candidate_scale = float(best_scale)
+        self.last_matched_template_scale = float(best_template_scale)
+        self.last_bank_similarity = float(best.appearance_score)
         if best.total_score >= self.min_match_score:
             old = self.last_bbox.copy()
             new = best.bbox.copy()
             self.last_bbox = self._smooth_bbox(old, new)
             self.last_good_bbox = self.last_bbox.copy()
             self.last_mode = "MATCH"
-            new_emb = self._embedding_from_bbox(frame_bgr, best.bbox)
-            if new_emb is not None:
-                updated = 0.95 * self.target_embedding + 0.05 * new_emb
-                self.target_embedding = F.normalize(updated, dim=0)
+
+            # Keep the original identity anchor immutable. Learn additional
+            # templates only at verified, materially different scales.
+            if best_embedding is not None:
+                self._maybe_add_scale_template(
+                    best_embedding,
+                    best_scale,
+                    best.appearance_score,
+                    best.total_score,
+                )
             if self.verbose and self.frame_index % 10 == 0:
-                print(f"[MATCH] bbox={self.last_bbox} total={best.total_score:.3f} app={best.appearance_score:.3f} motion={best.motion_score:.3f} cls={best.cls_id} conf={best.conf:.3f}")
+                print(
+                    f"[MATCH] bbox={self.last_bbox} total={best.total_score:.3f} "
+                    f"app={best.appearance_score:.3f} motion={best.motion_score:.3f} "
+                    f"scale={best_scale:.4f} bank={len(self.template_bank)} "
+                    f"cls={best.cls_id} conf={best.conf:.3f}"
+                )
             return self.last_bbox.copy()
 
         self.last_mode = "PRED_LOW_SCORE"

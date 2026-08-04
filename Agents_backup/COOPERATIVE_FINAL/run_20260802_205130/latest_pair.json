@@ -1,0 +1,6 @@
+{
+  "generation": 2,
+  "pair_dir": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002",
+  "agent1_checkpoint": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002\\agent1.zip",
+  "agent2_checkpoint": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002\\agent2.zip"
+}

@@ -12,9 +12,10 @@ TRAINING_MODE = "AGENT_1P2"
 TOTAL_AGENT2_TIMESTEPS = 2_048
 CHECKPOINT_FREQUENCY = 2_048
 
-# Agent 1 checkpoint selection. Leave empty to select the checkpoint with the
-# largest ``*_steps.zip`` number under models/PPO_Tracker/tracking.
-AGENT_1_MODEL_PATH = ""
+# Final model locations. The completed project loads both policies from one
+# explicit directory and no longer scans legacy training folders.
+AGENT_1_MODEL_PATH = "models/FINAL_MODELS/agent1_final.zip"
+AGENT_2_MODEL_PATH = "models/FINAL_MODELS/agent2_final.zip"
 AGENT_1_DETERMINISTIC = True
 AGENT_1_PREPARE_MAX_ATTEMPTS = 3
 AGENT_1_PREPARE_MAX_STEPS_PER_ATTEMPT = 700
@@ -26,13 +27,14 @@ PARALLEL_TARGET_VELOCITY_FEEDFORWARD_GAIN = 1.00
 PARALLEL_TARGET_VELOCITY_EMA_ALPHA = 0.45
 PARALLEL_HORIZONTAL_TOTAL_SPEED_MAX_MPS = 6.0
 
-# Bottom LIVE is authoritative for XY during landing. Agent 1 still performs
-# inference on every step and owns yaw/search, but its front/PRED XY is muted
-# while the bottom predictive controller has a current target. Full Agent-1 XY
-# returns immediately when the bottom camera loses LIVE MATCH.
-PARALLEL_AGENT1_MIN_XY_WEIGHT_NEAR_LANDING = 0.20  # legacy compatibility
-PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_LIVE = 0.00
-PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_PRED = 0.35
+# Agent 1 remains a real trainable XY/Yaw participant during landing. The
+# deterministic bottom-camera controller supplies a safety/reference correction,
+# while a conservative Agent-1 residual remains physically executed so PPO can
+# learn final alignment instead of receiving reward for a muted action. Full
+# Agent-1 XY returns immediately when bottom guidance is unavailable.
+PARALLEL_AGENT1_MIN_XY_WEIGHT_NEAR_LANDING = 0.35
+PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_LIVE = 0.35
+PARALLEL_AGENT1_XY_WEIGHT_WHEN_BOTTOM_PRED = 0.65
 PARALLEL_BOTTOM_PD_CORRECTION_GAIN = 1.00
 
 # Bottom-camera t+1 predictor and catch-up controller. The horizon uses actual

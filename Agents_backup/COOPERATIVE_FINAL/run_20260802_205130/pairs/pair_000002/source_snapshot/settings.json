@@ -1,0 +1,234 @@
+{
+  "SeeDocsAt": "https://github.com/Microsoft/AirSim/blob/main/docs/settings.md",
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "_COMMENT_ViewMode": "NoDisplay = headless, Lit / FlyWithMe / SpringArmChase = GUI modes",
+  "ViewMode": "Lit",
+  "ClockSpeed": 1.0,
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {
+        "ImageType": 0,
+        "Width": 960,
+        "Height": 540,
+        "FOV_Degrees": 90,
+        "TargetGamma": 2.2,
+        "AutoExposureSpeed": 100,
+        "AutoExposureBias": 0,
+        "AutoExposureMaxBrightness": 1.0,
+        "AutoExposureMinBrightness": 0.03,
+        "MotionBlurAmount": 0
+      }
+    ]
+  },
+  "Vehicles": {
+    "Drone1": {
+      "VehicleType": "SimpleFlight",
+      "AutoCreate": true,
+      "Cameras": {
+        "front_center": {
+          "X": 0.46,
+          "Y": 0.0,
+          "Z": 0.0,
+          "Pitch": -15,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 960,
+              "Height": 720,
+              "FOV_Degrees": 100,
+              "TargetGamma": 2.2,
+              "AutoExposureSpeed": 100,
+              "AutoExposureBias": 0,
+              "AutoExposureMaxBrightness": 1.0,
+              "AutoExposureMinBrightness": 0.03,
+              "MotionBlurAmount": 0
+            }
+          ]
+        },
+        "0": {
+          "X": 0.46,
+          "Y": 0.0,
+          "Z": 0.0,
+          "Pitch": -12,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 960,
+              "Height": 540,
+              "FOV_Degrees": 90,
+              "TargetGamma": 2.2,
+              "AutoExposureSpeed": 100,
+              "AutoExposureBias": 0,
+              "AutoExposureMaxBrightness": 1.0,
+              "AutoExposureMinBrightness": 0.03,
+              "MotionBlurAmount": 0
+            }
+          ]
+        },
+        "bottom_center": {
+          "X": 0.0,
+          "Y": 0.0,
+          "Z": 0.2,
+          "Pitch": -90,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 960,
+              "Height": 720,
+              "FOV_Degrees": 115,
+              "TargetGamma": 2.2,
+              "AutoExposureSpeed": 100,
+              "AutoExposureBias": 0,
+              "AutoExposureMaxBrightness": 1.0,
+              "AutoExposureMinBrightness": 0.03,
+              "MotionBlurAmount": 0
+            }
+          ]
+        },
+        "down_left": {
+          "X": 0.0,
+          "Y": -0.06,
+          "Z": 0.2,
+          "Pitch": -90,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 960,
+              "Height": 720,
+              "FOV_Degrees": 115,
+              "TargetGamma": 2.2,
+              "AutoExposureSpeed": 100,
+              "AutoExposureBias": 0,
+              "AutoExposureMaxBrightness": 1.0,
+              "AutoExposureMinBrightness": 0.03,
+              "MotionBlurAmount": 0
+            }
+          ]
+        },
+        "down_right": {
+          "X": 0.0,
+          "Y": 0.06,
+          "Z": 0.2,
+          "Pitch": -90,
+          "Roll": 0,
+          "Yaw": 0,
+          "CaptureSettings": [
+            {
+              "ImageType": 0,
+              "Width": 960,
+              "Height": 720,
+              "FOV_Degrees": 115,
+              "TargetGamma": 2.2,
+              "AutoExposureSpeed": 100,
+              "AutoExposureBias": 0,
+              "AutoExposureMaxBrightness": 1.0,
+              "AutoExposureMinBrightness": 0.03,
+              "MotionBlurAmount": 0
+            }
+          ]
+        }
+      },
+      "Sensors": {
+        "LidarSensor1": {
+          "SensorType": 6,
+          "Enabled": true,
+          "NumberOfChannels": 16,
+          "RotationsPerSecond": 10,
+          "PointsPerSecond": 100000,
+          "Range": 30,
+          "X": 0.0,
+          "Y": 0.0,
+          "Z": 0.0,
+          "Roll": 0,
+          "Pitch": 0,
+          "Yaw": 0,
+          "VerticalFOVUpper": 15,
+          "VerticalFOVLower": -45,
+          "HorizontalFOVStart": -180,
+          "HorizontalFOVEnd": 180,
+          "DrawDebugPoints": false,
+          "DataFrame": "SensorLocalFrame"
+        },
+        "TOP_LEFT": {
+          "SensorType": 5,
+          "Enabled": true,
+          "X": 0.28,
+          "Y": -0.28,
+          "Z": 0.6,
+          "Yaw": 0,
+          "Pitch": -90,
+          "Roll": 0,
+          "MinDistance": 0.05,
+          "MaxDistance": 20.0,
+          "DrawDebugPoints": false,
+          "ExternalController": false
+        },
+        "TOP_RIGHT": {
+          "SensorType": 5,
+          "Enabled": true,
+          "X": 0.28,
+          "Y": 0.28,
+          "Z": 0.6,
+          "Yaw": 0,
+          "Pitch": -90,
+          "Roll": 0,
+          "MinDistance": 0.05,
+          "MaxDistance": 20.0,
+          "DrawDebugPoints": false,
+          "ExternalController": false
+        },
+        "BOTTOM_LEFT": {
+          "SensorType": 5,
+          "Enabled": true,
+          "X": -0.28,
+          "Y": -0.28,
+          "Z": 0.6,
+          "Yaw": 0,
+          "Pitch": -90,
+          "Roll": 0,
+          "MinDistance": 0.05,
+          "MaxDistance": 20.0,
+          "DrawDebugPoints": false,
+          "ExternalController": false
+        },
+        "BOTTOM_RIGHT": {
+          "SensorType": 5,
+          "Enabled": true,
+          "X": -0.28,
+          "Y": 0.28,
+          "Z": 0.6,
+          "Yaw": 0,
+          "Pitch": -90,
+          "Roll": 0,
+          "MinDistance": 0.05,
+          "MaxDistance": 20.0,
+          "DrawDebugPoints": false,
+          "ExternalController": false
+        },
+        "CENTER": {
+          "SensorType": 5,
+          "Enabled": true,
+          "X": 0,
+          "Y": 0,
+          "Z": 0.6,
+          "Yaw": 0,
+          "Pitch": -90,
+          "Roll": 0,
+          "MinDistance": 0.05,
+          "MaxDistance": 20.0,
+          "DrawDebugPoints": false,
+          "ExternalController": false
+        }
+      }
+    }
+  }
+}

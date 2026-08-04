@@ -8,16 +8,22 @@ uses:
 * bottom camera only;
 * immutable user-selected visual identity;
 * horizontal LiDAR sectors only;
-* AirSim API Z for all vertical state;
+* AirSim API Z during normal visual flight;
+* calibrated five-beam range height during final approach and a controlled terminal exploration window;
 * AirSim collision API as the touchdown signal;
 * a collision-gated landing reward bank.
 """
 
 from __future__ import annotations
 
+import builtins
+import csv
 from dataclasses import dataclass
+import json
 import math
+from pathlib import Path
 import time
+import threading
 from typing import Any, Callable, Optional
 
 import cv2
@@ -37,6 +43,14 @@ from observation_builder import (
     ObservationBuilderConfig,
 )
 from resnet_yolo_tracker import YoloResNetTracker
+from range_finder_array import RangeFinderArray, RangeFinderArrayConfig, SENSOR_NAMES
+
+
+def _landing_console_print(text: str) -> None:
+    """Print only the final landing-decision block, bypassing quiet runtime mode."""
+    printer = getattr(builtins, "_rl_original_print", builtins.print)
+    printer(text, flush=True)
+
 
 
 @dataclass
@@ -44,13 +58,56 @@ class Agent2Config:
     vehicle_name: str = "Drone1"
     bottom_camera_name: str = "bottom_center"
     lidar_sensor_name: str = "LidarSensor1"
+    range_sensor_names: tuple[str, ...] = SENSOR_NAMES
+    range_min_distance_m: float = 0.05
+    range_max_distance_m: float = 20.0
+    range_min_valid_count: int = 4
+    range_safe_spread_m: float = 0.25
+    range_sensor_final_enabled: bool = True
+    range_sensor_final_entry_m: float = 1.50
+    range_sensor_final_stop_m: float = 0.35
+    range_terminal_contact_vz_mps: float = 0.18
+    range_terminal_contact_max_duration_s: float = 7.00  # Legacy compatibility only.
+    range_terminal_contact_max_steps: int = 50
+    # Low-altitude Z is range/controller governed. Agent 2 may request a climb
+    # only when current geometry provides a physical justification.
+    range_terminal_climb_max_vz_mps: float = 0.35
+    range_terminal_climb_center_error_threshold: float = 0.25
+    range_terminal_climb_spread_threshold_m: float = 0.25
+    # Pre-arm above the 0.35 m handoff floor. AirSim control/perception steps
+    # can cover more than the old 0.25 m arming band at 0.65 m/s, so a safe
+    # snapshot is latched up to 1.00 m and refreshed while descending. The
+    # actual one-way terminal handoff still occurs only at/below 0.35 m or
+    # when the already-armed range geometry becomes invalid.
+    range_terminal_contact_arm_max_height_m: float = 1.00
+    range_terminal_contact_latch_max_age_s: float = 3.00
+    range_sensor_final_recent_vision_s: float = 2.00
+    range_sensor_final_max_center_error_m: float = 0.25
+    range_sensor_final_min_similarity: float = 0.65
+    range_require_calibration: bool = True
     image_width: int = 960
     image_height: int = 720
 
-    cmd_duration_s: float = 0.10
+    # Optional scalar-only capture for offline Kalman replay. Disabled by
+    # default so normal training does not recreate historical diagnostic files.
+    kalman_diagnostic_logging_enabled: bool = False
+    kalman_diagnostic_output_dir: str = "outputs/kalman_live_diagnostics"
+
+    cmd_duration_s: float = 0.25
+    # Agent-2-only first-contact monitor. The monitor polls AirSim while the
+    # fused Agent-1/Agent-2 command is executing and cancels that command on
+    # the first new collision, before the drone can bounce or slide.
+    collision_poll_interval_s: float = 0.010
+    collision_stop_duration_s: float = 0.050
     vx_scale_mps: float = 1.20
     vy_scale_mps: float = 1.20
     vz_scale_mps: float = 0.65
+    # Forced-contact diagnostic mode: whenever the bottom camera has a LIVE
+    # MATCH, Agent 2 commands a deterministic positive NED-Z descent until
+    # first collision. This intentionally bypasses alignment/lock/PPO Z gates
+    # so the contact-monitor path can be tested under guaranteed impact.
+    force_descent_while_bottom_match: bool = False
+    forced_bottom_match_descent_vz_mps: float = 0.65
     yaw_scale_dps: float = 25.0
     max_episode_steps: int = 900
 
@@ -242,6 +299,39 @@ class Agent2Config:
     landing_anchor_edge_center_alpha: float = 0.98
     landing_anchor_max_outside_frame_ratio: float = 0.75
 
+    # Terminal landing anchor. A reliable roof point is acquired while the full
+    # target is still visible. Near touchdown, this point is propagated by local
+    # forward/backward optical flow and is no longer replaced by a new detector
+    # BBox center. This prevents a seat/window/edge crop from becoming the XY
+    # landing reference when the car fills the bottom camera.
+    terminal_anchor_enabled: bool = True
+    terminal_anchor_lock_min_height_m: float = 0.20
+    terminal_anchor_lock_max_height_m: float = 2.20
+    terminal_anchor_lock_min_similarity: float = 0.70
+    terminal_anchor_lock_max_center_error: float = 0.34
+    terminal_anchor_lock_min_area_norm: float = 0.010
+    terminal_anchor_lock_max_area_norm: float = 0.55
+    terminal_anchor_min_live_streak: int = 3
+    terminal_anchor_acquire_streak_required: int = 2
+    terminal_anchor_edge_margin_px: float = 12.0
+    terminal_anchor_candidate_max_jump_norm: float = 0.060
+    terminal_anchor_flow_patch_radius_ratio: float = 0.30
+    terminal_anchor_flow_patch_min_px: int = 40
+    terminal_anchor_flow_patch_max_px: int = 150
+    terminal_anchor_flow_max_corners: int = 80
+    terminal_anchor_flow_quality_level: float = 0.010
+    terminal_anchor_flow_min_distance_px: float = 5.0
+    terminal_anchor_flow_window_px: int = 21
+    terminal_anchor_flow_max_level: int = 3
+    terminal_anchor_flow_min_points: int = 6
+    terminal_anchor_flow_max_forward_backward_error_px: float = 1.50
+    terminal_anchor_flow_max_step_norm: float = 0.12
+    terminal_anchor_live_correction_alpha: float = 0.12
+    terminal_anchor_live_correction_max_jump_norm: float = 0.080
+    terminal_anchor_max_hold_steps: int = 3
+    terminal_anchor_identity_grace_steps: int = 10
+    terminal_anchor_freeze_adaptive_bank: bool = True
+
     # Controlled descent during horizontal catch-up. Catch-up is not itself a
     # vertical hazard: when the target is a confirmed LIVE match, remains well
     # inside the bottom image, and its predicted image motion is not diverging,
@@ -261,18 +351,29 @@ class Agent2Config:
     catchup_descent_max_metric_outward_speed_mps: float = 1.50
 
     # Adaptive multi-scale landing appearance memory. The two immutable identity
-    # anchors are never replaced. Recent close-range embeddings are appended to
-    # a small FIFO only after a strong LIVE match also agrees with an immutable
-    # anchor, preventing PRED/self-reinforcement drift.
+    # anchors are never replaced. The adaptive half-bank is refreshed in-place
+    # with recent verified LIVE views; guarded immutable agreement and spatial
+    # continuity prevent PRED/self-reinforcement drift.
     adaptive_embedding_enabled: bool = True
     adaptive_embedding_max_entries: int = 8
-    adaptive_embedding_update_interval_steps: int = 3
+    adaptive_embedding_update_interval_steps: int = 4
     adaptive_embedding_identity_floor: float = 0.52
     adaptive_embedding_add_min_identity_similarity: float = 0.62
     adaptive_embedding_add_min_combined_similarity: float = 0.68
-    adaptive_embedding_novelty_max_similarity: float = 0.985
-    adaptive_embedding_bbox_scales: tuple[float, ...] = (1.00, 1.16, 1.32)
-    adaptive_embedding_max_additions_per_update: int = 2
+    adaptive_embedding_novelty_max_similarity: float = 0.997
+    adaptive_embedding_bbox_scales: tuple[float, ...] = (1.00,)
+    adaptive_embedding_max_additions_per_update: int = 1
+    # Add a new appearance only after a cumulative target-scale change of at
+    # least 25% relative to the last snapshot accepted into the bank.
+    adaptive_embedding_min_scale_change_ratio: float = 0.15
+    adaptive_embedding_min_live_streak: int = 3
+    adaptive_embedding_max_center_jump_norm: float = 0.18
+    adaptive_embedding_max_area_ratio_change: float = 2.20
+    adaptive_embedding_force_refresh_age_steps: int = 16
+    adaptive_embedding_chain_min_combined_similarity: float = 0.82
+    adaptive_embedding_chain_min_margin: float = 0.04
+    adaptive_embedding_chain_max_spatial_jump_norm: float = 0.10
+    adaptive_embedding_freeze_below_height_m: float = 1.50
 
     lidar_max_range_m: float = 20.0
     obstacle_emergency_m: float = 0.55
@@ -286,10 +387,79 @@ class Agent2Config:
     good_collision_center_error: float = 0.32
     good_collision_bbox_rel_error: float = 0.58
     good_collision_recent_match_steps: int = 4
-    collision_latch_max_age_steps: int = 6
-    collision_latch_center_error: float = 0.10
-    collision_latch_bbox_rel_error: float = 0.15
-    collision_latch_min_similarity: float = 0.65
+
+    # Touchdown alignment is projected from the calibrated raw LIVE BBox into
+    # physical metres using target-relative height, camera HFOV and frame aspect.
+    collision_xy_threshold_m: float = 0.45
+    touchdown_legacy_window_steps: int = 12
+    collision_geometric_max_measurement_age_steps: int = 120
+    collision_geometric_min_height_m: float = 0.05
+    collision_geometric_max_height_m: float = 8.0
+    collision_latch_max_age_steps: int = 2
+    # Touchdown success has exactly three gates:
+    # 1) a physical contact event, 2) semantic ``user_target`` identity from a
+    # fresh neural MATCH, valid terminal continuity, or contact-frame neural
+    # appearance, and 3) calibrated metric center error within the threshold.
+    # Simulator actor names and YOLO class labels are diagnostic only.
+    collision_latch_center_error: float = 0.15  # normalized controller diagnostic only
+    collision_latch_center_error_m: float = 0.25
+    collision_latch_bbox_rel_error: float = 0.15  # quality/log compatibility only
+    collision_latch_min_similarity: float = 0.65  # quality/log compatibility only
+
+    # Terminal semantic-drift fallback. This does not alter the controller or
+    # the primary BEST touchdown path. It is evaluated only when physical
+    # contact and semantic identity pass but the final metric center sample
+    # is missing or above threshold.
+    terminal_fallback_enabled: bool = True
+    terminal_fallback_recent_samples: int = 5
+    terminal_fallback_min_samples: int = 5
+    terminal_fallback_center_median_m: float = 0.20
+    terminal_fallback_mean_relative_speed_mps: float = 0.40
+    terminal_fallback_max_relative_speed_mps: float = 0.80
+    terminal_fallback_min_velocity_samples: int = 3
+    terminal_fallback_max_bbox_rel_error: float = 0.35
+    terminal_fallback_min_similarity: float = 0.65
+
+    # Experimental stale-identity bridge. A confirmed semantic sample may remain
+    # eligible for up to eight steps only when the recent terminal trajectory is
+    # substantially stronger than the normal fallback requirements.
+    terminal_fallback_identity_bridge_enabled: bool = True
+    terminal_fallback_identity_bridge_max_age_steps: int = 8
+    terminal_fallback_identity_bridge_min_similarity: float = 0.70
+    terminal_fallback_identity_bridge_max_bbox_rel_error: float = 0.35
+    terminal_fallback_identity_bridge_center_median_m: float = 0.18
+    terminal_fallback_identity_bridge_mean_relative_speed_mps: float = 0.35
+    terminal_fallback_identity_bridge_max_relative_speed_mps: float = 0.70
+
+    # Last-valid center latch. This terminal semantic-drift fallback is
+    # refreshed only by a confirmed LIVE BBox whose
+    # appearance and geometry are reliable. When the close-range image becomes
+    # distorted, the last trustworthy per-frame metric center error is held.
+    terminal_last_valid_center_enabled: bool = True
+    terminal_last_valid_center_min_similarity: float = 0.70
+    terminal_last_valid_center_max_bbox_rel_error: float = 0.35
+    terminal_last_valid_center_max_age_steps: int = 8  # Compatibility diagnostic.
+    terminal_last_valid_center_max_age_s: float = 3.50
+    terminal_last_valid_center_error_m: float = 0.25
+
+    # Kalman terminal bridge. Once deterministic landing descent has
+    # started from a trustworthy LIVE match, a close-range visual rejection
+    # switches to a bounded predict-only Kalman state. Z continues and XY uses
+    # the predicted relative state instead of a distorted BBox.
+    terminal_blind_descent_enabled: bool = True
+    terminal_blind_descent_max_height_m: float = 1.50
+    terminal_blind_descent_max_duration_s: float = 3.00
+    terminal_kalman_enabled: bool = True
+    terminal_kalman_max_position_std_m: float = 0.60
+    terminal_kalman_rpc_center_error_m: float = 0.25
+
+    # Terminal landing-quality reward. These terms change reward magnitude only
+    # and are deliberately excluded from the binary touchdown success gate.
+    landing_quality_center_bonus: float = 500.0
+    landing_quality_bbox_rel_bonus: float = 300.0
+    landing_quality_similarity_bonus: float = 200.0
+    landing_quality_bbox_rel_reference: float = 0.60
+    landing_quality_similarity_reference: float = 0.65
 
     # Direct contact-frame appearance test. Several centered crops are compared
     # with the immutable bottom-view target anchor. Corner crops act as a
@@ -306,10 +476,10 @@ class Agent2Config:
     authorized_descent_min_vz_mps: float = 1.0e-4
     authorized_descent_extreme_live_center_error: float = 0.55
 
-    # The first verified, aligned, non-ground touchdown auto-locks the AirSim
-    # collision object name (for example Porsche_BP_C_1). Later rewards require
-    # the same object. This prevents Floor_0/terrain contacts from becoming
-    # successes while avoiding a hard-coded Unreal actor name.
+    # Legacy simulator collision-name settings are retained only for diagnostics
+    # and RPC plumbing. They never grant or veto touchdown success. A real system
+    # replaces the generic contact event with a physical contact sensor while
+    # semantic identity remains entirely vision-derived.
     collision_object_auto_lock: bool = True
     collision_ground_tokens: tuple[str, ...] = ("floor", "ground", "landscape", "terrain")
 
@@ -317,6 +487,18 @@ class Agent2Config:
     success_min_reward: float = 800.0
     success_max_reward: float = 6000.0
     wrong_collision_penalty: float = 1500.0
+
+    # Successful touchdown visualization. The RPC is called only after a new
+    # target collision has already passed the strict XY/contact success gate.
+    # PPO receives the terminal success reward, the drone is snapped to the
+    # roof anchor, the result is held briefly, and the wrapper then resets the
+    # next episode normally.
+    latch_on_success: bool = True
+    # The verified standalone RPC test uses AirSim's default vehicle key.
+    latch_vehicle_name: str = ""
+    latch_target_actor_name: str = "BP_X6M_C_1"
+    latch_anchor_component_name: str = "DroneLandingAnchor"
+    latch_success_hold_seconds: float = 5.0
 
     # Dense Agent-2 reward. Agent 2 owns only Z in AGENT_1P2, therefore it is
     # rewarded only for real, aligned height progress and is not paid merely for
@@ -362,12 +544,74 @@ class Agent2LandingEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
+    # Process-wide cache: the calibration JSON is read at most once for each
+    # absolute file path, even if Stable-Baselines creates more than one env.
+    _bottom_center_calibration_cache: dict[str, tuple[float, float, str]] = {}
+
+    @classmethod
+    def _load_bottom_center_calibration_once(
+        cls,
+        calibration_path: Path,
+    ) -> tuple[float, float, str]:
+        absolute_path = str(calibration_path.resolve())
+        cached = cls._bottom_center_calibration_cache.get(absolute_path)
+        if cached is not None:
+            return cached
+
+        target_x = 0.5
+        target_y = 0.5
+        source = "DEFAULT_IMAGE_CENTER"
+        try:
+            payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+            target = payload.get("target", {})
+            target_x = float(target["bbox_center_x_norm"])
+            target_y = float(target["bbox_center_y_norm"])
+            if not (0.0 <= target_x <= 1.0 and 0.0 <= target_y <= 1.0):
+                raise ValueError(
+                    f"calibrated target must be normalized to [0, 1], got "
+                    f"({target_x}, {target_y})"
+                )
+            source = absolute_path
+        except FileNotFoundError:
+            print(
+                "[BOTTOM CENTER CALIBRATION] JSON not found; using image center "
+                f"(0.500000, 0.500000) | path={absolute_path}"
+            )
+        except Exception as exc:
+            print(
+                "[BOTTOM CENTER CALIBRATION] Invalid JSON; using image center "
+                f"(0.500000, 0.500000) | path={absolute_path} error={exc}"
+            )
+
+        result = (float(target_x), float(target_y), str(source))
+        cls._bottom_center_calibration_cache[absolute_path] = result
+        return result
+
     def __init__(self, cfg: Agent2Config | None = None):
         super().__init__()
         self.cfg = cfg or Agent2Config()
 
+        self._bottom_center_calibration_path = (
+            Path(__file__).resolve().parent
+            / "config"
+            / "bottom_bbox_center_calibration.json"
+        )
+        (
+            self._bottom_center_target_x_norm,
+            self._bottom_center_target_y_norm,
+            self._bottom_center_calibration_source,
+        ) = self._load_bottom_center_calibration_once(
+            self._bottom_center_calibration_path
+        )
+        print(
+            "[BOTTOM CENTER CALIBRATION] loaded once | "
+            f"target=({self._bottom_center_target_x_norm:.6f},"
+            f"{self._bottom_center_target_y_norm:.6f}) "
+            f"source={self._bottom_center_calibration_source}"
+        )
+
         self.action_space = spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
-        self.observation_space = spaces.Box(-1.0, 1.0, shape=(37,), dtype=np.float32)
+        self.observation_space = spaces.Box(-1.0, 1.0, shape=(46,), dtype=np.float32)
 
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
@@ -386,6 +630,28 @@ class Agent2LandingEnv(gym.Env):
         )
         self.lidar_processor = LidarProcessor(
             LidarProcessorConfig(max_range_m=self.cfg.lidar_max_range_m)
+        )
+        self.range_finder_array = RangeFinderArray(
+            RangeFinderArrayConfig(
+                min_distance_m=float(self.cfg.range_min_distance_m),
+                max_distance_m=float(self.cfg.range_max_distance_m),
+                min_valid_count=int(self.cfg.range_min_valid_count),
+                safe_spread_m=float(self.cfg.range_safe_spread_m),
+                sensor_final_entry_m=float(self.cfg.range_sensor_final_entry_m),
+                sensor_final_stop_m=float(self.cfg.range_sensor_final_stop_m),
+            )
+        )
+        if bool(self.cfg.range_require_calibration) and not self.range_finder_array.calibration_loaded:
+            raise RuntimeError(
+                "A PASS range-finder calibration is required for Agent 2. "
+                "Run calibrate_and_test_range_finders.py and verify "
+                "config/range_finder_calibration.json before training."
+            )
+        print(
+            "[RANGE CALIBRATION] loaded="
+            f"{int(self.range_finder_array.calibration_loaded)} "
+            f"path={self.range_finder_array.config.calibration_path} "
+            f"bias={self.range_finder_array.sensor_bias_m}"
         )
         self.tracker = YoloResNetTracker(
             yolo_model_path="yolo11s.pt",
@@ -409,8 +675,13 @@ class Agent2LandingEnv(gym.Env):
         self._reference_embeddings: list[torch.Tensor] = []
         self._adaptive_embeddings: list[torch.Tensor] = []
         self._adaptive_embedding_steps: list[int] = []
+        self._adaptive_embedding_scales: list[float] = []
         self._last_adaptive_embedding_update_step = -999999
+        self._last_adaptive_bbox_xywh = None
         self._adaptive_embedding_updates = 0
+        self._adaptive_bank_replace_index = 0
+        self._adaptive_bank_cycle = 0
+        self._adaptive_bank_last_action = "EMPTY"
         self._target_id = "user_target"
         self._target_class_id: Optional[int] = None
         self._last_bbox_xyxy: Optional[np.ndarray] = None
@@ -426,6 +697,21 @@ class Agent2LandingEnv(gym.Env):
         self._landing_anchor_reference_height_m: Optional[float] = None
         self._landing_anchor_mode = "INIT"
         self._landing_anchor_edge_flags = "NONE"
+
+        # Terminal anchor state is independent of the detector BBox. Once locked,
+        # it follows the same physical roof point with optical flow until reset.
+        self._terminal_anchor_locked = False
+        self._terminal_anchor_px: Optional[np.ndarray] = None
+        self._terminal_anchor_previous_gray: Optional[np.ndarray] = None
+        self._terminal_anchor_support_bbox_xyxy: Optional[np.ndarray] = None
+        self._terminal_anchor_candidate_px: Optional[np.ndarray] = None
+        self._terminal_anchor_acquire_streak = 0
+        self._terminal_anchor_lock_step = -999999
+        self._terminal_anchor_last_identity_step = -999999
+        self._terminal_anchor_age_steps = 999999
+        self._terminal_anchor_source = "INACTIVE"
+        self._terminal_anchor_flow_points = 0
+        self._terminal_anchor_flow_confidence = 0.0
         self._last_bottom_observation_monotonic = 0.0
         self._last_similarity = 0.0
         self._last_candidate_class_id: Optional[int] = None
@@ -448,6 +734,19 @@ class Agent2LandingEnv(gym.Env):
         self._target_surface_altitude_m = float(self.cfg.static_target_surface_altitude_m)
         self._target_surface_source = "configured_static"
 
+        # Scalar-only live diagnostic session. No frames or arrays are retained.
+        self._kalman_diag_session_started = time.strftime("%Y%m%d_%H%M%S")
+        self._kalman_diag_start_monotonic = float(time.monotonic())
+        self._kalman_diag_last_monotonic: Optional[float] = None
+        self._kalman_diag_csv_path: Optional[Path] = None
+        self._kalman_diag_header_written = False
+        self._diag_raw_metric_x_m = float("nan")
+        self._diag_raw_metric_y_m = float("nan")
+        self._diag_external_vx_mps = float("nan")
+        self._diag_external_vy_mps = float("nan")
+        self._diag_velocity_measurement_valid = False
+        self._init_kalman_diagnostic_logger()
+
         self._step = 0
         self._reward_bank = 0.0
         self._episode_return = 0.0
@@ -463,6 +762,9 @@ class Agent2LandingEnv(gym.Env):
         self._last_verified_alignment_center_error = 999.0
         self._last_verified_alignment_bbox_rel_error = 999.0
         self._last_verified_alignment_similarity = 0.0
+        self._last_verified_alignment_err_x = 999.0
+        self._last_verified_alignment_err_y = 999.0
+        self._last_verified_alignment_height_m = float("inf")
 
         # Physical descent authorization evidence. Unlike the visual latch,
         # this is refreshed only when a non-zero descent command is actually
@@ -472,11 +774,31 @@ class Agent2LandingEnv(gym.Env):
         self._last_authorized_descent_center_error = 999.0
         self._last_authorized_descent_bbox_rel_error = 999.0
         self._last_authorized_descent_similarity = 0.0
+        self._last_authorized_descent_err_x = 999.0
+        self._last_authorized_descent_err_y = 999.0
+        self._last_authorized_descent_height_m = float("inf")
         self._last_authorized_descent_vz_mps = 0.0
         self._authorized_descent_invalidated_reason = "never_authorized"
 
-        self._expected_collision_object_name = ""
-        self._expected_collision_object_source = "unlocked"
+        self._expected_collision_object_name = str(
+            self._target_actor_name or self.cfg.latch_target_actor_name or ""
+        )
+        self._expected_collision_object_source = "configured_target_actor"
+        self._touchdown_legacy_window: list[dict[str, Any]] = []
+        self._touchdown_ready_snapshot: dict[str, Any] | None = None
+        self._range_terminal_contact_snapshot: dict[str, Any] | None = None
+        self._range_terminal_handoff_timed_out = False
+        self._last_valid_center_error_m = float("inf")
+        self._last_valid_center_step = -999999
+        self._last_valid_center_monotonic = float("-inf")
+        self._last_valid_center_similarity = 0.0
+        self._last_valid_center_bbox_rel_error = float("inf")
+        self._last_valid_center_source = "NONE"
+        self._terminal_kalman_state: Optional[np.ndarray] = None
+        self._terminal_kalman_covariance = np.eye(4, dtype=np.float64)
+        self._terminal_kalman_monotonic = float("-inf")
+        self._terminal_descent_committed = False
+        self._terminal_blind_descent_started_monotonic = float("-inf")
 
         # Most recent raw bottom-camera frame. It is used only when AirSim
         # reports a new collision, so contact appearance adds no per-step
@@ -604,13 +926,31 @@ class Agent2LandingEnv(gym.Env):
         self._external_command_executor: Optional[
             Callable[[float], dict[str, Any]]
         ] = None
+        # Agent 2 remains the only owner of collision polling. This callback
+        # performs motion cancellation only, on the command-owning Agent-1
+        # environment/client, after Agent 2 detects first contact.
+        self._external_motion_stop_callback: Optional[Callable[[str], None]] = None
         self._last_external_command_info: dict[str, Any] = {}
+
+        # Collision ownership is deliberately restricted to Agent 2 during the
+        # parallel landing phase. A dedicated AirSim client polls independently
+        # while the blocking fused command is in flight.
+        self._collision_monitor_client: Optional[Any] = None
+        self._collision_monitor_lock = threading.Lock()
+        self._collision_monitor_latched: Optional[tuple[str, int]] = None
 
     def set_external_command_executor(
         self,
         executor: Optional[Callable[[float], dict[str, Any]]],
     ) -> None:
         self._external_command_executor = executor
+
+    def set_external_motion_stop_callback(
+        self,
+        callback: Optional[Callable[[str], None]],
+    ) -> None:
+        """Register a cancellation callback; it must never poll collision."""
+        self._external_motion_stop_callback = callback
 
     def get_target_velocity_feedforward_body(self) -> tuple[float, float, bool]:
         """Return visually estimated target velocity in drone body axes.
@@ -659,10 +999,17 @@ class Agent2LandingEnv(gym.Env):
         live_match = bool(info.get("bottom_match_live", False))
         tracker_mode = str(info.get("tracker_mode", ""))
         visual_age = float(info.get("visual_motion_age_s", float("inf")))
+        terminal_kalman_prediction = bool(
+            info.get("terminal_kalman_prediction_active", False)
+        )
         prediction_only = bool(
             not live_match
-            and tracker_mode.startswith("PRED")
-            and visual_age <= float(self.cfg.bottom_pred_guidance_max_age_s)
+            and (tracker_mode.startswith("PRED") or terminal_kalman_prediction)
+            and visual_age <= (
+                float(self.cfg.terminal_blind_descent_max_duration_s)
+                if terminal_kalman_prediction
+                else float(self.cfg.bottom_pred_guidance_max_age_s)
+            )
             and bool(info.get("visual_relative_velocity_valid", False))
         )
         guidance_active = bool(
@@ -1044,8 +1391,13 @@ class Agent2LandingEnv(gym.Env):
         self._reference_embeddings = [self._original_embedding.detach().clone()]
         self._adaptive_embeddings = []
         self._adaptive_embedding_steps = []
+        self._adaptive_embedding_scales = []
         self._last_adaptive_embedding_update_step = -999999
+        self._last_adaptive_bbox_xywh = None
         self._adaptive_embedding_updates = 0
+        self._adaptive_bank_replace_index = 0
+        self._adaptive_bank_cycle = 0
+        self._adaptive_bank_last_action = "EMPTY"
         self._target_class_id = None if class_id is None else int(class_id)
 
         # The internal tracker is used only as a detector/embedding backend.
@@ -1111,26 +1463,51 @@ class Agent2LandingEnv(gym.Env):
             max(1, int(round(y2 - y1))),
         ]
 
-    def _append_adaptive_embedding(self, embedding: torch.Tensor) -> bool:
-        """Append a novel normalized embedding to the bounded adaptive FIFO."""
-        if embedding is None:
+    def _append_adaptive_embedding(
+        self,
+        embedding: torch.Tensor,
+        bbox_scale: float,
+    ) -> bool:
+        """Append until full, then refresh the left half and right half in order.
+
+        Immutable anchors live in ``_reference_embeddings`` and are never touched.
+        The adaptive bank is chronological: after filling N entries, slots
+        0..N/2-1 are replaced by newer verified views, then slots N/2..N-1.
+        This keeps landing appearances current instead of preserving stale scales.
+        """
+        if embedding is None or not np.isfinite(float(bbox_scale)):
             return False
         candidate = F.normalize(embedding.detach().clone(), dim=0)
         if not hasattr(self, "_adaptive_embeddings"):
             self._adaptive_embeddings = []
         if not hasattr(self, "_adaptive_embedding_steps"):
             self._adaptive_embedding_steps = []
-        novelty_limit = float(self.cfg.adaptive_embedding_novelty_max_similarity)
-        for existing in self._adaptive_embeddings:
-            similarity = float(torch.dot(existing, candidate).detach().cpu().item())
-            if similarity >= novelty_limit:
-                return False
-        self._adaptive_embeddings.append(candidate)
-        self._adaptive_embedding_steps.append(int(self._step))
+        if not hasattr(self, "_adaptive_embedding_scales"):
+            self._adaptive_embedding_scales = []
+
         max_entries = max(1, int(self.cfg.adaptive_embedding_max_entries))
-        while len(self._adaptive_embeddings) > max_entries:
-            self._adaptive_embeddings.pop(0)
-            self._adaptive_embedding_steps.pop(0)
+        step = int(getattr(self, "_step", 0))
+        if len(self._adaptive_embeddings) < max_entries:
+            self._adaptive_embeddings.append(candidate)
+            self._adaptive_embedding_steps.append(step)
+            self._adaptive_embedding_scales.append(float(bbox_scale))
+            self._adaptive_bank_last_action = "APPEND"
+            return True
+
+        replace_index = int(getattr(self, "_adaptive_bank_replace_index", 0)) % max_entries
+        half = max(1, max_entries // 2)
+        self._adaptive_embeddings[replace_index] = candidate
+        self._adaptive_embedding_steps[replace_index] = step
+        self._adaptive_embedding_scales[replace_index] = float(bbox_scale)
+        self._adaptive_bank_last_action = (
+            "REPLACE_LEFT" if replace_index < half else "REPLACE_RIGHT"
+        )
+        next_index = (replace_index + 1) % max_entries
+        self._adaptive_bank_replace_index = next_index
+        if next_index == 0:
+            self._adaptive_bank_cycle = int(
+                getattr(self, "_adaptive_bank_cycle", 0)
+            ) + 1
         return True
 
     def _maybe_update_adaptive_embedding_bank(
@@ -1139,53 +1516,121 @@ class Agent2LandingEnv(gym.Env):
         bbox_xywh: Any,
         immutable_similarity: float,
         combined_similarity: float,
+        matched_adaptive_anchor: bool,
     ) -> int:
-        """Add verified close-range views without ever mutating identity anchors."""
+        """Refresh the adaptive bank with recent, strongly verified LIVE views."""
         if not bool(self.cfg.adaptive_embedding_enabled):
             return 0
-        interval = max(1, int(self.cfg.adaptive_embedding_update_interval_steps))
-        current_step = int(getattr(self, "_step", 0))
-        if current_step - int(getattr(self, "_last_adaptive_embedding_update_step", -999999)) < interval:
-            return 0
-        if immutable_similarity < float(
-            self.cfg.adaptive_embedding_add_min_identity_similarity
+        if bool(getattr(self.cfg, "terminal_anchor_freeze_adaptive_bank", True)) and bool(
+            getattr(self, "_terminal_anchor_locked", False)
         ):
             return 0
-        if combined_similarity < float(
-            self.cfg.adaptive_embedding_add_min_combined_similarity
-        ):
-            return 0
-
-        additions = 0
-        max_additions = max(
-            1, int(self.cfg.adaptive_embedding_max_additions_per_update)
+        last_height = float(
+            dict(getattr(self, "_last_info", {}) or {}).get(
+                "relative_height_to_target_m", float("inf")
+            )
         )
-        for scale in self.cfg.adaptive_embedding_bbox_scales:
-            scaled_bbox = self._scaled_bbox_xywh(bbox_xywh, scale, frame.shape)
-            if scaled_bbox is None:
-                continue
-            embedding = self.tracker._embedding_from_bbox(frame, scaled_bbox)
-            if embedding is None:
-                continue
-            immutable_scores = [
-                float(torch.dot(anchor, embedding).detach().cpu().item())
-                for anchor in self._reference_embeddings
-            ]
-            if not immutable_scores or max(immutable_scores) < float(
-                self.cfg.adaptive_embedding_add_min_identity_similarity
-            ):
-                continue
-            if self._append_adaptive_embedding(embedding):
-                additions += 1
-                if additions >= max_additions:
-                    break
+        if (
+            np.isfinite(last_height)
+            and last_height
+            <= float(getattr(self.cfg, "adaptive_embedding_freeze_below_height_m", 1.50))
+        ):
+            return 0
+        step = int(getattr(self, "_step", 0))
+        interval = max(1, int(self.cfg.adaptive_embedding_update_interval_steps))
+        if step - int(getattr(self, "_last_adaptive_embedding_update_step", -999999)) < interval:
+            return 0
+        if int(getattr(self, "_live_match_streak", 0)) < max(2, int(self.cfg.adaptive_embedding_min_live_streak)):
+            return 0
+        if combined_similarity < float(self.cfg.adaptive_embedding_add_min_combined_similarity):
+            return 0
 
-        if additions > 0:
-            self._last_adaptive_embedding_update_step = current_step
-            self._adaptive_embedding_updates = int(
-                getattr(self, "_adaptive_embedding_updates", 0)
-            ) + 1
-        return additions
+        immutable_trusted = bool(
+            immutable_similarity >= float(self.cfg.adaptive_embedding_add_min_identity_similarity)
+        )
+        guarded_adaptive_chain = bool(
+            matched_adaptive_anchor
+            and immutable_similarity >= float(self.cfg.adaptive_embedding_identity_floor)
+            and combined_similarity >= float(self.cfg.adaptive_embedding_chain_min_combined_similarity)
+            and float(getattr(self, "_last_match_margin", 0.0))
+            >= float(self.cfg.adaptive_embedding_chain_min_margin)
+            and float(getattr(self, "_last_spatial_jump_norm", 999.0))
+            <= float(self.cfg.adaptive_embedding_chain_max_spatial_jump_norm)
+        )
+        if not (immutable_trusted or guarded_adaptive_chain):
+            return 0
+
+        current_bbox = np.asarray(bbox_xywh, dtype=np.float32).reshape(-1)[:4]
+        if current_bbox.size < 4 or not np.all(np.isfinite(current_bbox)):
+            return 0
+        if current_bbox[2] < 2.0 or current_bbox[3] < 2.0:
+            return 0
+        current_area = max(1.0, float(current_bbox[2] * current_bbox[3]))
+
+        previous_bbox = getattr(self, "_last_adaptive_bbox_xywh", None)
+        if previous_bbox is not None:
+            previous_bbox = np.asarray(previous_bbox, dtype=np.float32).reshape(-1)[:4]
+            previous_area = max(1.0, float(previous_bbox[2] * previous_bbox[3]))
+            area_ratio = max(current_area / previous_area, previous_area / current_area)
+            if area_ratio > float(self.cfg.adaptive_embedding_max_area_ratio_change):
+                return 0
+            image_h, image_w = frame.shape[:2]
+            current_center = np.asarray(
+                [current_bbox[0] + 0.5 * current_bbox[2], current_bbox[1] + 0.5 * current_bbox[3]],
+                dtype=np.float32,
+            )
+            previous_center = np.asarray(
+                [previous_bbox[0] + 0.5 * previous_bbox[2], previous_bbox[1] + 0.5 * previous_bbox[3]],
+                dtype=np.float32,
+            )
+            center_jump = float(
+                np.linalg.norm(current_center - previous_center)
+                / max(1.0, float(np.hypot(image_w, image_h)))
+            )
+            if center_jump > float(self.cfg.adaptive_embedding_max_center_jump_norm):
+                return 0
+
+        embedding = self.tracker._embedding_from_bbox(frame, current_bbox)
+        if embedding is None:
+            return 0
+        immutable_scores = [
+            float(torch.dot(anchor, embedding).detach().cpu().item())
+            for anchor in self._reference_embeddings
+        ]
+        crop_immutable_similarity = max(immutable_scores, default=-1.0)
+        crop_trusted = bool(
+            crop_immutable_similarity >= float(self.cfg.adaptive_embedding_add_min_identity_similarity)
+            or (guarded_adaptive_chain and crop_immutable_similarity >= float(self.cfg.adaptive_embedding_identity_floor))
+        )
+        if not crop_trusted:
+            return 0
+
+        bank = list(getattr(self, "_adaptive_embeddings", []))
+        candidate = F.normalize(embedding.detach().clone(), dim=0)
+        max_bank_similarity = max(
+            (float(torch.dot(existing, candidate).detach().cpu().item()) for existing in bank),
+            default=-1.0,
+        )
+        oldest_age = max(
+            (step - int(saved_step) for saved_step in getattr(self, "_adaptive_embedding_steps", [])),
+            default=999999,
+        )
+        too_similar = bool(
+            max_bank_similarity > float(self.cfg.adaptive_embedding_novelty_max_similarity)
+            and oldest_age < int(self.cfg.adaptive_embedding_force_refresh_age_steps)
+        )
+        if too_similar:
+            return 0
+
+        image_h, image_w = frame.shape[:2]
+        bbox_scale = float(math.sqrt(current_area / max(1.0, float(image_w * image_h))))
+        if not self._append_adaptive_embedding(candidate, bbox_scale):
+            return 0
+
+        self._last_adaptive_embedding_update_step = step
+        self._last_adaptive_bbox_xywh = current_bbox.copy()
+        self._adaptive_embedding_updates = int(getattr(self, "_adaptive_embedding_updates", 0)) + 1
+        return 1
 
     @staticmethod
     def _validated_xyxy(bbox_xyxy: Any, frame_shape: tuple[int, ...]) -> Optional[np.ndarray]:
@@ -1298,6 +1743,10 @@ class Agent2LandingEnv(gym.Env):
         handoff_bbox = self._extract_agent1_handoff_bbox(agent1_env)
 
         self._target_actor_name = str(getattr(agent1_env, "train_target_car", "") or "")
+        self._expected_collision_object_name = str(
+            self._target_actor_name or self.cfg.latch_target_actor_name or ""
+        )
+        self._expected_collision_object_source = "agent1_target_actor"
         self._read_target_surface_altitude()
         self._attached_from_agent1 = True
         self._reset_runtime_state()
@@ -1399,6 +1848,10 @@ class Agent2LandingEnv(gym.Env):
 
         handoff_bbox = self._extract_agent1_handoff_bbox(agent1_env)
         self._target_actor_name = str(getattr(agent1_env, "train_target_car", "") or "")
+        self._expected_collision_object_name = str(
+            self._target_actor_name or self.cfg.latch_target_actor_name or ""
+        )
+        self._expected_collision_object_source = "agent1_target_actor"
         self._attached_from_agent1 = True
         self._reset_runtime_state()
 
@@ -1512,6 +1965,15 @@ class Agent2LandingEnv(gym.Env):
 
     def _reset_runtime_state(self) -> None:
         self.observation_builder.reset()
+        self.range_finder_array.reset()
+        self._range_terminal_contact_armed = False
+        self._range_terminal_contact_armed_monotonic = float("-inf")
+        self._range_terminal_contact_started_monotonic = float("-inf")
+        self._range_terminal_contact_started_step = -1
+        self._range_terminal_contact_last_safe_height_m = float("inf")
+        self._range_terminal_handoff_active = False
+        self._range_terminal_handoff_timed_out = False
+        self._range_terminal_contact_snapshot = None
         self._step = 0
         self._reward_bank = 0.0
         self._episode_return = 0.0
@@ -1524,13 +1986,32 @@ class Agent2LandingEnv(gym.Env):
         self._last_verified_alignment_center_error = 999.0
         self._last_verified_alignment_bbox_rel_error = 999.0
         self._last_verified_alignment_similarity = 0.0
+        self._last_verified_alignment_err_x = 999.0
+        self._last_verified_alignment_err_y = 999.0
+        self._last_verified_alignment_height_m = float("inf")
         self._authorized_descent_latched = False
         self._last_authorized_descent_step = -999999
         self._last_authorized_descent_center_error = 999.0
         self._last_authorized_descent_bbox_rel_error = 999.0
         self._last_authorized_descent_similarity = 0.0
+        self._last_authorized_descent_err_x = 999.0
+        self._last_authorized_descent_err_y = 999.0
+        self._last_authorized_descent_height_m = float("inf")
         self._last_authorized_descent_vz_mps = 0.0
         self._authorized_descent_invalidated_reason = "never_authorized"
+        self._touchdown_legacy_window = []
+        self._touchdown_ready_snapshot = None
+        self._last_valid_center_error_m = float("inf")
+        self._last_valid_center_step = -999999
+        self._last_valid_center_monotonic = float("-inf")
+        self._last_valid_center_similarity = 0.0
+        self._last_valid_center_bbox_rel_error = float("inf")
+        self._last_valid_center_source = "NONE"
+        self._terminal_kalman_state = None
+        self._terminal_kalman_covariance = np.eye(4, dtype=np.float64)
+        self._terminal_kalman_monotonic = float("-inf")
+        self._terminal_descent_committed = False
+        self._terminal_blind_descent_started_monotonic = float("-inf")
         self._live_match_streak = 0
         self._last_match_margin = 0.0
         self._last_spatial_jump_norm = 0.0
@@ -1542,7 +2023,9 @@ class Agent2LandingEnv(gym.Env):
         self._last_candidate_scores = []
         self._adaptive_embeddings = []
         self._adaptive_embedding_steps = []
+        self._adaptive_embedding_scales = []
         self._last_adaptive_embedding_update_step = -999999
+        self._last_adaptive_bbox_xywh = None
         self._adaptive_embedding_updates = 0
         self._last_bbox_xyxy = None
         self._control_bbox_xyxy = None
@@ -1557,6 +2040,18 @@ class Agent2LandingEnv(gym.Env):
         self._landing_anchor_reference_height_m = None
         self._landing_anchor_mode = "INIT"
         self._landing_anchor_edge_flags = "NONE"
+        self._terminal_anchor_locked = False
+        self._terminal_anchor_px = None
+        self._terminal_anchor_previous_gray = None
+        self._terminal_anchor_support_bbox_xyxy = None
+        self._terminal_anchor_candidate_px = None
+        self._terminal_anchor_acquire_streak = 0
+        self._terminal_anchor_lock_step = -999999
+        self._terminal_anchor_last_identity_step = -999999
+        self._terminal_anchor_age_steps = 999999
+        self._terminal_anchor_source = "INACTIVE"
+        self._terminal_anchor_flow_points = 0
+        self._terminal_anchor_flow_confidence = 0.0
         self._last_bottom_observation_monotonic = 0.0
         self._last_bottom_frame = None
         self._last_info = {}
@@ -1807,10 +2302,23 @@ class Agent2LandingEnv(gym.Env):
         similarity_ok = bool(
             best is not None and best_similarity >= self.cfg.min_match_similarity
         )
+        adaptive_anchor_selected = bool(
+            best is not None
+            and best_anchor_index >= len(immutable_references)
+        )
+        recent_live_identity_chain = bool(
+            adaptive_anchor_selected
+            and int(getattr(self, "_step", 0))
+            - int(getattr(self, "_last_match_step", -999999))
+            <= max(2, int(self.cfg.max_prediction_steps))
+        )
         immutable_identity_ok = bool(
             best is not None
-            and best_immutable_similarity
-            >= float(self.cfg.adaptive_embedding_identity_floor)
+            and (
+                best_immutable_similarity
+                >= float(self.cfg.adaptive_embedding_identity_floor)
+                or recent_live_identity_chain
+            )
         )
         margin_ok = bool(
             best is not None
@@ -1841,7 +2349,7 @@ class Agent2LandingEnv(gym.Env):
             elif not similarity_ok:
                 self._last_match_reject_reason = "low_similarity"
             elif not immutable_identity_ok:
-                self._last_match_reject_reason = "adaptive_match_failed_immutable_identity_floor"
+                self._last_match_reject_reason = "identity_chain_and_immutable_floor_failed"
             elif not margin_ok:
                 self._last_match_reject_reason = "ambiguous_similarity_margin"
             else:
@@ -1864,6 +2372,7 @@ class Agent2LandingEnv(gym.Env):
             bbox_xywh=best.bbox,
             immutable_similarity=float(best_immutable_similarity),
             combined_similarity=float(best_similarity),
+            matched_adaptive_anchor=bool(adaptive_anchor_selected),
         )
 
         self.tracker.last_bbox = list(best.bbox)
@@ -1906,6 +2415,84 @@ class Agent2LandingEnv(gym.Env):
         # target has a smaller/more-negative Z, so this separation is positive.
         relative_height = float(self._target_surface_z_ned - drone_z_ned)
         return drone_state, relative_height, state
+
+    def _select_effective_landing_height(
+        self,
+        *,
+        live_match: bool,
+        api_relative_height_m: float,
+        range_state: dict[str, Any],
+        now_monotonic: float | None = None,
+    ) -> tuple[float, str, bool]:
+        """Select the height used by final-landing observation and safety logic.
+
+        Vision/API geometry remains authoritative while a LIVE target match is
+        available. When vision is degraded, the calibrated range array may
+        become authoritative only inside the final-landing envelope and only
+        after a recent, safe visual alignment. This prevents a road or an
+        unrelated surface from being treated as the selected moving target.
+        """
+        api_height = float(api_relative_height_m)
+        if live_match:
+            return api_height, "VISION_API_TARGET_SURFACE", False
+
+        if bool(self.cfg.range_require_calibration) and not bool(
+            range_state.get("range_calibration_loaded", False)
+        ):
+            return api_height, "API_FALLBACK_RANGE_NOT_CALIBRATED", False
+
+        if not bool(range_state.get("range_height_reliable", False)):
+            return api_height, "API_FALLBACK_RANGE_GEOMETRY_UNSAFE", False
+
+        range_height = float(range_state.get("range_mean_m", float("inf")))
+        if (
+            not np.isfinite(range_height)
+            or range_height <= float(self.cfg.range_sensor_final_stop_m)
+            or range_height > float(self.cfg.range_sensor_final_entry_m)
+        ):
+            return api_height, "API_FALLBACK_RANGE_OUTSIDE_FINAL_ENVELOPE", False
+
+        now_value = float(time.monotonic() if now_monotonic is None else now_monotonic)
+        last_visual = float(getattr(self, "_last_valid_center_monotonic", float("-inf")))
+        visual_age = now_value - last_visual
+        center = float(getattr(self, "_last_valid_center_error_m", float("inf")))
+        similarity = float(getattr(self, "_last_valid_center_similarity", 0.0))
+        recent_visual_context_safe = bool(
+            np.isfinite(visual_age)
+            and 0.0 <= visual_age <= float(self.cfg.range_sensor_final_recent_vision_s)
+            and np.isfinite(center)
+            and center <= float(self.cfg.range_sensor_final_max_center_error_m)
+            and similarity >= float(self.cfg.range_sensor_final_min_similarity)
+        )
+
+        # The normal descent gate already records the last command that was
+        # physically authorized from valid target geometry. Use that evidence
+        # as a second arming source, because a slow AirSim control step can make
+        # the separate last-valid-center wall-clock age expire before the range
+        # crosses the close-range pre-arm envelope. This does not relax XY
+        # safety: the
+        # recorded authorization must satisfy the same center/similarity gates.
+        authorized_age_steps = int(
+            self._step - int(getattr(self, "_last_authorized_descent_step", -999999))
+        )
+        authorized_context_safe = bool(
+            getattr(self, "_authorized_descent_latched", False)
+            and 0 <= authorized_age_steps <= 3
+            and np.isfinite(
+                float(getattr(self, "_last_authorized_descent_center_error", float("inf")))
+            )
+            and float(getattr(self, "_last_authorized_descent_center_error", float("inf")))
+            <= float(self.cfg.range_sensor_final_max_center_error_m)
+            and float(getattr(self, "_last_authorized_descent_similarity", 0.0))
+            >= float(self.cfg.range_sensor_final_min_similarity)
+        )
+        visual_context_safe = bool(
+            recent_visual_context_safe or authorized_context_safe
+        )
+        if not visual_context_safe:
+            return api_height, "API_FALLBACK_RECENT_VISION_UNSAFE", False
+
+        return range_height, "CALIBRATED_RANGE_ARRAY", True
 
     def _read_target_surface_altitude(self) -> None:
         actor = str(
@@ -2043,6 +2630,95 @@ class Agent2LandingEnv(gym.Env):
             return float(pitch), float(roll), float(yaw)
         except Exception:
             return 0.0, 0.0, 0.0
+
+    def _init_kalman_diagnostic_logger(self) -> None:
+        """Create a scalar-only CSV session for offline A/B/C replay."""
+        if not bool(getattr(self.cfg, "kalman_diagnostic_logging_enabled", False)):
+            return
+        try:
+            base = Path(__file__).resolve().parent / str(
+                getattr(self.cfg, "kalman_diagnostic_output_dir", "outputs/kalman_live_diagnostics")
+            )
+            session = base / f"session_{self._kalman_diag_session_started}"
+            session.mkdir(parents=True, exist_ok=True)
+            self._kalman_diag_csv_path = session / "kalman_replay.csv"
+            (base / "latest_session.txt").write_text(str(session.resolve()), encoding="utf-8")
+        except Exception as exc:
+            self._kalman_diag_csv_path = None
+            _landing_console_print(f"[KALMAN DIAG] logger disabled after init error: {exc}")
+
+    @staticmethod
+    def _diag_finite_or_blank(value: Any) -> Any:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ""
+        return number if np.isfinite(number) else ""
+
+    def _append_kalman_diagnostic_row(self, info: dict[str, Any]) -> None:
+        """Append one real bottom-camera observation without affecting control."""
+        path = getattr(self, "_kalman_diag_csv_path", None)
+        if path is None:
+            return
+        now = float(info.get("bottom_observation_monotonic", time.monotonic()))
+        previous = self._kalman_diag_last_monotonic
+        dt_s = (
+            float(now - previous)
+            if previous is not None and np.isfinite(now - previous) and now > previous
+            else float(info.get("bottom_control_dt_s", self.cfg.cmd_duration_s))
+        )
+        self._kalman_diag_last_monotonic = now
+        measurement_valid = bool(
+            info.get("bottom_match_live", False)
+            and np.isfinite(float(info.get("bottom_err_x", float("nan"))))
+            and np.isfinite(float(info.get("bottom_err_y", float("nan"))))
+            and np.isfinite(float(info.get("relative_height_to_target_m", float("nan"))))
+        )
+        row = {
+            "frame": int(self._step),
+            "time_s": float(now - self._kalman_diag_start_monotonic),
+            "dt_s": float(max(1.0e-6, dt_s)),
+            "measurement_valid": int(measurement_valid),
+            "err_x_norm": self._diag_finite_or_blank(info.get("bottom_err_x")) if measurement_valid else "",
+            "err_y_norm": self._diag_finite_or_blank(info.get("bottom_err_y")) if measurement_valid else "",
+            "height_m": self._diag_finite_or_blank(info.get("relative_height_to_target_m")),
+            "external_vx_mps": self._diag_finite_or_blank(getattr(self, "_diag_external_vx_mps", float("nan"))),
+            "external_vy_mps": self._diag_finite_or_blank(getattr(self, "_diag_external_vy_mps", float("nan"))),
+            "truth_x_norm": "",
+            "truth_y_norm": "",
+            "tracker_mode": str(info.get("tracker_mode", "")),
+            "similarity": self._diag_finite_or_blank(info.get("bottom_similarity")),
+            "bbox_rel_error": self._diag_finite_or_blank(info.get("bottom_bbox_rel_err")),
+            "raw_metric_x_m": self._diag_finite_or_blank(getattr(self, "_diag_raw_metric_x_m", float("nan"))),
+            "raw_metric_y_m": self._diag_finite_or_blank(getattr(self, "_diag_raw_metric_y_m", float("nan"))),
+            "project_kalman_x_m": self._diag_finite_or_blank(
+                self._visual_kalman_state[0] if self._visual_kalman_state is not None else float("nan")
+            ),
+            "project_kalman_y_m": self._diag_finite_or_blank(
+                self._visual_kalman_state[1] if self._visual_kalman_state is not None else float("nan")
+            ),
+            "project_kalman_vx_mps": self._diag_finite_or_blank(
+                self._visual_kalman_state[2] if self._visual_kalman_state is not None else float("nan")
+            ),
+            "project_kalman_vy_mps": self._diag_finite_or_blank(
+                self._visual_kalman_state[3] if self._visual_kalman_state is not None else float("nan")
+            ),
+            "velocity_measurement_valid": int(getattr(self, "_diag_velocity_measurement_valid", False)),
+            "visual_motion_source": str(info.get("visual_motion_source", "")),
+            "hfov_deg": self._diag_finite_or_blank(info.get("bottom_camera_hfov_deg")),
+            "frame_width_px": int(info.get("bottom_frame_width_px", self.cfg.image_width)),
+            "frame_height_px": int(info.get("bottom_frame_height_px", self.cfg.image_height)),
+        }
+        try:
+            with path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+                if not self._kalman_diag_header_written and path.stat().st_size == 0:
+                    writer.writeheader()
+                    self._kalman_diag_header_written = True
+                writer.writerow(row)
+        except Exception as exc:
+            _landing_console_print(f"[KALMAN DIAG] write error; disabling logger: {exc}")
+            self._kalman_diag_csv_path = None
 
     def _update_visual_motion_kalman(
         self,
@@ -2197,6 +2873,57 @@ class Agent2LandingEnv(gym.Env):
             bool(self._visual_kalman_velocity_initialized),
         )
 
+    def _terminal_kalman_prediction(self, now_monotonic: Optional[float] = None) -> dict[str, Any]:
+        """Predict the latched trustworthy relative target state without vision updates."""
+        if not bool(getattr(self.cfg, "terminal_kalman_enabled", True)):
+            return {"valid": False, "reason": "DISABLED"}
+        state = getattr(self, "_terminal_kalman_state", None)
+        if state is None:
+            return {"valid": False, "reason": "NOT_INITIALIZED"}
+        now = float(time.monotonic() if now_monotonic is None else now_monotonic)
+        source_time = float(getattr(self, "_terminal_kalman_monotonic", float("-inf")))
+        age_s = float(now - source_time)
+        if not np.isfinite(age_s) or age_s < 0.0:
+            return {"valid": False, "reason": "INVALID_AGE", "age_s": age_s}
+        max_age = float(self.cfg.terminal_blind_descent_max_duration_s)
+        if age_s > max_age:
+            return {"valid": False, "reason": "TIMEOUT", "age_s": age_s}
+
+        dt = float(age_s)
+        transition = np.asarray(
+            [[1.0, 0.0, dt, 0.0], [0.0, 1.0, 0.0, dt],
+             [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        acceleration_std = max(1.0e-3, float(self.cfg.visual_kalman_process_accel_std_mps2))
+        process_map = np.asarray(
+            [[0.5 * dt * dt, 0.0], [0.0, 0.5 * dt * dt],
+             [dt, 0.0], [0.0, dt]],
+            dtype=np.float64,
+        )
+        process_noise = (acceleration_std ** 2) * (process_map @ process_map.T)
+        covariance = transition @ self._terminal_kalman_covariance @ transition.T + process_noise
+        predicted = transition @ np.asarray(state, dtype=np.float64)
+        x_m, y_m, vx_mps, vy_mps = [float(v) for v in predicted]
+        radial_m = float(math.hypot(x_m, y_m))
+        position_std_m = float(math.sqrt(max(0.0, float(np.max(np.diag(covariance)[:2])))))
+        valid = bool(
+            np.all(np.isfinite(predicted))
+            and np.isfinite(position_std_m)
+            and position_std_m <= float(self.cfg.terminal_kalman_max_position_std_m)
+        )
+        return {
+            "valid": valid,
+            "reason": "PASS" if valid else "UNCERTAINTY_TOO_HIGH",
+            "age_s": age_s,
+            "x_m": x_m,
+            "y_m": y_m,
+            "vx_mps": vx_mps,
+            "vy_mps": vy_mps,
+            "radial_m": radial_m,
+            "position_std_m": position_std_m,
+        }
+
     @staticmethod
     def _expanded_bbox_xyxy(
         bbox_xyxy: np.ndarray,
@@ -2329,6 +3056,11 @@ class Agent2LandingEnv(gym.Env):
 
         This is the only target-velocity estimator used by the controller.
         """
+        self._diag_raw_metric_x_m = float("nan")
+        self._diag_raw_metric_y_m = float("nan")
+        self._diag_external_vx_mps = float("nan")
+        self._diag_external_vy_mps = float("nan")
+        self._diag_velocity_measurement_valid = False
         now = float(time.monotonic())
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         ego_vx, ego_vy, yaw = self._body_velocity_from_api_state(api_state)
@@ -2551,6 +3283,12 @@ class Agent2LandingEnv(gym.Env):
                         relative_vx = raw_relative_vx
                         relative_vy = raw_relative_vy
                     measurement_valid = True
+
+            self._diag_raw_metric_x_m = float(relative_x)
+            self._diag_raw_metric_y_m = float(relative_y)
+            self._diag_external_vx_mps = float(relative_vx) if measurement_valid else float("nan")
+            self._diag_external_vy_mps = float(relative_vy) if measurement_valid else float("nan")
+            self._diag_velocity_measurement_valid = bool(measurement_valid)
 
             (
                 filtered_relative_x,
@@ -3120,6 +3858,349 @@ class Agent2LandingEnv(gym.Env):
         self._landing_anchor_mode = mode
         return self._landing_anchor_px.copy(), virtual_bbox.copy()
 
+    @staticmethod
+    def _bbox_is_edge_clipped(
+        bbox_xyxy: Optional[np.ndarray],
+        frame_shape: tuple[int, ...],
+        margin_px: float,
+    ) -> bool:
+        """Return True when any visible BBox edge touches the image boundary."""
+        if bbox_xyxy is None:
+            return True
+        arr = np.asarray(bbox_xyxy, dtype=np.float64).reshape(-1)
+        if arr.size < 4 or not np.all(np.isfinite(arr[:4])):
+            return True
+        h, w = frame_shape[:2]
+        margin = max(0.0, float(margin_px))
+        return bool(
+            arr[0] <= margin
+            or arr[1] <= margin
+            or arr[2] >= float(w) - margin
+            or arr[3] >= float(h) - margin
+        )
+
+    def _terminal_anchor_flow_step(
+        self,
+        previous_gray: np.ndarray,
+        current_gray: np.ndarray,
+        anchor_px: np.ndarray,
+        support_bbox_xyxy: Optional[np.ndarray],
+    ) -> tuple[Optional[np.ndarray], int, float]:
+        """Propagate a locked roof point with robust local LK optical flow."""
+        if previous_gray is None or current_gray is None or anchor_px is None:
+            return None, 0, 0.0
+        if previous_gray.shape[:2] != current_gray.shape[:2]:
+            return None, 0, 0.0
+
+        h, w = previous_gray.shape[:2]
+        anchor = np.asarray(anchor_px, dtype=np.float32).reshape(-1)
+        if anchor.size < 2 or not np.all(np.isfinite(anchor[:2])):
+            return None, 0, 0.0
+
+        if support_bbox_xyxy is not None:
+            support = np.asarray(support_bbox_xyxy, dtype=np.float64).reshape(-1)
+            support_w = max(2.0, float(support[2] - support[0]))
+            support_h = max(2.0, float(support[3] - support[1]))
+            radius = float(self.cfg.terminal_anchor_flow_patch_radius_ratio) * min(
+                support_w, support_h
+            )
+        else:
+            radius = float(self.cfg.terminal_anchor_flow_patch_min_px)
+        radius = int(
+            round(
+                np.clip(
+                    radius,
+                    int(self.cfg.terminal_anchor_flow_patch_min_px),
+                    int(self.cfg.terminal_anchor_flow_patch_max_px),
+                )
+            )
+        )
+
+        center_x = int(round(float(np.clip(anchor[0], 0.0, max(0.0, w - 1.0)))))
+        center_y = int(round(float(np.clip(anchor[1], 0.0, max(0.0, h - 1.0)))))
+        mask = np.zeros_like(previous_gray, dtype=np.uint8)
+        cv2.circle(mask, (center_x, center_y), max(8, radius), 255, -1)
+
+        points0 = cv2.goodFeaturesToTrack(
+            previous_gray,
+            maxCorners=max(8, int(self.cfg.terminal_anchor_flow_max_corners)),
+            qualityLevel=max(1.0e-5, float(self.cfg.terminal_anchor_flow_quality_level)),
+            minDistance=max(2.0, float(self.cfg.terminal_anchor_flow_min_distance_px)),
+            mask=mask,
+            blockSize=7,
+        )
+        min_points = max(3, int(self.cfg.terminal_anchor_flow_min_points))
+        if points0 is None or len(points0) < min_points:
+            return None, 0, 0.0
+
+        win = max(9, int(self.cfg.terminal_anchor_flow_window_px))
+        if win % 2 == 0:
+            win += 1
+        lk = dict(
+            winSize=(win, win),
+            maxLevel=max(0, int(self.cfg.terminal_anchor_flow_max_level)),
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 25, 0.01),
+        )
+        points1, status1, _error1 = cv2.calcOpticalFlowPyrLK(
+            previous_gray, current_gray, points0, None, **lk
+        )
+        if points1 is None or status1 is None:
+            return None, 0, 0.0
+        points0_back, status_back, _error_back = cv2.calcOpticalFlowPyrLK(
+            current_gray, previous_gray, points1, None, **lk
+        )
+        if points0_back is None or status_back is None:
+            return None, 0, 0.0
+
+        p0 = points0.reshape(-1, 2)
+        p1 = points1.reshape(-1, 2)
+        p0_back = points0_back.reshape(-1, 2)
+        valid = (status1.reshape(-1) > 0) & (status_back.reshape(-1) > 0)
+        valid &= np.all(np.isfinite(p1), axis=1) & np.all(np.isfinite(p0_back), axis=1)
+        forward_backward_error = np.linalg.norm(p0 - p0_back, axis=1)
+        valid &= forward_backward_error <= float(
+            self.cfg.terminal_anchor_flow_max_forward_backward_error_px
+        )
+
+        displacement = p1[valid] - p0[valid]
+        if displacement.shape[0] < min_points:
+            return None, int(displacement.shape[0]), 0.0
+
+        median_displacement = np.median(displacement, axis=0)
+        residual = np.linalg.norm(
+            displacement - median_displacement.reshape(1, 2), axis=1
+        )
+        median_residual = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median_residual)))
+        inlier_threshold = max(1.5, median_residual + 3.5 * 1.4826 * mad)
+        inliers = residual <= inlier_threshold
+        displacement = displacement[inliers]
+        if displacement.shape[0] < min_points:
+            return None, int(displacement.shape[0]), 0.0
+
+        median_displacement = np.median(displacement, axis=0)
+        step_norm = float(
+            np.linalg.norm(median_displacement)
+            / max(1.0, float(np.hypot(w, h)))
+        )
+        if step_norm > float(self.cfg.terminal_anchor_flow_max_step_norm):
+            return None, int(displacement.shape[0]), 0.0
+
+        next_anchor = anchor[:2].astype(np.float64) + median_displacement.astype(np.float64)
+        outside = max(0.0, float(self.cfg.landing_anchor_max_outside_frame_ratio))
+        next_anchor[0] = float(np.clip(next_anchor[0], -outside * w, (1.0 + outside) * w))
+        next_anchor[1] = float(np.clip(next_anchor[1], -outside * h, (1.0 + outside) * h))
+        confidence = float(
+            np.clip(
+                displacement.shape[0]
+                / max(float(min_points), float(self.cfg.terminal_anchor_flow_max_corners)),
+                0.0,
+                1.0,
+            )
+        )
+        return next_anchor.astype(np.float32), int(displacement.shape[0]), confidence
+
+    def _update_terminal_landing_anchor(
+        self,
+        *,
+        frame: np.ndarray,
+        measured_anchor_px: Optional[np.ndarray],
+        raw_bbox_xyxy: Optional[np.ndarray],
+        control_bbox_xyxy: Optional[np.ndarray],
+        live_match: bool,
+        similarity: float,
+        relative_height_m: float,
+    ) -> tuple[Optional[np.ndarray], bool, str]:
+        """Acquire once, then follow the physical roof point independently."""
+        if not bool(self.cfg.terminal_anchor_enabled):
+            return measured_anchor_px, False, "DISABLED"
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
+        measured = None
+        if measured_anchor_px is not None:
+            candidate = np.asarray(measured_anchor_px, dtype=np.float32).reshape(-1)
+            if candidate.size >= 2 and np.all(np.isfinite(candidate[:2])):
+                measured = candidate[:2].copy()
+
+        raw = self._validated_xyxy(raw_bbox_xyxy, frame.shape)
+        control = self._validated_xyxy(control_bbox_xyxy, frame.shape)
+        visible = raw if raw is not None else control
+        visible_metrics = self._bbox_metrics(visible, frame.shape)
+        edge_clipped = self._bbox_is_edge_clipped(
+            visible,
+            frame.shape,
+            float(self.cfg.terminal_anchor_edge_margin_px),
+        )
+        live_confirmed = bool(
+            live_match
+            and int(getattr(self, "_live_match_streak", 0))
+            >= max(
+                int(self.cfg.match_confirmation_steps),
+                int(self.cfg.terminal_anchor_min_live_streak),
+            )
+            and float(similarity) >= float(self.cfg.terminal_anchor_lock_min_similarity)
+        )
+
+        if not bool(getattr(self, "_terminal_anchor_locked", False)):
+            eligible = bool(
+                live_confirmed
+                and measured is not None
+                and visible is not None
+                and not edge_clipped
+                and np.isfinite(relative_height_m)
+                and float(self.cfg.terminal_anchor_lock_min_height_m)
+                <= float(relative_height_m)
+                <= float(self.cfg.terminal_anchor_lock_max_height_m)
+                and float(visible_metrics["center_error"])
+                <= float(self.cfg.terminal_anchor_lock_max_center_error)
+                and float(self.cfg.terminal_anchor_lock_min_area_norm)
+                <= float(visible_metrics["area_norm"])
+                <= float(self.cfg.terminal_anchor_lock_max_area_norm)
+            )
+            if eligible:
+                previous_candidate = getattr(self, "_terminal_anchor_candidate_px", None)
+                if previous_candidate is None:
+                    stable = True
+                else:
+                    stable = bool(
+                        float(np.linalg.norm(measured - previous_candidate))
+                        / max(1.0, float(np.hypot(w, h)))
+                        <= float(self.cfg.terminal_anchor_candidate_max_jump_norm)
+                    )
+                if stable:
+                    self._terminal_anchor_acquire_streak = int(
+                        getattr(self, "_terminal_anchor_acquire_streak", 0)
+                    ) + 1
+                else:
+                    self._terminal_anchor_acquire_streak = 1
+                self._terminal_anchor_candidate_px = measured.copy()
+            else:
+                self._terminal_anchor_acquire_streak = 0
+                self._terminal_anchor_candidate_px = None
+
+            if (
+                eligible
+                and int(self._terminal_anchor_acquire_streak)
+                >= max(1, int(self.cfg.terminal_anchor_acquire_streak_required))
+            ):
+                self._terminal_anchor_locked = True
+                self._terminal_anchor_px = measured.copy()
+                self._terminal_anchor_previous_gray = gray.copy()
+                self._terminal_anchor_support_bbox_xyxy = (
+                    None if visible is None else visible.copy()
+                )
+                self._terminal_anchor_lock_step = int(self._step)
+                self._terminal_anchor_last_identity_step = int(self._step)
+                self._terminal_anchor_age_steps = 0
+                self._terminal_anchor_source = "TERMINAL_ANCHOR_LOCK"
+                self._terminal_anchor_flow_points = 0
+                self._terminal_anchor_flow_confidence = 1.0
+                return self._terminal_anchor_px.copy(), True, self._terminal_anchor_source
+
+            self._terminal_anchor_previous_gray = gray.copy()
+            return measured_anchor_px, False, "WAIT_LOCK"
+
+        # Locked mode: propagate the selected roof point before considering any
+        # new detector geometry. A detector BBox may correct only a small, trusted
+        # flow drift; it can never replace the terminal point with a distant crop.
+        previous_gray = getattr(self, "_terminal_anchor_previous_gray", None)
+        previous_anchor = getattr(self, "_terminal_anchor_px", None)
+        support_bbox = getattr(self, "_terminal_anchor_support_bbox_xyxy", None)
+        flow_anchor, flow_points, flow_confidence = self._terminal_anchor_flow_step(
+            previous_gray,
+            gray,
+            previous_anchor,
+            support_bbox,
+        )
+        self._terminal_anchor_flow_points = int(flow_points)
+        self._terminal_anchor_flow_confidence = float(flow_confidence)
+
+        flow_valid = flow_anchor is not None
+        if flow_valid:
+            next_anchor = np.asarray(flow_anchor, dtype=np.float32)
+            self._terminal_anchor_age_steps = 0
+            source = "TERMINAL_ANCHOR_FLOW"
+        else:
+            next_anchor = np.asarray(previous_anchor, dtype=np.float32).copy()
+            self._terminal_anchor_age_steps = int(
+                getattr(self, "_terminal_anchor_age_steps", 0)
+            ) + 1
+            source = "TERMINAL_ANCHOR_HOLD"
+
+        trusted_live_correction = False
+        if live_confirmed and measured is not None and not edge_clipped:
+            correction_jump = float(
+                np.linalg.norm(measured - next_anchor)
+                / max(1.0, float(np.hypot(w, h)))
+            )
+            if correction_jump <= float(
+                self.cfg.terminal_anchor_live_correction_max_jump_norm
+            ):
+                alpha = float(
+                    np.clip(self.cfg.terminal_anchor_live_correction_alpha, 0.0, 1.0)
+                )
+                next_anchor = (
+                    (1.0 - alpha) * next_anchor.astype(np.float64)
+                    + alpha * measured.astype(np.float64)
+                ).astype(np.float32)
+                self._terminal_anchor_last_identity_step = int(self._step)
+                self._terminal_anchor_support_bbox_xyxy = (
+                    None if visible is None else visible.copy()
+                )
+                trusted_live_correction = True
+                source = (
+                    "TERMINAL_ANCHOR_FLOW_LIVE"
+                    if flow_valid
+                    else "TERMINAL_ANCHOR_LIVE_RECOVERY"
+                )
+                self._terminal_anchor_age_steps = 0
+        elif live_match and flow_valid:
+            # The identity network still sees the selected object, while the BBox
+            # geometry is clipped or unstable. Refresh identity age only; never
+            # pull the anchor toward that BBox.
+            self._terminal_anchor_last_identity_step = int(self._step)
+
+        self._terminal_anchor_px = next_anchor.copy()
+        self._terminal_anchor_previous_gray = gray.copy()
+        self._terminal_anchor_source = source
+        identity_age = int(self._step) - int(
+            getattr(self, "_terminal_anchor_last_identity_step", -999999)
+        )
+        valid = bool(
+            int(self._terminal_anchor_age_steps)
+            <= int(self.cfg.terminal_anchor_max_hold_steps)
+            and identity_age <= int(self.cfg.terminal_anchor_identity_grace_steps)
+        )
+        if not valid:
+            self._terminal_anchor_source = f"{source}_STALE"
+        return self._terminal_anchor_px.copy(), valid, self._terminal_anchor_source
+
+    @staticmethod
+    def _draw_double_v_marker(
+        image: np.ndarray,
+        point_xy: tuple[int, int],
+        color: tuple[int, int, int] = (255, 0, 255),
+    ) -> None:
+        """Draw two stacked downward chevrons; the lower tip is the exact point."""
+        x, y = [int(value) for value in point_xy]
+        for vertical_offset in (0, -16):
+            tip_y = y + vertical_offset
+            cv2.line(image, (x - 12, tip_y - 13), (x, tip_y), color, 3, cv2.LINE_AA)
+            cv2.line(image, (x + 12, tip_y - 13), (x, tip_y), color, 3, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_frame_center_marker(
+        image: np.ndarray,
+        point_xy: tuple[int, int],
+        color: tuple[int, int, int] = (0, 255, 0),
+    ) -> None:
+        """Draw a plus sign surrounded by a circle at the calibrated frame center."""
+        x, y = [int(value) for value in point_xy]
+        cv2.circle(image, (x, y), 18, color, 2, cv2.LINE_AA)
+        cv2.line(image, (x - 12, y), (x + 12, y), color, 3, cv2.LINE_AA)
+        cv2.line(image, (x, y - 12), (x, y + 12), color, 3, cv2.LINE_AA)
+
     def _landing_anchor_metrics(
         self,
         *,
@@ -3138,8 +4219,10 @@ class Agent2LandingEnv(gym.Env):
             return self._bbox_metrics(visible_bbox_xyxy, frame_shape)
         full_w = max(2.0, float(virtual[2] - virtual[0]))
         full_h = max(2.0, float(virtual[3] - virtual[1]))
-        err_x = (float(anchor[0]) - 0.5 * w) / max(1.0, 0.5 * w)
-        err_y = (float(anchor[1]) - 0.5 * h) / max(1.0, 0.5 * h)
+        target_x_px = float(getattr(self, "_bottom_center_target_x_norm", 0.5)) * float(w)
+        target_y_px = float(getattr(self, "_bottom_center_target_y_norm", 0.5)) * float(h)
+        err_x = (float(anchor[0]) - target_x_px) / max(1.0, 0.5 * w)
+        err_y = (float(anchor[1]) - target_y_px) / max(1.0, 0.5 * h)
         rel_x = abs(err_x) / max(1.0e-6, full_w / max(1.0, w))
         rel_y = abs(err_y) / max(1.0e-6, full_h / max(1.0, h))
         visible_metrics = self._bbox_metrics(visible_bbox_xyxy, frame_shape)
@@ -3153,8 +4236,11 @@ class Agent2LandingEnv(gym.Env):
             "area_norm": float(visible_metrics["area_norm"]),
         }
 
-    @staticmethod
-    def _bbox_metrics(bbox_xyxy: Optional[np.ndarray], frame_shape: tuple[int, ...]) -> dict[str, float]:
+    def _bbox_metrics(
+        self,
+        bbox_xyxy: Optional[np.ndarray],
+        frame_shape: tuple[int, ...],
+    ) -> dict[str, float]:
         if bbox_xyxy is None:
             return {
                 "err_x": 0.0,
@@ -3169,8 +4255,10 @@ class Agent2LandingEnv(gym.Env):
         bh = max(1.0, y2 - y1)
         cx = 0.5 * (x1 + x2)
         cy = 0.5 * (y1 + y2)
-        err_x = (cx - 0.5 * w) / max(1.0, 0.5 * w)
-        err_y = (cy - 0.5 * h) / max(1.0, 0.5 * h)
+        target_x_px = float(getattr(self, "_bottom_center_target_x_norm", 0.5)) * float(w)
+        target_y_px = float(getattr(self, "_bottom_center_target_y_norm", 0.5)) * float(h)
+        err_x = (cx - target_x_px) / max(1.0, 0.5 * w)
+        err_y = (cy - target_y_px) / max(1.0, 0.5 * h)
         rel_x = abs(err_x) / max(1e-6, bw / max(1.0, w))
         rel_y = abs(err_y) / max(1e-6, bh / max(1.0, h))
         return {
@@ -3183,6 +4271,7 @@ class Agent2LandingEnv(gym.Env):
 
     def _observe(self, frame: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict[str, Any]]:
         frame = self._get_bottom_frame() if frame is None else frame
+        frame_capture_monotonic = float(time.monotonic())
         self._sync_image_geometry(frame)
         self._last_bottom_frame = frame.copy()
         raw_bbox_xyxy, similarity, tracker_mode = self._strict_track(frame)
@@ -3192,7 +4281,7 @@ class Agent2LandingEnv(gym.Env):
             live_match=live_match,
             frame_shape=frame.shape,
         )
-        self._last_bottom_observation_monotonic = float(time.monotonic())
+        self._last_bottom_observation_monotonic = frame_capture_monotonic
 
         # The moving platform may change world Z on uneven roads. Refresh its
         # API pose before every vertical-state calculation. No actor movement is
@@ -3200,8 +4289,23 @@ class Agent2LandingEnv(gym.Env):
         if self._target_actor_name:
             self._read_target_surface_altitude()
 
-        drone_state, relative_height, api_state = self._get_api_state()
-        landing_anchor_px, virtual_target_bbox_xyxy = (
+        drone_state, api_relative_height, api_state = self._get_api_state()
+        range_state = self.range_finder_array.read(
+            self.client, self.cfg.vehicle_name
+        )
+        relative_height, landing_height_source, range_height_used = (
+            self._select_effective_landing_height(
+                live_match=live_match,
+                api_relative_height_m=api_relative_height,
+                range_state=range_state,
+                now_monotonic=frame_capture_monotonic,
+            )
+        )
+        # Agent 2's altitude feature represents height over the active landing
+        # surface. In vision-degraded SENSOR_FINAL this is the calibrated
+        # range-array median; global World-Z remains available separately.
+        drone_state.altitude_m = max(0.0, float(relative_height))
+        measured_landing_anchor_px, virtual_target_bbox_xyxy = (
             self._update_landing_anchor_geometry(
                 raw_bbox_xyxy=raw_bbox_xyxy,
                 control_bbox_xyxy=bbox_xyxy,
@@ -3210,12 +4314,48 @@ class Agent2LandingEnv(gym.Env):
                 relative_height_m=relative_height,
             )
         )
+        (
+            terminal_anchor_px,
+            terminal_anchor_valid,
+            terminal_anchor_source,
+        ) = self._update_terminal_landing_anchor(
+            frame=frame,
+            measured_anchor_px=measured_landing_anchor_px,
+            raw_bbox_xyxy=raw_bbox_xyxy,
+            control_bbox_xyxy=bbox_xyxy,
+            live_match=live_match,
+            similarity=float(similarity),
+            relative_height_m=float(relative_height),
+        )
+        landing_anchor_px = (
+            terminal_anchor_px
+            if bool(getattr(self, "_terminal_anchor_locked", False))
+            and terminal_anchor_px is not None
+            else measured_landing_anchor_px
+        )
         metrics = self._landing_anchor_metrics(
             anchor_px=landing_anchor_px,
             virtual_bbox_xyxy=virtual_target_bbox_xyxy,
             visible_bbox_xyxy=bbox_xyxy,
             frame_shape=frame.shape,
         )
+
+        # Once the terminal roof point has been locked, touchdown geometry follows
+        # that physical point rather than a fresh detector rectangle. Before lock,
+        # preserve BEST's raw-LIVE/control-BBox fallback.
+        if bool(getattr(self, "_terminal_anchor_locked", False)) and landing_anchor_px is not None:
+            touchdown_bbox_metrics = dict(metrics)
+            touchdown_bbox_source = str(terminal_anchor_source)
+        else:
+            touchdown_bbox_xyxy = (
+                raw_bbox_xyxy if live_match and raw_bbox_xyxy is not None else bbox_xyxy
+            )
+            touchdown_bbox_source = (
+                "RAW_LIVE_BBOX"
+                if live_match and raw_bbox_xyxy is not None
+                else "CONTROL_BBOX_FALLBACK"
+            )
+            touchdown_bbox_metrics = self._bbox_metrics(touchdown_bbox_xyxy, frame.shape)
         self._update_visual_target_motion(
             frame=frame,
             bbox_xyxy=bbox_xyxy,
@@ -3260,6 +4400,13 @@ class Agent2LandingEnv(gym.Env):
             obstacle_state=obstacle_state,
             dt=float(self.cfg.cmd_duration_s),
         )
+        obs = np.concatenate(
+            [obs, np.asarray(range_state["features"], dtype=np.float32)]
+        ).astype(np.float32, copy=False)
+        for feature_name, feature_value in zip(
+            self.range_finder_array.FEATURE_NAMES, range_state["features"]
+        ):
+            obs_dict[feature_name] = float(feature_value)
 
         match_recent = bool(
             self._step - self._last_match_step <= self.cfg.good_collision_recent_match_steps
@@ -3310,6 +4457,9 @@ class Agent2LandingEnv(gym.Env):
             "reference_anchor_count": int(len(self._reference_embeddings)),
             "adaptive_anchor_count": int(len(self._adaptive_embeddings)),
             "adaptive_embedding_updates": int(self._adaptive_embedding_updates),
+            "adaptive_bank_last_action": str(getattr(self, "_adaptive_bank_last_action", "EMPTY")),
+            "adaptive_bank_replace_index": int(getattr(self, "_adaptive_bank_replace_index", 0)),
+            "adaptive_bank_cycle": int(getattr(self, "_adaptive_bank_cycle", 0)),
             "has_front_anchor": self._original_embedding is not None,
             "has_bottom_anchor": self._bottom_anchor_embedding is not None,
             "yolo_candidate_count": int(self._last_candidate_count),
@@ -3358,6 +4508,32 @@ class Agent2LandingEnv(gym.Env):
                 if landing_anchor_px is None
                 else [float(v) for v in np.asarray(landing_anchor_px).reshape(-1)[:2]]
             ),
+            "bottom_terminal_anchor_locked": bool(
+                getattr(self, "_terminal_anchor_locked", False)
+            ),
+            "bottom_terminal_anchor_valid": bool(terminal_anchor_valid),
+            "bottom_terminal_anchor_source": str(terminal_anchor_source),
+            "bottom_terminal_anchor_age_steps": int(
+                getattr(self, "_terminal_anchor_age_steps", 999999)
+            ),
+            "bottom_terminal_anchor_identity_age_steps": int(
+                int(self._step)
+                - int(getattr(self, "_terminal_anchor_last_identity_step", -999999))
+            ),
+            "bottom_terminal_anchor_flow_points": int(
+                getattr(self, "_terminal_anchor_flow_points", 0)
+            ),
+            "bottom_terminal_anchor_flow_confidence": float(
+                getattr(self, "_terminal_anchor_flow_confidence", 0.0)
+            ),
+            "bottom_terminal_anchor_px": (
+                None
+                if getattr(self, "_terminal_anchor_px", None) is None
+                else [
+                    float(v)
+                    for v in np.asarray(self._terminal_anchor_px).reshape(-1)[:2]
+                ]
+            ),
             "bottom_virtual_target_bbox_xyxy": (
                 None
                 if virtual_target_bbox_xyxy is None
@@ -3366,10 +4542,30 @@ class Agent2LandingEnv(gym.Env):
                     for v in np.asarray(virtual_target_bbox_xyxy).reshape(-1)[:4]
                 ]
             ),
+            # Controller/observation geometry (semantic anchor aware).
             "bottom_err_x": metrics["err_x"],
             "bottom_err_y": metrics["err_y"],
             "bottom_center_error": metrics["center_error"],
             "bottom_bbox_rel_err": metrics["bbox_rel_error"],
+            # Touchdown geometry follows the locked terminal roof point when
+            # available; before lock it falls back to BEST's raw/control BBox.
+            "bottom_touchdown_bbox_err_x": touchdown_bbox_metrics["err_x"],
+            "bottom_touchdown_bbox_err_y": touchdown_bbox_metrics["err_y"],
+            "bottom_touchdown_bbox_center_error": touchdown_bbox_metrics["center_error"],
+            "bottom_touchdown_bbox_rel_err": touchdown_bbox_metrics["bbox_rel_error"],
+            "bottom_touchdown_bbox_source": str(touchdown_bbox_source),
+            "bottom_observation_monotonic": float(self._last_bottom_observation_monotonic),
+            "bottom_frame_width_px": int(frame.shape[1]),
+            "bottom_frame_height_px": int(frame.shape[0]),
+            "bottom_calibrated_target_x_norm": float(
+                self._bottom_center_target_x_norm
+            ),
+            "bottom_calibrated_target_y_norm": float(
+                self._bottom_center_target_y_norm
+            ),
+            "bottom_center_calibration_source": str(
+                self._bottom_center_calibration_source
+            ),
             "bottom_bbox_rel_gate_required": bool(
                 self._bbox_relative_alignment_required(
                     {
@@ -3465,10 +4661,29 @@ class Agent2LandingEnv(gym.Env):
             "target_surface_altitude_m": float(self._target_surface_altitude_m),
             "target_surface_source": self._target_surface_source,
             "relative_height_to_target_m": float(relative_height),
+            "api_relative_height_to_target_m": float(api_relative_height),
+            "landing_height_m": float(relative_height),
+            "landing_height_source": str(landing_height_source),
+            "range_height_used": bool(range_height_used),
+            "range_calibration_loaded": bool(range_state["range_calibration_loaded"]),
+            "range_surface_world_z_median": float(range_state["range_surface_world_z_median"]),
+            "range_surface_world_z_spread": float(range_state["range_surface_world_z_spread"]),
             "lidar_vertical_used": False,
             "obstacle_source": obstacle["obstacle_source"],
             "lidar_valid": bool(obstacle.get("lidar_valid", False)),
             "lidar_point_count": int(obstacle.get("lidar_point_count", 0)),
+            "range_top_left_m": float(range_state["range_distances_m"]["TOP_LEFT"]),
+            "range_top_right_m": float(range_state["range_distances_m"]["TOP_RIGHT"]),
+            "range_bottom_left_m": float(range_state["range_distances_m"]["BOTTOM_LEFT"]),
+            "range_bottom_right_m": float(range_state["range_distances_m"]["BOTTOM_RIGHT"]),
+            "range_center_m": float(range_state["range_distances_m"]["CENTER"]),
+            "range_mean_m": float(range_state["range_mean_m"]),
+            "range_spread_m": float(range_state["range_spread_m"]),
+            "range_valid_count": int(range_state["range_valid_count"]),
+            "range_valid_ratio": float(range_state["range_valid_ratio"]),
+            "range_closing_rate_mps": float(range_state["range_closing_rate_mps"]),
+            "range_height_reliable": bool(range_state["range_height_reliable"]),
+            "range_sensor_final_ready": bool(range_state["range_sensor_final_ready"]),
             "front_dist_m": float(obstacle["front_dist_m"]),
             "left_dist_m": float(obstacle["left_dist_m"]),
             "right_dist_m": float(obstacle["right_dist_m"]),
@@ -3489,7 +4704,11 @@ class Agent2LandingEnv(gym.Env):
         if self.cfg.show_camera:
             vis = frame.copy()
             h, w = vis.shape[:2]
-            cv2.drawMarker(vis, (w // 2, h // 2), (0, 255, 0), cv2.MARKER_CROSS, 28, 2)
+            calibrated_center = (
+                int(round(float(getattr(self, "_bottom_center_target_x_norm", 0.5)) * float(w))),
+                int(round(float(getattr(self, "_bottom_center_target_y_norm", 0.5)) * float(h))),
+            )
+            self._draw_frame_center_marker(vis, calibrated_center)
             display_mode = tracker_mode
             if live_match and not bool(self._descent_alignment_latched):
                 display_mode = (
@@ -3508,31 +4727,15 @@ class Agent2LandingEnv(gym.Env):
             if landing_anchor_px is not None:
                 anchor_x = int(round(float(landing_anchor_px[0])))
                 anchor_y = int(round(float(landing_anchor_px[1])))
-                if 0 <= anchor_x < w and 0 <= anchor_y < h:
-                    cv2.drawMarker(
-                        vis,
-                        (anchor_x, anchor_y),
-                        (255, 0, 255),
-                        cv2.MARKER_CROSS,
-                        34,
-                        3,
-                    )
-                else:
-                    edge_x = int(np.clip(anchor_x, 0, max(0, w - 1)))
-                    edge_y = int(np.clip(anchor_y, 0, max(0, h - 1)))
-                    cv2.drawMarker(
-                        vis,
-                        (edge_x, edge_y),
-                        (255, 0, 255),
-                        cv2.MARKER_TILTED_CROSS,
-                        30,
-                        3,
-                    )
+                marker_x = int(np.clip(anchor_x, 14, max(14, w - 15)))
+                marker_y = int(np.clip(anchor_y, 30, max(30, h - 2)))
+                self._draw_double_v_marker(vis, (marker_x, marker_y))
             cv2.putText(
                 vis,
                 f"AGENT 2 | {self._target_id} | {display_mode} sim={similarity:.3f} "
                 f"bboxFilter={self._control_bbox_filter_mode} "
-                f"anchor={self._landing_anchor_mode}",
+                f"anchor={self._landing_anchor_mode} "
+                f"terminal={terminal_anchor_source}",
                 (15, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -3634,6 +4837,7 @@ class Agent2LandingEnv(gym.Env):
             cv2.imshow("Agent 2 - Bottom Landing", vis)
             cv2.waitKey(1)
 
+        self._append_kalman_diagnostic_row(info)
         self._last_info = info
         return np.asarray(obs, dtype=np.float32), info
 
@@ -3946,21 +5150,20 @@ class Agent2LandingEnv(gym.Env):
         return crop
 
     def _appearance_similarity_to_bottom_anchor(self, crop: np.ndarray) -> float:
-        """Compare one current-frame crop with the immutable bottom anchor."""
-        reference = self._bottom_anchor_embedding
-        if reference is None:
-            # Standalone Agent-2 clicks the target from the bottom camera, so
-            # its original embedding is a valid fallback when no explicit
-            # handoff bottom anchor exists.
-            reference = self._original_embedding
-        if reference is None:
+        """Return the best similarity against immutable and verified views."""
+        references = self._all_reference_embeddings()
+        if not references:
             return 0.0
         embedding = self.tracker._embedding_from_crop(crop)
         if embedding is None:
             return 0.0
-        ref = F.normalize(reference.reshape(-1), dim=0)
         emb = F.normalize(embedding.reshape(-1), dim=0)
-        return float(torch.dot(ref, emb).detach().cpu().item())
+        scores = [
+            float(torch.dot(F.normalize(reference.reshape(-1), dim=0), emb).detach().cpu().item())
+            for reference in references
+            if reference is not None
+        ]
+        return max(scores, default=0.0)
 
     def _contact_appearance_evidence(self) -> dict[str, Any]:
         """Measure whether the selected target is under the bottom camera now.
@@ -4061,22 +5264,318 @@ class Agent2LandingEnv(gym.Env):
             if str(token).strip()
         )
 
+    def _legacy_touchdown_sample(self, info: dict[str, Any]) -> dict[str, Any] | None:
+        """Build one confirmed LIVE bottom-camera sample for touchdown review.
+
+        Admission is intentionally independent of the center threshold. The
+        history must preserve both good and bad late alignment so an older
+        centered frame can never hide a newer side impact. Binary touchdown
+        centering uses the locked terminal roof point once available. Before
+        terminal lock, the current raw LIVE BBox remains the fallback source.
+        """
+        live_match = bool(info.get("bottom_match_live", False))
+        confirmed = bool(info.get("bottom_match_confirmed", False))
+        terminal_valid = bool(info.get("bottom_terminal_anchor_valid", False))
+        terminal_locked = bool(info.get("bottom_terminal_anchor_locked", False))
+        similarity = float(info.get("bottom_similarity", 0.0))
+        center_error = float(
+            info.get(
+                "bottom_touchdown_bbox_center_error",
+                info.get("bottom_center_error", float("inf")),
+            )
+        )
+        bbox_rel_error = float(
+            info.get(
+                "bottom_touchdown_bbox_rel_err",
+                info.get("bottom_bbox_rel_err", float("inf")),
+            )
+        )
+        err_x = float(
+            info.get(
+                "bottom_touchdown_bbox_err_x",
+                info.get("bottom_err_x", float("inf")),
+            )
+        )
+        err_y = float(
+            info.get(
+                "bottom_touchdown_bbox_err_y",
+                info.get("bottom_err_y", float("inf")),
+            )
+        )
+
+        identity_confirmed = bool((live_match and confirmed) or (terminal_locked and terminal_valid))
+        if not (
+            identity_confirmed
+            and np.isfinite(center_error)
+            and center_error >= 0.0
+            and np.isfinite(err_x)
+            and np.isfinite(err_y)
+        ):
+            return None
+
+        return {
+            "step": int(self._step),
+            "error_m": float(center_error),  # compatibility: normalized, not metres
+            "err_x": float(err_x),
+            "err_y": float(err_y),
+            "center_error": float(center_error),
+            "bbox_rel_error": float(bbox_rel_error),
+            "similarity": float(similarity),
+            "confirmed": True,
+            "identity_source": (
+                "TERMINAL_ANCHOR"
+                if terminal_locked and terminal_valid
+                else "LIVE_MATCH"
+            ),
+            "relative_height_m": float(info.get("relative_height_to_target_m", float("inf"))),
+            "frame_width_px": int(info.get("bottom_frame_width_px", self.cfg.image_width)),
+            "frame_height_px": int(info.get("bottom_frame_height_px", self.cfg.image_height)),
+            "source_monotonic": float(info.get("bottom_observation_monotonic", time.monotonic())),
+            "bbox_source": str(info.get("bottom_touchdown_bbox_source", "CONTROL_BBOX_FALLBACK")),
+            "decision_context": str(
+                info.get("bottom_touchdown_decision_context", "PRE_CONTACT_LIVE")
+            ),
+            "relative_velocity_valid": bool(
+                info.get("visual_relative_velocity_valid", False)
+            ),
+            "relative_velocity_x_mps": float(
+                info.get("visual_relative_velocity_body_x_mps", float("nan"))
+            ),
+            "relative_velocity_y_mps": float(
+                info.get("visual_relative_velocity_body_y_mps", float("nan"))
+            ),
+        }
+
+    def _record_touchdown_legacy_sample(self, info: dict[str, Any]) -> None:
+        """Record every confirmed LIVE sample, including off-center samples."""
+        sample = self._legacy_touchdown_sample(info)
+        if sample is None:
+            return
+
+        # Refresh the center latch only from a genuine confirmed LIVE BBox.
+        # Terminal-anchor/PRED continuity is deliberately not allowed to update
+        # the value because close-range semantic distortion is exactly the case
+        # in which the previous trustworthy measurement must be preserved.
+        if (
+            bool(self.cfg.terminal_last_valid_center_enabled)
+            and not bool(getattr(self, "_range_terminal_handoff_active", False))
+        ):
+            similarity = float(sample.get("similarity", 0.0))
+            bbox_rel = float(sample.get("bbox_rel_error", float("inf")))
+            is_live_bbox = str(sample.get("identity_source", "")) == "LIVE_MATCH"
+            center_error_m, center_valid = self._geometric_xy_error_m(
+                float(sample.get("err_x", float("inf"))),
+                float(sample.get("err_y", float("inf"))),
+                float(sample.get("relative_height_m", float("inf"))),
+                float(sample.get("frame_width_px", self.cfg.image_width)),
+                float(sample.get("frame_height_px", self.cfg.image_height)),
+            )
+            if (
+                is_live_bbox
+                and similarity >= float(self.cfg.terminal_last_valid_center_min_similarity)
+                and np.isfinite(bbox_rel)
+                and bbox_rel <= float(self.cfg.terminal_last_valid_center_max_bbox_rel_error)
+                and center_valid
+            ):
+                self._last_valid_center_error_m = float(center_error_m)
+                self._last_valid_center_step = int(self._step)
+                self._last_valid_center_monotonic = float(time.monotonic())
+                self._last_valid_center_similarity = float(similarity)
+                self._last_valid_center_bbox_rel_error = float(bbox_rel)
+                self._last_valid_center_source = str(sample.get("bbox_source", "LIVE_BBOX"))
+                if (
+                    self._visual_kalman_state is not None
+                    and np.all(np.isfinite(self._visual_kalman_state))
+                    and np.all(np.isfinite(self._visual_kalman_covariance))
+                ):
+                    self._terminal_kalman_state = np.asarray(
+                        self._visual_kalman_state, dtype=np.float64
+                    ).copy()
+                    self._terminal_kalman_covariance = np.asarray(
+                        self._visual_kalman_covariance, dtype=np.float64
+                    ).copy()
+                    self._terminal_kalman_monotonic = float(time.monotonic())
+
+        self._touchdown_legacy_window.append(sample)
+        # Compatibility field only. It now mirrors the newest confirmed sample
+        # and is never used to prefer an older center-qualified frame.
+        self._touchdown_ready_snapshot = dict(sample)
+        max_steps = max(1, int(self.cfg.touchdown_legacy_window_steps))
+        min_step = int(self._step) - max_steps
+        self._touchdown_legacy_window = [
+            row for row in self._touchdown_legacy_window
+            if int(row.get("step", -999999)) >= min_step
+        ]
+
+    def _best_recent_legacy_touchdown_sample(
+        self, pre_contact_info: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the newest confirmed sample at or before the contact command.
+
+        The pre-command observation has absolute priority. History is used only
+        when that observation temporarily lacks a confirmed LIVE MATCH, and the
+        caller applies the short collision-age limit. No best-error selection
+        and no center-qualified snapshot fallback are allowed.
+        """
+        current = self._legacy_touchdown_sample(pre_contact_info)
+        if current is not None:
+            current = dict(current)
+            context = str(current.get("decision_context", "PRE_CONTACT_LIVE"))
+            current["decision_source"] = (
+                f"{context}:{current.get('bbox_source', 'UNKNOWN_BBOX')}"
+            )
+            return current
+
+        max_steps = max(1, int(self.cfg.touchdown_legacy_window_steps))
+        min_step = int(self._step) - max_steps
+        candidates = [
+            row for row in list(getattr(self, "_touchdown_legacy_window", []))
+            if int(row.get("step", -999999)) >= min_step
+        ]
+        selected = max(candidates, key=lambda row: int(row["step"]), default=None)
+        if selected is None:
+            return None
+        selected = dict(selected)
+        selected["decision_source"] = f"PRE_CONTACT_FALLBACK:{selected.get('bbox_source', 'UNKNOWN_BBOX')}"
+        return selected
+
+    def _terminal_semantic_drift_fallback(self) -> dict[str, Any]:
+        """Evaluate a bounded recent-history fallback for terminal BBox drift.
+
+        Only the newest visually confirmed, geometrically projectable samples
+        are considered. The median radial center error prevents one distorted
+        terminal frame from dominating the decision, while the relative-speed
+        gate rejects obvious lateral slip before contact.
+        """
+        result: dict[str, Any] = {
+            "enabled": bool(self.cfg.terminal_fallback_enabled),
+            "valid": False,
+            "passed": False,
+            "sample_count": 0,
+            "velocity_sample_count": 0,
+            "median_center_error_m": float("inf"),
+            "mean_relative_speed_mps": float("inf"),
+            "max_relative_speed_mps": float("inf"),
+            "reason": "DISABLED",
+        }
+        if not bool(self.cfg.terminal_fallback_enabled):
+            return result
+
+        rows: list[dict[str, Any]] = []
+        for raw in list(getattr(self, "_touchdown_legacy_window", [])):
+            if not bool(raw.get("confirmed", False)):
+                continue
+            similarity = float(raw.get("similarity", 0.0))
+            bbox_rel = float(raw.get("bbox_rel_error", float("inf")))
+            if similarity < float(self.cfg.terminal_fallback_min_similarity):
+                continue
+            if not np.isfinite(bbox_rel) or bbox_rel > float(
+                self.cfg.terminal_fallback_max_bbox_rel_error
+            ):
+                continue
+            error_m, valid = self._geometric_xy_error_m(
+                float(raw.get("err_x", float("inf"))),
+                float(raw.get("err_y", float("inf"))),
+                float(raw.get("relative_height_m", float("inf"))),
+                float(raw.get("frame_width_px", self.cfg.image_width)),
+                float(raw.get("frame_height_px", self.cfg.image_height)),
+            )
+            if not valid:
+                continue
+            row = dict(raw)
+            row["center_error_m"] = float(error_m)
+            rows.append(row)
+
+        rows.sort(key=lambda row: int(row.get("step", -999999)))
+        keep = max(1, int(self.cfg.terminal_fallback_recent_samples))
+        rows = rows[-keep:]
+        result["sample_count"] = len(rows)
+        if len(rows) < int(self.cfg.terminal_fallback_min_samples):
+            result["reason"] = "INSUFFICIENT_RECENT_RELIABLE_SAMPLES"
+            return result
+
+        center_errors = np.asarray(
+            [float(row["center_error_m"]) for row in rows], dtype=np.float64
+        )
+        median_center = float(np.median(center_errors))
+
+        speeds: list[float] = []
+        for row in rows:
+            if not bool(row.get("relative_velocity_valid", False)):
+                continue
+            vx = float(row.get("relative_velocity_x_mps", float("nan")))
+            vy = float(row.get("relative_velocity_y_mps", float("nan")))
+            if np.isfinite(vx) and np.isfinite(vy):
+                speeds.append(float(math.hypot(vx, vy)))
+
+        result["median_center_error_m"] = median_center
+        result["velocity_sample_count"] = len(speeds)
+        if len(speeds) < int(self.cfg.terminal_fallback_min_velocity_samples):
+            result["reason"] = "INSUFFICIENT_RELATIVE_VELOCITY_SAMPLES"
+            return result
+
+        mean_speed = float(np.mean(np.asarray(speeds, dtype=np.float64)))
+        max_speed = float(np.max(np.asarray(speeds, dtype=np.float64)))
+        result["mean_relative_speed_mps"] = mean_speed
+        result["max_relative_speed_mps"] = max_speed
+        result["valid"] = True
+
+        center_pass = median_center <= float(
+            self.cfg.terminal_fallback_center_median_m
+        )
+        mean_speed_pass = mean_speed <= float(
+            self.cfg.terminal_fallback_mean_relative_speed_mps
+        )
+        max_speed_pass = max_speed <= float(
+            self.cfg.terminal_fallback_max_relative_speed_mps
+        )
+        result["passed"] = bool(center_pass and mean_speed_pass and max_speed_pass)
+        result["reason"] = (
+            "PASS"
+            if result["passed"]
+            else "CENTER_OR_RELATIVE_SPEED_GATE_FAILED"
+        )
+        return result
+
+    def _collision_object_matches_target(self, collision_object: str) -> tuple[bool, str]:
+        """Match AirSim's collision actor name against the configured target actor."""
+        collision_name = self._normalized_collision_object_name(collision_object)
+        candidate_names = [
+            str(getattr(self, "_target_actor_name", "") or ""),
+            str(getattr(self, "_expected_collision_object_name", "") or ""),
+            str(getattr(self.cfg, "latch_target_actor_name", "") or ""),
+        ]
+        normalized_candidates = [
+            self._normalized_collision_object_name(name)
+            for name in candidate_names
+            if self._normalized_collision_object_name(name)
+        ]
+        if not collision_name:
+            return False, ""
+        for expected in normalized_candidates:
+            if collision_name == expected:
+                return True, expected
+            # Unreal PIE may prefix an otherwise identical actor instance name.
+            if collision_name.endswith(expected) or expected.endswith(collision_name):
+                return True, expected
+        return False, normalized_candidates[0] if normalized_candidates else ""
+
     def _update_verified_alignment_latch(self, info: dict[str, Any]) -> None:
-        """Store only a strict, confirmed LIVE alignment from this frame."""
+        """Store strict alignment diagnostics and the recent legacy XY window."""
+        self._record_touchdown_legacy_sample(info)
         live_match = bool(info.get("bottom_match_live", False))
         confirmed = bool(info.get("bottom_match_confirmed", False))
         center_error = float(info.get("bottom_center_error", 999.0))
         bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
         similarity = float(info.get("bottom_similarity", 0.0))
+        err_x = float(info.get("bottom_err_x", 999.0))
+        err_y = float(info.get("bottom_err_y", 999.0))
+        height_m = float(info.get("relative_height_to_target_m", float("inf")))
         strict_alignment = bool(
             live_match
             and confirmed
             and np.isfinite(center_error)
-            and np.isfinite(bbox_rel)
-            and np.isfinite(similarity)
             and center_error <= float(self.cfg.collision_latch_center_error)
-            and bbox_rel <= float(self.cfg.collision_latch_bbox_rel_error)
-            and similarity >= float(self.cfg.collision_latch_min_similarity)
         )
         if not strict_alignment:
             return
@@ -4084,6 +5583,9 @@ class Agent2LandingEnv(gym.Env):
         self._last_verified_alignment_center_error = float(center_error)
         self._last_verified_alignment_bbox_rel_error = float(bbox_rel)
         self._last_verified_alignment_similarity = float(similarity)
+        self._last_verified_alignment_err_x = float(err_x)
+        self._last_verified_alignment_err_y = float(err_y)
+        self._last_verified_alignment_height_m = float(height_m)
 
     def _record_authorized_descent(
         self,
@@ -4099,6 +5601,9 @@ class Agent2LandingEnv(gym.Env):
         center_error = float(pre_info.get("bottom_center_error", 999.0))
         bbox_rel = float(pre_info.get("bottom_bbox_rel_err", 999.0))
         similarity = float(pre_info.get("bottom_similarity", 0.0))
+        err_x = float(pre_info.get("bottom_err_x", 999.0))
+        err_y = float(pre_info.get("bottom_err_y", 999.0))
+        height_m = float(pre_info.get("relative_height_to_target_m", float("inf")))
         live_match = bool(pre_info.get("bottom_match_live", False))
         confirmed = bool(pre_info.get("bottom_match_confirmed", False))
 
@@ -4124,6 +5629,9 @@ class Agent2LandingEnv(gym.Env):
         self._last_authorized_descent_center_error = float(center_error)
         self._last_authorized_descent_bbox_rel_error = float(bbox_rel)
         self._last_authorized_descent_similarity = float(similarity)
+        self._last_authorized_descent_err_x = float(err_x)
+        self._last_authorized_descent_err_y = float(err_y)
+        self._last_authorized_descent_height_m = float(height_m)
         self._last_authorized_descent_vz_mps = float(vz)
         self._authorized_descent_invalidated_reason = ""
 
@@ -4297,36 +5805,157 @@ class Agent2LandingEnv(gym.Env):
         total = float(sum(parts.values()))
         return total, parts
 
+    def _geometric_xy_error_m(
+        self,
+        err_x: float,
+        err_y: float,
+        height_m: float,
+        frame_width_px: float | None = None,
+        frame_height_px: float | None = None,
+    ) -> tuple[float, bool]:
+        """Project calibrated raw-BBox image error to radial XY metres.
+
+        ``err_x`` and ``err_y`` are normalized by half the frame width/height.
+        With square pixels, tan(VFOV/2) equals tan(HFOV/2) multiplied by H/W.
+        """
+        values = (float(err_x), float(err_y), float(height_m))
+        if not all(np.isfinite(v) for v in values):
+            return float("inf"), False
+        min_h = float(self.cfg.collision_geometric_min_height_m)
+        max_h = float(self.cfg.collision_geometric_max_height_m)
+        if height_m < min_h or height_m > max_h:
+            return float("inf"), False
+
+        width = float(frame_width_px or self.cfg.image_width)
+        height = float(frame_height_px or self.cfg.image_height)
+        if width <= 1.0 or height <= 1.0:
+            return float("inf"), False
+        tan_h, tan_v = self._camera_projection_tangents(
+            (int(round(height)), int(round(width)), 3)
+        )
+        offset_x_m = float(err_x) * float(height_m) * tan_h
+        offset_y_m = float(err_y) * float(height_m) * tan_v
+        error_m = float(math.hypot(offset_x_m, offset_y_m))
+        return error_m, bool(np.isfinite(error_m))
+
+    def _collision_xy_fusion(
+        self,
+        info: dict[str, Any],
+        *,
+        allow_historical_measurements: bool = True,
+    ) -> dict[str, Any]:
+        """Fuse legacy and geometric XY estimates from one observation.
+
+        For touchdown classification, ``allow_historical_measurements`` is
+        disabled so a stale alignment snapshot cannot approve a later side
+        impact after the drone has already slipped.
+        """
+        candidates: list[tuple[str, float]] = []
+
+        legacy_x = float(info.get("visual_relative_position_body_x_m", float("inf")))
+        legacy_y = float(info.get("visual_relative_position_body_y_m", float("inf")))
+        legacy_error = float(math.hypot(legacy_x, legacy_y))
+        legacy_valid = bool(np.isfinite(legacy_error))
+        if legacy_valid:
+            candidates.append(("LEGACY_METRIC", legacy_error))
+
+        max_age = int(self.cfg.collision_geometric_max_measurement_age_steps)
+        geometric_candidates: list[tuple[str, float]] = []
+
+        current_error, current_valid = self._geometric_xy_error_m(
+            float(info.get("bottom_err_x", 999.0)),
+            float(info.get("bottom_err_y", 999.0)),
+            float(info.get("relative_height_to_target_m", float("inf"))),
+        )
+        if current_valid and bool(info.get("bottom_match_live", False)):
+            geometric_candidates.append(("GEOMETRIC_CURRENT", current_error))
+
+        if allow_historical_measurements:
+            verified_age = int(
+                self._step - int(getattr(self, "_last_verified_alignment_step", -999999))
+            )
+            verified_error, verified_valid = self._geometric_xy_error_m(
+                float(getattr(self, "_last_verified_alignment_err_x", 999.0)),
+                float(getattr(self, "_last_verified_alignment_err_y", 999.0)),
+                float(getattr(self, "_last_verified_alignment_height_m", float("inf"))),
+            )
+            if verified_valid and verified_age <= max_age:
+                geometric_candidates.append(("GEOMETRIC_VERIFIED", verified_error))
+
+            authorized_age = int(
+                self._step - int(getattr(self, "_last_authorized_descent_step", -999999))
+            )
+            authorized_error, authorized_valid = self._geometric_xy_error_m(
+                float(getattr(self, "_last_authorized_descent_err_x", 999.0)),
+                float(getattr(self, "_last_authorized_descent_err_y", 999.0)),
+                float(getattr(self, "_last_authorized_descent_height_m", float("inf"))),
+            )
+            if authorized_valid and authorized_age <= max_age:
+                geometric_candidates.append(("GEOMETRIC_AUTHORIZED", authorized_error))
+
+        if geometric_candidates:
+            geometric_source, geometric_error = min(
+                geometric_candidates, key=lambda item: item[1]
+            )
+            candidates.append((geometric_source, geometric_error))
+        else:
+            geometric_source, geometric_error = "NONE", float("inf")
+
+        if candidates:
+            selected_source, combined_error = min(candidates, key=lambda item: item[1])
+            combined_valid = True
+        else:
+            selected_source, combined_error, combined_valid = "NONE", float("inf"), False
+
+        return {
+            "legacy_error_m": float(legacy_error),
+            "legacy_valid": bool(legacy_valid),
+            "geometric_error_m": float(geometric_error),
+            "geometric_valid": bool(np.isfinite(geometric_error)),
+            "geometric_source": str(geometric_source),
+            "combined_error_m": float(combined_error),
+            "combined_valid": bool(combined_valid),
+            "selected_source": str(selected_source),
+            "good_xy": bool(
+                combined_valid
+                and combined_error <= float(self.cfg.collision_xy_threshold_m)
+            ),
+        }
+
     def _collision_reward_decision(
         self,
         info: dict[str, Any],
         collision_object: str,
         collision_now: bool = False,
+        pre_contact_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Classify touchdown from current collision-frame evidence only.
+        """Classify touchdown from physical contact and semantic target identity.
 
-        Historical visual latches and prior descent authorization are logged for
-        diagnosis, but they cannot grant terminal reward. Success requires a
-        target-object collision plus either a centered LIVE bottom-camera match
-        or, only when no LIVE bbox exists, direct target appearance under the
-        camera in the current frame. A bad LIVE alignment cannot be overridden
-        by appearance similarity.
+        The simulator actor name is diagnostic only and never participates in
+        success. ``user_target`` identity is established at click time from
+        neural embeddings and may remain valid through either a fresh visual
+        MATCH, uninterrupted terminal-anchor continuity, or collision-frame
+        appearance evidence. Calibrated metric center error remains an
+        independent geometric gate.
         """
-        live_match = bool(info.get("bottom_match_live", False))
-        center_error = float(info.get("bottom_center_error", 999.0))
-        bbox_rel = float(info.get("bottom_bbox_rel_err", 999.0))
-        similarity = float(info.get("bottom_similarity", 0.0))
+        if pre_contact_info is None:
+            pre_contact_info = info
 
-        live_alignment = bool(
-            live_match
-            and np.isfinite(center_error)
-            and np.isfinite(bbox_rel)
-            and center_error <= float(self.cfg.good_collision_center_error)
-            and bbox_rel <= float(self.cfg.good_collision_bbox_rel_error)
+        live_match = bool(pre_contact_info.get("bottom_match_live", False))
+        center_error = float(
+            pre_contact_info.get(
+                "bottom_touchdown_bbox_center_error",
+                pre_contact_info.get("bottom_center_error", 999.0),
+            )
         )
+        bbox_rel = float(
+            pre_contact_info.get(
+                "bottom_touchdown_bbox_rel_err",
+                pre_contact_info.get("bottom_bbox_rel_err", 999.0),
+            )
+        )
+        similarity = float(pre_contact_info.get("bottom_similarity", 0.0))
 
-        # Direct image evidence is evaluated only on a real collision step.
-        # This avoids extra ResNet inference during normal control.
         if collision_now:
             contact = self._contact_appearance_evidence()
         else:
@@ -4339,84 +5968,368 @@ class Agent2LandingEnv(gym.Env):
                 "reason": "not_a_collision_step",
             }
 
-        # LIVE geometry has precedence over appearance. If a live bbox exists
-        # but is not centered, a broad ResNet crop must never rescue the event:
-        # that exact pattern is a side impact where the vehicle remains visible
-        # at the edge of the bottom frame. CONTACT_APPEARANCE is only a fallback
-        # when the live detector has disappeared because the target fills the
-        # camera immediately before contact.
-        if live_match:
-            success_path = "LIVE_MATCH" if live_alignment else "NONE"
-        elif bool(contact["valid"]):
-            success_path = "CONTACT_APPEARANCE"
-        else:
-            success_path = "NONE"
-
-        # Historical values remain in the output for comparison with v6-v9.
-        last_verified_step = int(getattr(self, "_last_verified_alignment_step", -999999))
-        last_verified_center = float(
-            getattr(self, "_last_verified_alignment_center_error", 999.0)
+        best_recent = self._best_recent_legacy_touchdown_sample(pre_contact_info)
+        recent_error_norm = float(best_recent["center_error"]) if best_recent is not None else float("inf")
+        recent_bbox_rel = float(best_recent["bbox_rel_error"]) if best_recent is not None else float("inf")
+        recent_similarity = float(best_recent["similarity"]) if best_recent is not None else 0.0
+        recent_age = int(self._step - int(best_recent["step"])) if best_recent is not None else 999999
+        recent_source = str(best_recent.get("decision_source", "NONE")) if best_recent is not None else "NONE"
+        frame_delay_ms = (
+            max(0.0, (time.monotonic() - float(best_recent.get("source_monotonic", time.monotonic()))) * 1000.0)
+            if best_recent is not None
+            else float("inf")
         )
-        last_verified_bbox_rel = float(
-            getattr(self, "_last_verified_alignment_bbox_rel_error", 999.0)
-        )
-        last_verified_similarity = float(
-            getattr(self, "_last_verified_alignment_similarity", 0.0)
-        )
-        latch_age = int(self._step - last_verified_step)
-
-        last_authorized_step = int(
-            getattr(self, "_last_authorized_descent_step", -999999)
-        )
-        authorized_age = int(self._step - last_authorized_step)
-        last_authorized_center = float(
-            getattr(self, "_last_authorized_descent_center_error", 999.0)
-        )
-        last_authorized_bbox_rel = float(
-            getattr(self, "_last_authorized_descent_bbox_rel_error", 999.0)
-        )
-        last_authorized_similarity = float(
-            getattr(self, "_last_authorized_descent_similarity", 0.0)
-        )
-        last_authorized_vz = float(
-            getattr(self, "_last_authorized_descent_vz_mps", 0.0)
+        recent_error_m, recent_error_m_valid = self._geometric_xy_error_m(
+            float(best_recent.get("err_x", float("inf"))) if best_recent is not None else float("inf"),
+            float(best_recent.get("err_y", float("inf"))) if best_recent is not None else float("inf"),
+            float(best_recent.get("relative_height_m", float("inf"))) if best_recent is not None else float("inf"),
+            float(best_recent.get("frame_width_px", self.cfg.image_width)) if best_recent is not None else None,
+            float(best_recent.get("frame_height_px", self.cfg.image_height)) if best_recent is not None else None,
         )
 
-        normalized_object = self._normalized_collision_object_name(collision_object)
-        ground_contact = self._is_ground_collision_object(collision_object)
-        object_matches_target = False
-        object_lock_created = False
+        legacy_fresh_match = bool(
+            best_recent is not None
+            and bool(best_recent.get("confirmed", False))
+            and np.isfinite(recent_error_norm)
+            and recent_age <= int(self.cfg.collision_latch_max_age_steps)
+        )
 
-        current_bottom_evidence = success_path != "NONE"
-        expected_name = str(getattr(self, "_expected_collision_object_name", "") or "")
-        expected_normalized = self._normalized_collision_object_name(expected_name)
-        object_lock_eligible = bool(current_bottom_evidence)
-        if current_bottom_evidence and normalized_object and not ground_contact:
-            if expected_normalized:
-                object_matches_target = normalized_object == expected_normalized
-            elif bool(self.cfg.collision_object_auto_lock) and object_lock_eligible:
-                self._expected_collision_object_name = str(collision_object)
-                self._expected_collision_object_source = "current_bottom_evidence_touchdown"
-                object_matches_target = True
-                object_lock_created = True
+        # Actor names exist only in simulation and are never positive identity
+        # evidence. They are used only as a negative safety veto when AirSim
+        # explicitly reports contact with a known different actor.
+        actor_name_match_diag, expected_collision_name_diag = (
+            self._collision_object_matches_target(collision_object)
+        )
+        collision_object_name_available = bool(
+            self._normalized_collision_object_name(collision_object)
+        )
+        known_wrong_object_contact = bool(
+            collision_now
+            and collision_object_name_available
+            and bool(expected_collision_name_diag)
+            and not actor_name_match_diag
+        )
+
+        # A simulator actor name is never positive identity evidence, but a
+        # known mismatch is a hard veto: a safe pre-handoff snapshot cannot
+        # approve physical contact with a different object.
+
+        # Once acquired, the terminal anchor belongs to the semantic identity
+        # ``user_target``. Valid uninterrupted optical-flow continuity is useful
+        # close to touchdown, where a detector may see only roof/interior details
+        # and therefore cannot produce a conventional full-object MATCH.
+        terminal_locked = bool(
+            info.get("bottom_terminal_anchor_locked", False)
+            or pre_contact_info.get("bottom_terminal_anchor_locked", False)
+        )
+        terminal_valid = bool(
+            info.get("bottom_terminal_anchor_valid", False)
+            or pre_contact_info.get("bottom_terminal_anchor_valid", False)
+        )
+        terminal_identity_age = min(
+            int(info.get("bottom_terminal_anchor_identity_age_steps", 999999)),
+            int(pre_contact_info.get("bottom_terminal_anchor_identity_age_steps", 999999)),
+        )
+        terminal_flow_age = min(
+            int(info.get("bottom_terminal_anchor_age_steps", 999999)),
+            int(pre_contact_info.get("bottom_terminal_anchor_age_steps", 999999)),
+        )
+        terminal_identity_continuity = bool(
+            collision_now
+            and terminal_locked
+            and terminal_valid
+            and terminal_identity_age
+            <= int(self.cfg.terminal_anchor_identity_grace_steps)
+            and terminal_flow_age <= int(self.cfg.terminal_anchor_max_hold_steps)
+        )
+
+        # Independent semantic fallback from the current contact frame. The
+        # network compares current crops against the selected target's embedding
+        # bank. No actor name, YOLO class name, or simulator template is used.
+        contact_identity_fallback = bool(
+            collision_now
+            and bool(contact.get("valid", False))
+        )
+
+        terminal_snapshot = getattr(self, "_range_terminal_contact_snapshot", None)
+        terminal_snapshot_valid = bool(
+            isinstance(terminal_snapshot, dict)
+            and bool(terminal_snapshot.get("valid", False))
+        )
+        terminal_snapshot_target_id = str(
+            terminal_snapshot.get("target_id", "")
+            if isinstance(terminal_snapshot, dict)
+            else ""
+        )
+        terminal_snapshot_center_error_m = float(
+            terminal_snapshot.get("center_error_m", float("inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("inf")
+        )
+        terminal_snapshot_center_error_norm = float(
+            terminal_snapshot.get("center_error_norm", float("inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("inf")
+        )
+        terminal_snapshot_similarity = float(
+            terminal_snapshot.get("similarity", 0.0)
+            if isinstance(terminal_snapshot, dict)
+            else 0.0
+        )
+        terminal_snapshot_bbox_rel_error = float(
+            terminal_snapshot.get("bbox_rel_error", float("inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("inf")
+        )
+        terminal_snapshot_captured_step = int(
+            terminal_snapshot.get("captured_step", -999999)
+            if isinstance(terminal_snapshot, dict)
+            else -999999
+        )
+        terminal_snapshot_captured_monotonic = float(
+            terminal_snapshot.get("captured_monotonic", float("-inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("-inf")
+        )
+        terminal_snapshot_age_steps = int(self._step - terminal_snapshot_captured_step)
+        terminal_snapshot_age_s = float(
+            time.monotonic() - terminal_snapshot_captured_monotonic
+        )
+        terminal_snapshot_identity_ok = bool(
+            collision_now
+            and not known_wrong_object_contact
+            and bool(getattr(self, "_range_terminal_handoff_active", False))
+            and terminal_snapshot_valid
+            and terminal_snapshot_target_id
+            == str(getattr(self, "_target_id", "user_target") or "user_target")
+        )
+        terminal_snapshot_center_pass = bool(
+            terminal_snapshot_identity_ok
+            and np.isfinite(terminal_snapshot_center_error_m)
+            and terminal_snapshot_center_error_m
+            <= float(self.cfg.collision_latch_center_error_m)
+        )
+
+        # Last-valid center latch. No trajectory median and no relative-
+        # speed gate are used. A strong confirmed LIVE BBox refreshes this value
+        # per frame; unreliable/PRED terminal frames simply leave it unchanged.
+        last_valid_center_age = int(
+            self._step - int(getattr(self, "_last_valid_center_step", -999999))
+        )
+        last_valid_center_age_s = float(
+            time.monotonic()
+            - float(getattr(self, "_last_valid_center_monotonic", float("-inf")))
+        )
+        last_valid_center_error_m = float(
+            getattr(self, "_last_valid_center_error_m", float("inf"))
+        )
+        last_valid_center_similarity = float(
+            getattr(self, "_last_valid_center_similarity", 0.0)
+        )
+        last_valid_center_bbox_rel = float(
+            getattr(self, "_last_valid_center_bbox_rel_error", float("inf"))
+        )
+        last_valid_center_valid = bool(
+            bool(self.cfg.terminal_last_valid_center_enabled)
+            and np.isfinite(last_valid_center_error_m)
+            and np.isfinite(last_valid_center_age_s)
+            and last_valid_center_age_s >= 0.0
+            and last_valid_center_age_s
+            <= float(self.cfg.terminal_last_valid_center_max_age_s)
+            and last_valid_center_similarity
+            >= float(self.cfg.terminal_last_valid_center_min_similarity)
+            and np.isfinite(last_valid_center_bbox_rel)
+            and last_valid_center_bbox_rel
+            <= float(self.cfg.terminal_last_valid_center_max_bbox_rel_error)
+        )
+        last_valid_center_pass = bool(
+            last_valid_center_valid
+            and last_valid_center_error_m
+            <= float(self.cfg.terminal_last_valid_center_error_m)
+        )
+        terminal_kalman = self._terminal_kalman_prediction()
+        terminal_kalman_valid = bool(terminal_kalman.get("valid", False))
+        terminal_kalman_error_m = float(terminal_kalman.get("radial_m", float("inf")))
+        terminal_kalman_pass = bool(
+            terminal_kalman_valid
+            and terminal_kalman_error_m
+            <= float(self.cfg.terminal_kalman_rpc_center_error_m)
+        )
+        stale_identity_bridge = bool(
+            collision_now and (last_valid_center_valid or terminal_kalman_valid)
+        )
+
+        semantic_identity_ok = bool(
+            not known_wrong_object_contact
+            and (
+                legacy_fresh_match
+                or terminal_identity_continuity
+                or contact_identity_fallback
+                or stale_identity_bridge
+                or terminal_snapshot_identity_ok
+            )
+        )
+        identity_age_limit = int(self.cfg.collision_latch_max_age_steps)
+        if terminal_snapshot_identity_ok:
+            # Once terminal handoff begins, this pre-handoff snapshot is the
+            # authoritative semantic and XY evidence. Its lifetime is bounded by
+            # the terminal hard timeout, not by the normal live-frame age gate.
+            recent_source = "TERMINAL_HANDOFF_SAFE_SNAPSHOT"
+            recent_age = int(terminal_snapshot_age_steps)
+            identity_age_limit = int(terminal_snapshot_age_steps)
+            recent_error_norm = float(terminal_snapshot_center_error_norm)
+            recent_error_m = float(terminal_snapshot_center_error_m)
+            recent_error_m_valid = bool(np.isfinite(recent_error_m))
+            recent_bbox_rel = float(terminal_snapshot_bbox_rel_error)
+            recent_similarity = float(terminal_snapshot_similarity)
+            frame_delay_ms = (
+                max(0.0, terminal_snapshot_age_s * 1000.0)
+                if np.isfinite(terminal_snapshot_age_s)
+                else float("inf")
+            )
+        elif stale_identity_bridge and not legacy_fresh_match:
+            recent_source = "STALE_SEMANTIC_KINEMATIC_BRIDGE"
+            identity_age_limit = int(
+                self.cfg.terminal_last_valid_center_max_age_steps
+            )
+        elif terminal_identity_continuity and not legacy_fresh_match:
+            recent_source = "TERMINAL_IDENTITY_CONTINUITY"
+            recent_age = int(terminal_identity_age)
+            identity_age_limit = int(self.cfg.terminal_anchor_identity_grace_steps)
+            current_capture = float(
+                info.get("bottom_observation_monotonic", time.monotonic())
+            )
+            frame_delay_ms = max(
+                0.0,
+                (time.monotonic() - current_capture) * 1000.0,
+            )
+        elif contact_identity_fallback and not legacy_fresh_match:
+            recent_source = "CONTACT_FRAME_SEMANTIC_APPEARANCE"
+            recent_age = 0
+            identity_age_limit = 0
+            current_capture = float(
+                info.get("bottom_observation_monotonic", time.monotonic())
+            )
+            frame_delay_ms = max(
+                0.0,
+                (time.monotonic() - current_capture) * 1000.0,
+            )
+            recent_similarity = max(
+                float(recent_similarity),
+                float(contact.get("center_similarity", 0.0)),
+            )
+
+        # Center geometry is an independent condition. It must not be displayed
+        # as FAIL merely because identity freshness failed. Final success still
+        # requires both identity and center checks below.
+        center_ok = bool(
+            terminal_snapshot_center_pass
+            or (
+                recent_error_m_valid
+                and recent_error_m <= float(self.cfg.collision_latch_center_error_m)
+            )
+        )
+        fallback_used = bool(
+            collision_now
+            and semantic_identity_ok
+            and not center_ok
+            and terminal_kalman_pass
+        )
+        success = bool(
+            collision_now and semantic_identity_ok and (center_ok or fallback_used)
+        )
+
+        if collision_now:
+            center_value_text = f"{recent_error_m:.3f}m" if recent_error_m_valid else "INVALID"
+            delay_text = f"{frame_delay_ms:.1f}ms" if np.isfinite(frame_delay_ms) else "INVALID"
+            lines = [
+                "=" * 88,
+                "[A2 LANDING DECISION]",
+                (
+                    f"Target contact : {'PASS' if collision_now else 'FAIL'} | "
+                    f"semantic_id={getattr(self, '_target_id', 'user_target')} sensor=CONTACT_EVENT"
+                ),
+                (
+                    f"Bottom MATCH   : {'PASS' if semantic_identity_ok else 'FAIL'} | "
+                    f"source={recent_source} age={recent_age} "
+                    f"limit<={identity_age_limit}"
+                ),
+                (
+                    f"Last valid XY : "
+                    f"{'PASS' if last_valid_center_pass else 'FAIL'} | "
+                    f"value={last_valid_center_error_m:.3f}m "
+                    f"age={last_valid_center_age}steps/{last_valid_center_age_s:.2f}s "
+                    f"limit<={self.cfg.terminal_last_valid_center_error_m:.3f}m/"
+                    f"{self.cfg.terminal_last_valid_center_max_age_s:.2f}s "
+                    f"sim={last_valid_center_similarity:.3f}"
+                ),
+                (
+                    f"Terminal snap : "
+                    f"{'PASS' if terminal_snapshot_center_pass else 'FAIL'} | "
+                    f"valid={int(terminal_snapshot_valid)} "
+                    f"target={terminal_snapshot_target_id or 'NONE'} "
+                    f"xy={terminal_snapshot_center_error_m:.3f}m "
+                    f"sim={terminal_snapshot_similarity:.3f} "
+                    f"age={terminal_snapshot_age_s:.2f}s"
+                ),
+                (
+                    f"Center error   : {'PASS' if center_ok else 'FAIL'} | "
+                    f"value={center_value_text} "
+                    f"limit<={self.cfg.collision_latch_center_error_m:.3f}m"
+                ),
+                (
+                    f"Kalman XY     : "
+                    f"{'PASS' if terminal_kalman_pass else 'FAIL'} | "
+                    f"value={terminal_kalman_error_m:.3f}m "
+                    f"age={float(terminal_kalman.get('age_s', float('inf'))):.2f}s "
+                    f"std={float(terminal_kalman.get('position_std_m', float('inf'))):.3f}m "
+                    f"limit<={self.cfg.terminal_kalman_rpc_center_error_m:.3f}m"
+                ),
+                (
+                    f"Fallback      : "
+                    f"{'PASS' if fallback_used else 'FAIL'} | "
+                    f"method=KALMAN_PREDICT_ONLY "
+                    f"source={getattr(self, '_last_valid_center_source', 'NONE')}"
+                ),
+                (
+                    f"Quality only   : bboxRel={recent_bbox_rel:.3f} "
+                    f"similarity={recent_similarity:.3f} "
+                    f"contactSim={float(contact['center_similarity']):.3f} "
+                    f"frameDelay={delay_text}"
+                ),
+                f"Decision       : {'SUCCESS -> RPC' if success else 'FAIL -> NO RPC'}",
+                "=" * 88,
+            ]
+            _landing_console_print("\n".join(lines))
 
         if not collision_now:
             reject_reason = ""
-        elif ground_contact:
-            reject_reason = "ground_or_terrain_collision"
-        elif not normalized_object:
-            reject_reason = "empty_collision_object"
-        elif live_match and not live_alignment:
-            reject_reason = "live_match_not_centered"
-        elif not current_bottom_evidence:
-            reject_reason = str(contact.get("reason", "bottom_target_not_verified")) or "bottom_target_not_verified"
-        elif not object_matches_target:
-            reject_reason = "collision_object_mismatch"
+        elif known_wrong_object_contact:
+            reject_reason = "known_wrong_object_contact"
+        elif not semantic_identity_ok:
+            reject_reason = "semantic_target_identity_not_confirmed"
+        elif not center_ok and not fallback_used:
+            reject_reason = "recent_center_and_last_valid_center_failed"
         else:
             reject_reason = ""
 
+        last_verified_step = int(getattr(self, "_last_verified_alignment_step", -999999))
+        last_authorized_step = int(getattr(self, "_last_authorized_descent_step", -999999))
+        if not success:
+            success_path = "NONE"
+        elif terminal_snapshot_center_pass:
+            success_path = "CONTACT_TERMINAL_HANDOFF_SAFE_SNAPSHOT"
+        elif fallback_used:
+            success_path = "CONTACT_SEMANTIC_IDENTITY_RECENT_HISTORY_FALLBACK"
+        elif legacy_fresh_match:
+            success_path = "CONTACT_FRESH_SEMANTIC_MATCH_CENTER"
+        elif terminal_identity_continuity:
+            success_path = "CONTACT_TERMINAL_IDENTITY_CONTINUITY_CENTER"
+        else:
+            success_path = "CONTACT_FRAME_SEMANTIC_APPEARANCE_CENTER"
+
         return {
-            "success": bool(collision_now and current_bottom_evidence and object_matches_target),
+            "success": success,
             "success_path": success_path,
             "live_match_at_collision": live_match,
             "live_center_error": center_error,
@@ -4428,31 +6341,194 @@ class Agent2LandingEnv(gym.Env):
             "contact_center_margin": float(contact["center_margin"]),
             "contact_best_center_scale": float(contact["best_center_scale"]),
             "contact_appearance_reason": str(contact["reason"]),
-            "alignment_latch_age": latch_age,
-            "last_verified_center_error": last_verified_center,
-            "last_verified_bbox_rel_error": last_verified_bbox_rel,
-            "last_verified_similarity": last_verified_similarity,
-            "authorized_descent_latched": bool(
-                getattr(self, "_authorized_descent_latched", False)
+            "collision_xy_threshold_m": float(self.cfg.collision_xy_threshold_m),
+            "collision_xy_legacy_error_m": float(recent_error_norm),
+            "collision_xy_legacy_valid": bool(legacy_fresh_match),
+            "collision_bottom_identity_ok": bool(semantic_identity_ok),
+            "collision_legacy_fresh_match": bool(legacy_fresh_match),
+            "collision_contact_identity_fallback": bool(contact_identity_fallback),
+            "collision_terminal_identity_continuity": bool(terminal_identity_continuity),
+            "collision_terminal_snapshot_valid": bool(terminal_snapshot_valid),
+            "collision_terminal_snapshot_identity_ok": bool(terminal_snapshot_identity_ok),
+            "collision_terminal_snapshot_center_pass": bool(terminal_snapshot_center_pass),
+            "collision_terminal_snapshot_center_error_m": float(
+                terminal_snapshot_center_error_m
             ),
-            "authorized_descent_latch_age": authorized_age,
-            "last_authorized_descent_center_error": last_authorized_center,
-            "last_authorized_descent_bbox_rel_error": last_authorized_bbox_rel,
-            "last_authorized_descent_similarity": last_authorized_similarity,
-            "last_authorized_descent_vz_mps": last_authorized_vz,
+            "collision_terminal_snapshot_similarity": float(
+                terminal_snapshot_similarity
+            ),
+            "collision_terminal_snapshot_bbox_rel_error": float(
+                terminal_snapshot_bbox_rel_error
+            ),
+            "collision_terminal_snapshot_age_steps": int(
+                terminal_snapshot_age_steps
+            ),
+            "collision_terminal_snapshot_age_s": float(terminal_snapshot_age_s),
+            "collision_semantic_identity_ok": bool(semantic_identity_ok),
+            "collision_semantic_identity_source": str(recent_source),
+            "collision_semantic_identity_age": int(recent_age),
+            "collision_semantic_identity_age_limit": int(identity_age_limit),
+            "collision_stale_identity_bridge_used": bool(stale_identity_bridge),
+            "collision_stale_identity_bridge_semantics_ok": bool(last_valid_center_valid),
+            "collision_stale_identity_bridge_kinematics_ok": True,
+            "collision_center_ok": bool(center_ok),
+            "collision_terminal_fallback_used": bool(fallback_used),
+            "collision_terminal_fallback_valid": bool(terminal_kalman_valid),
+            "collision_terminal_fallback_passed": bool(terminal_kalman_pass),
+            "collision_terminal_fallback_reason": (
+                "PASS" if terminal_kalman_pass else "KALMAN_PREDICTION_FAILED"
+            ),
+            "collision_terminal_fallback_sample_count": int(
+                1 if last_valid_center_valid else 0
+            ),
+            "collision_terminal_fallback_velocity_sample_count": 0,
+            "collision_terminal_fallback_median_center_error_m": float(
+                last_valid_center_error_m
+            ),
+            "collision_terminal_fallback_mean_relative_speed_mps": float("nan"),
+            "collision_terminal_fallback_max_relative_speed_mps": float("nan"),
+            "collision_last_valid_center_age_steps": int(last_valid_center_age),
+            "collision_last_valid_center_age_s": float(last_valid_center_age_s),
+            "collision_last_valid_center_similarity": float(
+                last_valid_center_similarity
+            ),
+            "collision_xy_geometric_error_m": float(recent_error_m),
+            "collision_xy_geometric_valid": bool(recent_error_m_valid),
+            "collision_xy_geometric_source": str(recent_source),
+            "collision_xy_combined_error_m": float(recent_error_m),
+            "collision_xy_combined_valid": bool(recent_error_m_valid),
+            "collision_xy_selected_source": str(recent_source),
+            "collision_recent_legacy_age": int(recent_age),
+            "collision_recent_center_error": float(recent_error_norm),
+            "collision_recent_center_error_m": float(recent_error_m),
+            "collision_recent_frame_delay_ms": float(frame_delay_ms),
+            "collision_recent_source": str(recent_source),
+            "collision_recent_bbox_rel_error": float(recent_bbox_rel),
+            "collision_recent_similarity": float(recent_similarity),
+            "collision_center_threshold_norm": float(self.cfg.collision_latch_center_error),
+            "collision_center_threshold_m": float(self.cfg.collision_latch_center_error_m),
+            "collision_bbox_rel_threshold_norm": float(self.cfg.collision_latch_bbox_rel_error),
+            "alignment_latch_age": int(self._step - last_verified_step),
+            "last_verified_center_error": float(getattr(self, "_last_verified_alignment_center_error", 999.0)),
+            "last_verified_bbox_rel_error": float(getattr(self, "_last_verified_alignment_bbox_rel_error", 999.0)),
+            "last_verified_similarity": float(getattr(self, "_last_verified_alignment_similarity", 0.0)),
+            "authorized_descent_latched": bool(getattr(self, "_authorized_descent_latched", False)),
+            "recent_authorized_descent": False,
+            "authorized_descent_latch_age": int(self._step - last_authorized_step),
+            "last_authorized_descent_center_error": float(getattr(self, "_last_authorized_descent_center_error", 999.0)),
+            "last_authorized_descent_bbox_rel_error": float(getattr(self, "_last_authorized_descent_bbox_rel_error", 999.0)),
+            "last_authorized_descent_similarity": float(getattr(self, "_last_authorized_descent_similarity", 0.0)),
+            "last_authorized_descent_vz_mps": float(getattr(self, "_last_authorized_descent_vz_mps", 0.0)),
             "authorized_descent_invalidated_reason": "diagnostic_only",
-            "collision_object_matches_target": bool(object_matches_target),
-            "collision_object_lock_created": bool(object_lock_created),
-            "collision_object_lock_eligible": bool(object_lock_eligible),
-            "expected_collision_object_name": str(
-                getattr(self, "_expected_collision_object_name", "") or ""
-            ),
-            "expected_collision_object_source": str(
-                getattr(self, "_expected_collision_object_source", "unlocked") or "unlocked"
-            ),
-            "collision_ground_contact": bool(ground_contact),
+            # Actor-name fields are primarily diagnostics. A known mismatch
+            # is used only as a negative safety veto; a match never proves
+            # semantic target identity.
+            "collision_object_matches_target": bool(actor_name_match_diag),
+            "collision_object_name_available": bool(collision_object_name_available),
+            "collision_known_wrong_object_contact": bool(known_wrong_object_contact),
+            "collision_object_lock_created": False,
+            "collision_object_lock_eligible": False,
+            "expected_collision_object_name": str(expected_collision_name_diag),
+            "expected_collision_object_source": "diagnostic_only",
+            "collision_actor_name_used_for_decision": False,
+            "collision_ground_contact": False,
             "reject_reason": reject_reason,
         }
+
+    def _terminal_landing_quality_reward(
+        self, collision_decision: dict[str, Any]
+    ) -> tuple[float, dict[str, float]]:
+        """Return reward-only landing quality terms; never gates success."""
+        center = float(collision_decision.get("collision_recent_center_error_m", float("inf")))
+        bbox_rel = float(collision_decision.get("collision_recent_bbox_rel_error", float("inf")))
+        similarity = float(collision_decision.get("collision_recent_similarity", 0.0))
+
+        center_limit = max(1.0e-6, float(self.cfg.collision_latch_center_error_m))
+        center_quality = float(np.clip(1.0 - center / center_limit, 0.0, 1.0)) if np.isfinite(center) else 0.0
+
+        bbox_ref = max(1.0e-6, float(self.cfg.landing_quality_bbox_rel_reference))
+        bbox_quality = float(np.clip(1.0 - bbox_rel / bbox_ref, -1.0, 1.0)) if np.isfinite(bbox_rel) else -1.0
+
+        sim_ref = float(self.cfg.landing_quality_similarity_reference)
+        sim_den = max(1.0e-6, 1.0 - sim_ref)
+        similarity_quality = float(np.clip((similarity - sim_ref) / sim_den, -1.0, 1.0)) if np.isfinite(similarity) else -1.0
+
+        parts = {
+            "center": float(self.cfg.landing_quality_center_bonus) * center_quality,
+            "bbox_rel": float(self.cfg.landing_quality_bbox_rel_bonus) * bbox_quality,
+            "similarity": float(self.cfg.landing_quality_similarity_bonus) * similarity_quality,
+        }
+        return float(sum(parts.values())), parts
+
+    def begin_first_contact_window(self) -> None:
+        """Clear the Agent-2-owned contact latch before one physical command."""
+        with self._collision_monitor_lock:
+            self._collision_monitor_latched = None
+
+    def poll_first_contact(self) -> bool:
+        """Poll AirSim synchronously from Agent 2 and latch first new contact.
+
+        This method is invoked while the fused command is physically active.
+        The collision RPC is owned and executed by Agent 2; Agent 1 only calls
+        this callback and reacts to its boolean result by stopping motion.
+        """
+        with self._collision_monitor_lock:
+            if self._collision_monitor_latched is not None:
+                return True
+        try:
+            col = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
+            collided = bool(getattr(col, "has_collided", False))
+            timestamp = int(getattr(col, "time_stamp", 0) or 0)
+            object_name = str(getattr(col, "object_name", "") or "")
+            baseline = int(getattr(self, "_collision_timestamp_at_reset", 0) or 0)
+            is_new = bool(collided and (timestamp == 0 or timestamp != baseline))
+            if not is_new:
+                return False
+            with self._collision_monitor_lock:
+                if self._collision_monitor_latched is None:
+                    self._collision_monitor_latched = (object_name, timestamp)
+            print(
+                "[A2 FIRST CONTACT] synchronous detection | "
+                f"object={object_name or 'UNKNOWN'} timestamp={timestamp} "
+                f"poll={float(self.cfg.collision_poll_interval_s) * 1000.0:.1f}ms"
+            )
+            return True
+        except Exception as exc:
+            # Surface RPC failures instead of silently swallowing them. A
+            # throttled message avoids flooding the training log.
+            now = time.monotonic()
+            last = float(getattr(self, "_last_collision_probe_error_log_s", 0.0))
+            if now - last >= 1.0:
+                self._last_collision_probe_error_log_s = now
+                print(f"[A2 COLLISION PROBE ERROR] {type(exc).__name__}: {exc}")
+            return False
+
+    def _execute_with_agent2_collision_monitor(
+        self,
+        executor: Callable[[float], dict[str, Any]],
+        vz_mps: float,
+    ) -> tuple[dict[str, Any], bool, str, int]:
+        """Execute one command with synchronous Agent-2 contact polling.
+
+        DroneEnv invokes ``poll_first_contact`` every polling interval while
+        the 0.25-second fused command is active. No msgpack RPC client is used
+        from a background thread, avoiding coroutine/thread failures. The long
+        asynchronous bridge is disabled in parallel landing.
+        """
+        self.begin_first_contact_window()
+        external_info = dict(executor(vz_mps) or {})
+        with self._collision_monitor_lock:
+            latched = self._collision_monitor_latched
+            self._collision_monitor_latched = None
+        if latched is None:
+            return external_info, False, "", 0
+        object_name, timestamp = latched
+        print(
+            "[A2 FIRST CONTACT] command stopped | "
+            f"object={object_name or 'UNKNOWN'} timestamp={timestamp} "
+            "motion_cancelled=1"
+        )
+        return external_info, True, object_name, int(timestamp)
 
     def _new_collision(self) -> tuple[bool, str, int]:
         """Return a collision only when it is new relative to the episode reset."""
@@ -4801,6 +6877,382 @@ class Agent2LandingEnv(gym.Env):
             "bottom_lost_expand_field_of_view",
         )
 
+    def _latch_vehicle_after_success(self) -> tuple[bool, str]:
+        """Snap the drone to the target roof after verified touchdown only."""
+        if not bool(self.cfg.latch_on_success):
+            return False, "disabled"
+
+        target_actor = str(
+            getattr(self, "_target_actor_name", "")
+            or self.cfg.latch_target_actor_name
+        )
+        vehicle_name = str(self.cfg.latch_vehicle_name)
+        anchor_name = str(self.cfg.latch_anchor_component_name)
+        print(
+            "[A2 LATCH] attempting RPC | "
+            f"vehicle={vehicle_name or '<default>'} "
+            f"target={target_actor} anchor={anchor_name}"
+        )
+
+        try:
+            result = bool(
+                self.client.client.call(
+                    "simLatchVehicleToActor",
+                    vehicle_name,
+                    target_actor,
+                    anchor_name,
+                )
+            )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            print(f"[A2 LATCH] RPC error | {message}")
+            return False, message
+
+        if not result:
+            message = "RPC returned False"
+            print(f"[A2 LATCH] failed | {message}")
+            return False, message
+
+        hold_seconds = max(0.0, float(self.cfg.latch_success_hold_seconds))
+        print(
+            "[A2 LATCH] success | "
+            f"vehicle={self.cfg.latch_vehicle_name or '<default>'} "
+            f"target={getattr(self, '_target_actor_name', '') or self.cfg.latch_target_actor_name} "
+            f"anchor={self.cfg.latch_anchor_component_name} "
+            f"hold={hold_seconds:.1f}s"
+        )
+        if hold_seconds > 0.0:
+            time.sleep(hold_seconds)
+        return True, ""
+
+    def _capture_range_terminal_contact_snapshot(
+        self,
+        info: dict[str, Any],
+        *,
+        captured_monotonic: float,
+        safe_range_m: float,
+    ) -> dict[str, Any]:
+        """Freeze the last trustworthy landing evidence before terminal descent.
+
+        The snapshot is captured only while calibrated range geometry and recent
+        LIVE visual evidence are both safe. It is immutable after terminal
+        handoff and therefore remains authoritative when close-range imagery is
+        distorted, temporarily missing, or semantically ambiguous.
+        """
+        center_error_m = float(
+            getattr(self, "_last_valid_center_error_m", float("inf"))
+        )
+        similarity = float(getattr(self, "_last_valid_center_similarity", 0.0))
+        bbox_rel_error = float(
+            getattr(self, "_last_valid_center_bbox_rel_error", float("inf"))
+        )
+        target_id = str(getattr(self, "_target_id", "user_target") or "user_target")
+
+        bbox = getattr(self, "_control_bbox_xyxy", None)
+        if bbox is None:
+            bbox = getattr(self, "_last_bbox_xyxy", None)
+        bbox_list: list[float] | None = None
+        if bbox is not None:
+            bbox_arr = np.asarray(bbox, dtype=np.float64).reshape(-1)
+            if bbox_arr.size == 4 and np.all(np.isfinite(bbox_arr)):
+                bbox_list = [float(value) for value in bbox_arr]
+
+        center_error_norm = float(
+            info.get(
+                "bottom_touchdown_bbox_center_error",
+                info.get("bottom_center_error", float("inf")),
+            )
+        )
+        snapshot_valid = bool(
+            target_id == "user_target"
+            and np.isfinite(center_error_m)
+            and center_error_m
+            <= float(self.cfg.range_sensor_final_max_center_error_m)
+            and np.isfinite(similarity)
+            and similarity
+            >= float(self.cfg.terminal_last_valid_center_min_similarity)
+            and np.isfinite(bbox_rel_error)
+            and bbox_rel_error
+            <= float(self.cfg.terminal_last_valid_center_max_bbox_rel_error)
+            and np.isfinite(safe_range_m)
+            and float(self.cfg.range_sensor_final_stop_m) < safe_range_m
+            <= float(self.cfg.range_terminal_contact_arm_max_height_m)
+        )
+
+        snapshot = {
+            "valid": snapshot_valid,
+            "captured_step": int(self._step),
+            "captured_monotonic": float(captured_monotonic),
+            "target_id": target_id,
+            "target_actor_name": str(getattr(self, "_target_actor_name", "") or ""),
+            "center_error_m": center_error_m,
+            "center_error_norm": center_error_norm,
+            "similarity": similarity,
+            "bbox_rel_error": bbox_rel_error,
+            "bbox_xyxy": bbox_list,
+            "last_safe_range_m": float(safe_range_m),
+            "source": str(getattr(self, "_last_valid_center_source", "NONE")),
+            "handoff_step": None,
+            "handoff_monotonic": None,
+        }
+        self._range_terminal_contact_snapshot = snapshot
+        return snapshot
+
+    def _terminal_low_altitude_z_command(
+        self,
+        raw_vz_action: float,
+        info: dict[str, Any],
+    ) -> tuple[float, str, bool, str]:
+        """Return range-governed terminal Z with conditional climb permission.
+
+        Positive NED-Z descends and negative NED-Z climbs. Once terminal handoff
+        is active, calibrated range geometry owns the normal descent command.
+        Agent 2 may contribute an upward command only when current evidence
+        indicates a large horizontal deviation or unsafe/asymmetric roof
+        geometry. When every beam becomes invalid after the safely armed
+        low-altitude handoff, the array is treated as being below its measured
+        minimum and a gentle descent continues until contact or timeout.
+        """
+        action = float(np.clip(raw_vz_action, -1.0, 1.0))
+        reliable = bool(info.get("range_height_reliable", False))
+        valid_count = int(info.get("range_valid_count", 0) or 0)
+        mean_m = float(info.get("range_mean_m", float("inf")))
+        spread_m = float(info.get("range_spread_m", float("inf")))
+
+        live_match = bool(info.get("bottom_match_live", False))
+        similarity = float(info.get("bottom_similarity", 0.0))
+        center_error = float(
+            info.get(
+                "bottom_touchdown_bbox_center_error",
+                info.get("bottom_center_error", float("inf")),
+            )
+        )
+        visual_deviation = bool(
+            live_match
+            and similarity >= float(self.cfg.range_sensor_final_min_similarity)
+            and np.isfinite(center_error)
+            and center_error
+            > float(self.cfg.range_terminal_climb_center_error_threshold)
+        )
+
+        asymmetric_range = bool(
+            valid_count >= 2
+            and np.isfinite(spread_m)
+            and spread_m
+            > float(self.cfg.range_terminal_climb_spread_threshold_m)
+        )
+        partial_surface = bool(0 < valid_count < int(self.cfg.range_min_valid_count))
+        range_geometry_unsafe = bool(asymmetric_range or partial_surface)
+        climb_allowed = bool(visual_deviation or range_geometry_unsafe)
+
+        if valid_count <= 0 or not np.isfinite(mean_m):
+            return (
+                float(self.cfg.range_terminal_contact_vz_mps),
+                "range_terminal_inf_below_min_descent",
+                False,
+                "all_ranges_inf_after_low_altitude_handoff",
+            )
+
+        if action < 0.0 and climb_allowed:
+            climb_vz = -min(
+                abs(action) * float(self.cfg.vz_scale_mps),
+                float(self.cfg.range_terminal_climb_max_vz_mps),
+            )
+            reason = (
+                "large_xy_deviation"
+                if visual_deviation
+                else "unsafe_asymmetric_range_geometry"
+            )
+            return climb_vz, "range_terminal_authorized_climb", True, reason
+
+        if range_geometry_unsafe:
+            return (
+                0.0,
+                "range_terminal_unsafe_geometry_hold",
+                False,
+                "climb_not_requested",
+            )
+
+        if reliable:
+            if mean_m <= float(self.cfg.range_sensor_final_stop_m):
+                descent_vz = float(self.cfg.range_terminal_contact_vz_mps)
+            else:
+                descent_vz = float(
+                    self.range_finder_array.sensor_final_descent_speed(mean_m)
+                )
+                if descent_vz <= 0.0:
+                    descent_vz = float(self.cfg.range_terminal_contact_vz_mps)
+            climb_block_reason = (
+                "aligned_safe_range_geometry" if action < 0.0 else "not_requested"
+            )
+            return (
+                descent_vz,
+                "range_terminal_governed_descent",
+                False,
+                climb_block_reason,
+            )
+
+        # A finite but unreliable low-altitude sample that is not asymmetric
+        # is treated conservatively as the close-range dead zone. Continue a
+        # gentle descent rather than exposing unrestricted policy Z.
+        return (
+            float(self.cfg.range_terminal_contact_vz_mps),
+            "range_terminal_unreliable_close_descent",
+            False,
+            "range_not_reliable_no_climb_evidence",
+        )
+
+    def _sensor_final_command(self, info: dict[str, Any]) -> tuple[bool, float, str]:
+        """Run the calibrated final-landing handoff.
+
+        Above the experimentally verified 0.35 m floor, the existing vision
+        controller remains active and the range array is monitored. A recent,
+        safe range/vision state arms the one-way handoff. At or below 0.35 m,
+        the existing controlled Agent-1 X/Y/Yaw path remains active while a
+        range-governed Z controller runs for at most 50 physical policy commands.
+        Agent 2 may request a bounded climb only when geometry justifies it. Existing safety,
+        smoothing, range, vision and collision checks remain in force.
+
+        Touchdown success remains governed by contact with the selected target
+        and the last safe XY gate. The handoff itself stays irreversible and
+        replaces unrestricted terminal Z with the range-governed controller.
+        """
+        now = float(time.monotonic())
+
+        # Check the one-way terminal latch before every configuration, Vision,
+        # calibration, or range branch. Once handoff has started, no later
+        # sample may refresh the snapshot, reset the timer, or return authority
+        # to the normal state machine.
+        if bool(getattr(self, "_range_terminal_handoff_active", False)):
+            started_step = int(
+                getattr(self, "_range_terminal_contact_started_step", self._step)
+            )
+            if started_step < 0:
+                started_step = int(self._step)
+                self._range_terminal_contact_started_step = started_step
+            elapsed_steps = max(0, int(self._step) - started_step)
+            if elapsed_steps < int(self.cfg.range_terminal_contact_max_steps):
+                return True, 0.0, "range_floor_terminal_range_control"
+
+            # The latch remains irreversible, but timeout is counted by actual
+            # physical policy steps rather than wall-clock time.
+            self._range_terminal_handoff_timed_out = True
+            return True, 0.0, "range_terminal_contact_hard_timeout"
+
+        if not bool(self.cfg.range_sensor_final_enabled):
+            return False, 0.0, "disabled"
+
+        live_vision = bool(info.get("bottom_match_live", False))
+        calibrated = bool(info.get("range_calibration_loaded", False))
+        reliable = bool(info.get("range_height_reliable", False))
+        ready = bool(info.get("range_sensor_final_ready", False))
+        range_used = bool(info.get("range_height_used", False))
+        mean_m = float(info.get("range_mean_m", float("inf")))
+
+        visual_age = float(
+            now - float(getattr(self, "_last_valid_center_monotonic", float("-inf")))
+        )
+        center = float(getattr(self, "_last_valid_center_error_m", float("inf")))
+        similarity = float(getattr(self, "_last_valid_center_similarity", 0.0))
+        visual_context_safe = bool(
+            np.isfinite(visual_age)
+            and 0.0 <= visual_age <= float(self.cfg.range_sensor_final_recent_vision_s)
+            and np.isfinite(center)
+            and center <= float(self.cfg.range_sensor_final_max_center_error_m)
+            and similarity >= float(self.cfg.range_sensor_final_min_similarity)
+        )
+
+        if bool(self.cfg.range_require_calibration) and not calibrated:
+            return False, 0.0, "range_calibration_not_loaded"
+
+        # Pre-arm before the rays enter their measured close-surface dead zone.
+        # The upper edge is intentionally wider than the old 0.60 m limit:
+        # at the forced 0.65 m/s descent rate, one slow AirSim step can skip
+        # the entire 0.35-0.60 m band. The snapshot is still accepted only
+        # with calibrated/reliable range plus safe LIVE visual geometry, and
+        # the actual terminal handoff remains fixed at the 0.35 m floor.
+        if (
+            calibrated
+            and reliable
+            and visual_context_safe
+            and float(self.cfg.range_sensor_final_stop_m) < mean_m
+            <= float(self.cfg.range_terminal_contact_arm_max_height_m)
+        ):
+            snapshot = self._capture_range_terminal_contact_snapshot(
+                info,
+                captured_monotonic=now,
+                safe_range_m=mean_m,
+            )
+            if bool(snapshot.get("valid", False)):
+                self._range_terminal_contact_armed = True
+                self._range_terminal_contact_armed_monotonic = now
+                self._range_terminal_contact_started_monotonic = float("-inf")
+                self._range_terminal_contact_last_safe_height_m = mean_m
+
+        armed_age = float(
+            now - float(getattr(self, "_range_terminal_contact_armed_monotonic", float("-inf")))
+        )
+        terminal_snapshot = getattr(self, "_range_terminal_contact_snapshot", None)
+        terminal_armed = bool(
+            getattr(self, "_range_terminal_contact_armed", False)
+            and isinstance(terminal_snapshot, dict)
+            and bool(terminal_snapshot.get("valid", False))
+            and np.isfinite(armed_age)
+            and 0.0 <= armed_age <= float(self.cfg.range_terminal_contact_latch_max_age_s)
+            and float(getattr(self, "_range_terminal_contact_last_safe_height_m", float("inf")))
+            <= float(self.cfg.range_terminal_contact_arm_max_height_m)
+        )
+        below_floor = bool(
+            np.isfinite(mean_m)
+            and mean_m <= float(self.cfg.range_sensor_final_stop_m)
+        )
+        ray_became_invalid = bool(not reliable or not np.isfinite(mean_m))
+
+        # Deterministic handoff at 0.35 m. Live vision is deliberately no longer
+        # a blocker here: the handoff occurs before close-range visual geometry
+        # can corrupt XY/yaw. Invalid rays may trigger the same path only from a
+        # very recent safely armed sample.
+        if terminal_armed and (below_floor or ray_became_invalid):
+            self._range_terminal_handoff_active = True
+            self._range_terminal_handoff_timed_out = False
+            self._range_terminal_contact_started_monotonic = now
+            self._range_terminal_contact_started_step = int(self._step)
+            terminal_snapshot["handoff_step"] = int(self._step)
+            terminal_snapshot["handoff_monotonic"] = float(now)
+            return True, 0.0, "range_floor_terminal_range_control"
+
+        # Keep Agent 1 in full XY/yaw control while using the calibrated range
+        # array only as a Z-speed governor inside the final 1.50 m envelope.
+        # This prevents a 0.65 m/s command from skipping the complete pre-arm
+        # band between perception/control steps. It is not terminal authority:
+        # XY/yaw are frozen only after _range_terminal_handoff_active is set.
+        if live_vision:
+            if calibrated and reliable and ready:
+                governed_vz = float(
+                    self.range_finder_array.sensor_final_descent_speed(mean_m)
+                )
+                if governed_vz > 0.0:
+                    return True, governed_vz, "vision_live_range_z_governor"
+            return False, 0.0, "vision_live_ranges_monitoring_only"
+
+        if not visual_context_safe:
+            return False, 0.0, "recent_visual_context_unsafe"
+
+        # Natural vision loss above the floor: calibrated range may guide Z
+        # while still inside the reliable final envelope.
+        if reliable and ready and range_used:
+            speed = float(self.range_finder_array.sensor_final_descent_speed(mean_m))
+            if speed > 0.0:
+                return True, speed, "recent_vision_plus_safe_range_array"
+
+        if not reliable:
+            return False, 0.0, "range_geometry_not_reliable"
+        if not ready:
+            return False, 0.0, "range_outside_reliable_final_envelope"
+        if not range_used:
+            return False, 0.0, "range_height_not_authorized"
+        return False, 0.0, "range_terminal_not_armed"
+
     def step(self, action):
         self._step += 1
         raw = np.asarray(action, dtype=np.float32).reshape(4)
@@ -4813,6 +7265,32 @@ class Agent2LandingEnv(gym.Env):
         if not self._last_info:
             raise RuntimeError("Agent2LandingEnv.step() called before reset()/handoff observation.")
         pre_info = dict(self._last_info)
+        now_monotonic = float(time.monotonic())
+        terminal_kalman = self._terminal_kalman_prediction(now_monotonic)
+        try:
+            pre_height = float(pre_info.get("relative_height_to_target_m", float("inf")))
+        except (TypeError, ValueError):
+            pre_height = float("inf")
+        terminal_kalman_active = bool(
+            not bool(pre_info.get("bottom_match_live", False))
+            and bool(getattr(self, "_terminal_descent_committed", False))
+            and bool(terminal_kalman.get("valid", False))
+            and np.isfinite(pre_height)
+            and pre_height <= float(self.cfg.terminal_blind_descent_max_height_m)
+        )
+        if terminal_kalman_active:
+            pre_info["tracker_mode"] = "PRED_KALMAN_TERMINAL"
+            pre_info["terminal_kalman_prediction_active"] = True
+            pre_info["visual_motion_age_s"] = float(terminal_kalman["age_s"])
+            # Guidance expects the state at the last real measurement and
+            # advances it by visual_motion_age_s internally.
+            latched = np.asarray(self._terminal_kalman_state, dtype=np.float64)
+            pre_info["visual_relative_position_body_x_m"] = float(latched[0])
+            pre_info["visual_relative_position_body_y_m"] = float(latched[1])
+            pre_info["visual_relative_velocity_body_x_mps"] = float(latched[2])
+            pre_info["visual_relative_velocity_body_y_mps"] = float(latched[3])
+            pre_info["visual_relative_velocity_valid"] = True
+            pre_info["target_velocity_valid"] = False
 
         vx, vy, horizontal = self._horizontal_visual_servo(raw, pre_info)
         self._last_horizontal_control_state = str(horizontal["state"])
@@ -4846,26 +7324,184 @@ class Agent2LandingEnv(gym.Env):
             }
         )
 
-        # Landing-only vertical contract:
-        #   raw_z > 0  -> request descent (positive AirSim NED vz)
-        #   raw_z <= 0 -> hover vertically
-        # A fresh/untrained PPO policy can therefore never escape upward.
+        # Normal landing keeps the original descent-only contract. Inside the
+        # final 50-step low-altitude window, range geometry governs Z and Agent 2
+        # may request a bounded climb only when the controller authorizes it.
         raw_vz_action = float(raw[2])
+        bottom_live_forced_descent = bool(
+            self.cfg.force_descent_while_bottom_match
+            and pre_info.get("bottom_match_live", False)
+        )
         climb_command_blocked = bool(raw_vz_action < 0.0)
-        requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)
-        vertical_state, descent_allowed, descent_block_reason = self._vertical_control_state(pre_info)
-        vz, vertical_speed_limit, soft_catchup_descent = (
-            self._bounded_descent_command(
-                requested_vz,
-                vertical_state,
-                descent_allowed,
-                pre_info,
+
+        last_valid_elapsed_s = float(
+            now_monotonic
+            - float(getattr(self, "_last_valid_center_monotonic", float("-inf")))
+        )
+        try:
+            current_relative_height_m = float(
+                pre_info.get("relative_height_to_target_m", float("inf"))
             )
+        except (TypeError, ValueError):
+            current_relative_height_m = float("inf")
+        last_valid_center_ready = bool(
+            np.isfinite(float(getattr(self, "_last_valid_center_error_m", float("inf"))))
+            and float(getattr(self, "_last_valid_center_error_m", float("inf")))
+            <= float(self.cfg.terminal_last_valid_center_error_m)
+            and float(getattr(self, "_last_valid_center_similarity", 0.0))
+            >= float(self.cfg.terminal_last_valid_center_min_similarity)
+            and np.isfinite(float(getattr(self, "_last_valid_center_bbox_rel_error", float("inf"))))
+            and float(getattr(self, "_last_valid_center_bbox_rel_error", float("inf")))
+            <= float(self.cfg.terminal_last_valid_center_max_bbox_rel_error)
         )
-        reacquire_vz, reacquire_climb_active, reacquire_climb_reason = (
-            self._reacquire_climb_command(pre_info)
+        terminal_blind_descent = bool(
+            bool(self.cfg.terminal_blind_descent_enabled)
+            and not bottom_live_forced_descent
+            and bool(getattr(self, "_terminal_descent_committed", False))
+            and terminal_kalman_active
+            and np.isfinite(current_relative_height_m)
+            and current_relative_height_m
+            <= float(self.cfg.terminal_blind_descent_max_height_m)
         )
-        descent_requested = bool(requested_vz > 0.0)
+
+        # Forced-contact diagnostic mode: while the downward camera has a LIVE
+        # MATCH, Agent 2 continuously commands positive NED-Z until first
+        # collision. PPO Z, landing-lock geometry, similarity, bbox-relative
+        # gates and reacquisition logic cannot interrupt this descent. This is
+        # deliberately confined to Agent 2 and is intended to validate the
+        # first-contact/collision path under guaranteed physical contact.
+        if bottom_live_forced_descent:
+            self._terminal_descent_committed = True
+            self._terminal_blind_descent_started_monotonic = float("-inf")
+            requested_vz = float(self.cfg.vz_scale_mps)
+            vertical_state = "FORCED_DESCENT_BOTTOM_LIVE_UNTIL_COLLISION"
+            descent_allowed = True
+            descent_block_reason = "none_forced_bottom_live_until_collision"
+            vz = float(requested_vz)
+            vertical_speed_limit = float(requested_vz)
+            soft_catchup_descent = False
+            reacquire_vz = 0.0
+            reacquire_climb_active = False
+            reacquire_climb_reason = "disabled_during_forced_bottom_live_descent"
+        elif terminal_blind_descent:
+            if not np.isfinite(
+                float(getattr(self, "_terminal_blind_descent_started_monotonic", float("-inf")))
+            ):
+                self._terminal_blind_descent_started_monotonic = now_monotonic
+            requested_vz = float(self.cfg.forced_bottom_match_descent_vz_mps)
+            vertical_state = "TERMINAL_BLIND_DESCENT_KALMAN_PREDICT"
+            descent_allowed = True
+            descent_block_reason = "none_terminal_blind_descent"
+            vz = max(0.0, float(requested_vz))
+            vertical_speed_limit = float(vz)
+            soft_catchup_descent = False
+            reacquire_vz = 0.0
+            reacquire_climb_active = False
+            reacquire_climb_reason = "disabled_during_terminal_blind_descent"
+        else:
+            requested_vz = max(0.0, raw_vz_action) * float(self.cfg.vz_scale_mps)
+            vertical_state, descent_allowed, descent_block_reason = self._vertical_control_state(pre_info)
+            vz, vertical_speed_limit, soft_catchup_descent = (
+                self._bounded_descent_command(
+                    requested_vz,
+                    vertical_state,
+                    descent_allowed,
+                    pre_info,
+                )
+            )
+            reacquire_vz, reacquire_climb_active, reacquire_climb_reason = (
+                self._reacquire_climb_command(pre_info)
+            )
+
+        # Diagnostic forced-impact mode requested for collision validation.
+        # A LIVE bottom-camera MATCH has absolute Z authority: keep descending
+        # at a deterministic speed until Agent 2 detects first contact. This
+        # bypasses PPO hesitation, landing-lock geometry and catch-up Z vetoes,
+        # but only while the current bottom frame is a LIVE MATCH.
+        forced_match_descent = bool(
+            self.cfg.force_descent_while_bottom_match
+            and pre_info.get("bottom_match_live", False)
+        )
+        if forced_match_descent:
+            vz = max(
+                0.0,
+                float(self.cfg.forced_bottom_match_descent_vz_mps),
+            )
+            vertical_state = "FORCED_DESCEND_BOTTOM_MATCH_UNTIL_COLLISION"
+            descent_allowed = True
+            soft_catchup_descent = False
+            vertical_speed_limit = float(vz)
+            descent_block_reason = ""
+            reacquire_climb_active = False
+            reacquire_climb_reason = "bottom_live_forced_descent"
+
+        sensor_final_active, sensor_final_vz, sensor_final_reason = (
+            self._sensor_final_command(pre_info)
+        )
+        terminal_handoff_active = bool(
+            getattr(self, "_range_terminal_handoff_active", False)
+        )
+        terminal_hard_timeout = bool(
+            terminal_handoff_active
+            and sensor_final_reason == "range_terminal_contact_hard_timeout"
+        )
+        terminal_climb_allowed = False
+        terminal_climb_reason = "not_in_terminal_handoff"
+        terminal_inf_descent_active = False
+        # Before terminal handoff the original descent-only contract remains.
+        # After handoff, the range/controller path governs Z and policy climb
+        # requests are admitted only when current geometry justifies them.
+        climb_command_blocked = bool(
+            raw_vz_action < 0.0 and not terminal_handoff_active
+        )
+        if sensor_final_active:
+            if terminal_handoff_active and not terminal_hard_timeout:
+                (
+                    terminal_vz,
+                    terminal_z_reason,
+                    terminal_climb_allowed,
+                    terminal_climb_reason,
+                ) = self._terminal_low_altitude_z_command(
+                    raw_vz_action,
+                    pre_info,
+                )
+                requested_vz = float(terminal_vz)
+                vz = float(terminal_vz)
+                vertical_state = "SENSOR_FINAL_TERMINAL_RANGE_CONTROL"
+                descent_allowed = bool(vz >= 0.0)
+                soft_catchup_descent = False
+                vertical_speed_limit = abs(float(vz))
+                descent_block_reason = str(terminal_z_reason)
+                reacquire_climb_active = False
+                reacquire_climb_reason = str(terminal_z_reason)
+                terminal_inf_descent_active = bool(
+                    terminal_z_reason == "range_terminal_inf_below_min_descent"
+                )
+                climb_command_blocked = bool(
+                    raw_vz_action < 0.0 and not terminal_climb_allowed
+                )
+            else:
+                requested_vz = float(sensor_final_vz)
+                vz = float(sensor_final_vz)
+                vertical_state = (
+                    "SENSOR_FINAL_TERMINAL_TIMEOUT"
+                    if terminal_hard_timeout
+                    else "SENSOR_FINAL_RANGE_ARRAY"
+                )
+                descent_allowed = not terminal_hard_timeout
+                soft_catchup_descent = False
+                vertical_speed_limit = abs(float(sensor_final_vz))
+                descent_block_reason = (
+                    "range_terminal_contact_hard_timeout"
+                    if terminal_hard_timeout
+                    else ""
+                )
+                reacquire_climb_active = False
+                reacquire_climb_reason = "disabled_during_sensor_final"
+
+        descent_requested = bool(
+            requested_vz > 0.0 or forced_match_descent or terminal_blind_descent or sensor_final_active
+        )
         descent_blocked = bool(descent_requested and not descent_allowed)
         if reacquire_climb_active:
             vz = float(reacquire_vz)
@@ -4898,9 +7534,19 @@ class Agent2LandingEnv(gym.Env):
         yaw_rate = float(np.clip(raw[3], -0.20, 0.20)) * self.cfg.yaw_scale_dps
         vx, vy, guard_reasons = self._horizontal_lidar_guard(vx, vy, pre_info)
 
-        # Negative NED-Z is legal only for the deterministic reacquisition
-        # climb. PPO remains unable to request arbitrary upward motion.
-        if reacquire_climb_active:
+        if terminal_handoff_active:
+            # Agent 1 remains on the existing controlled X/Y/Yaw path. Terminal
+            # Z is already bounded by the range governor above; do not restore
+            # unrestricted signed policy authority at the command boundary.
+            reacquire_climb_active = False
+            vz = float(
+                np.clip(
+                    vz,
+                    -float(self.cfg.range_terminal_climb_max_vz_mps),
+                    float(self.cfg.vz_scale_mps),
+                )
+            )
+        elif reacquire_climb_active:
             vz = min(0.0, float(vz))
         else:
             vz = max(0.0, float(vz))
@@ -4908,11 +7554,20 @@ class Agent2LandingEnv(gym.Env):
         self._record_authorized_descent(pre_info, descent_allowed, vz)
 
         external_info: dict[str, Any] = {}
+        collision_now = False
+        collision_object = ""
+        collision_timestamp = 0
         external_executor = getattr(self, "_external_command_executor", None)
         if external_executor is not None:
-            # Agent 1 owns XY/Yaw and sends the only physical command. Agent 2
-            # contributes only its already-gated Z command.
-            external_info = dict(external_executor(vz) or {})
+            # Agent 2 exclusively owns collision detection in parallel landing.
+            # The fused Agent-1/Agent-2 command is watched while it executes, so
+            # first contact cancels motion before bounce/slide can corrupt XY.
+            (
+                external_info,
+                collision_now,
+                collision_object,
+                collision_timestamp,
+            ) = self._execute_with_agent2_collision_monitor(external_executor, vz)
             self._last_external_command_info = external_info
             vx = float(external_info.get("agent1_commanded_vx_mps", 0.0))
             vy = float(external_info.get("agent1_commanded_vy_mps", 0.0))
@@ -4930,11 +7585,78 @@ class Agent2LandingEnv(gym.Env):
                 vehicle_name=self.cfg.vehicle_name,
             ).join()
             self._last_external_command_info = {}
+            collision_now, collision_object, collision_timestamp = self._new_collision()
 
         self._last_applied_vz_mps = float(vz)
 
+        # Observation may occur after the contact, but touchdown classification
+        # continues to use pre_info captured before the command that touched.
         obs, info = self._observe()
-        collision_now, collision_object, collision_timestamp = self._new_collision()
+        info["range_sensor_final_active"] = bool(sensor_final_active)
+        info["range_sensor_final_reason"] = str(sensor_final_reason)
+        info["range_sensor_final_vz_mps"] = float(sensor_final_vz if sensor_final_active else 0.0)
+        info["range_terminal_contact_armed"] = bool(getattr(self, "_range_terminal_contact_armed", False))
+        info["range_terminal_handoff_active"] = bool(
+            getattr(self, "_range_terminal_handoff_active", False)
+        )
+        terminal_started_step = int(
+            getattr(self, "_range_terminal_contact_started_step", -1)
+        )
+        info["range_terminal_exploration_steps"] = int(
+            max(0, int(self._step) - terminal_started_step)
+            if terminal_started_step >= 0
+            else 0
+        )
+        info["range_terminal_exploration_max_steps"] = int(
+            self.cfg.range_terminal_contact_max_steps
+        )
+        info["terminal_policy_control_active"] = bool(
+            getattr(self, "_range_terminal_handoff_active", False)
+            and not getattr(self, "_range_terminal_handoff_timed_out", False)
+        )
+        info["terminal_range_governed_z"] = bool(
+            terminal_handoff_active and not terminal_hard_timeout
+        )
+        info["terminal_conditional_climb_authority"] = bool(
+            terminal_handoff_active
+            and not terminal_hard_timeout
+            and terminal_climb_allowed
+        )
+        info["terminal_climb_permission_reason"] = str(terminal_climb_reason)
+        info["terminal_inf_descent_active"] = bool(terminal_inf_descent_active)
+        info["policy_actions_suppressed_after_terminal_handoff"] = False
+        info["range_terminal_contact_last_safe_height_m"] = float(
+            getattr(self, "_range_terminal_contact_last_safe_height_m", float("inf"))
+        )
+        terminal_snapshot = getattr(self, "_range_terminal_contact_snapshot", None)
+        info["range_terminal_handoff_timed_out"] = bool(
+            getattr(self, "_range_terminal_handoff_timed_out", False)
+        )
+        info["range_terminal_snapshot_valid"] = bool(
+            isinstance(terminal_snapshot, dict)
+            and terminal_snapshot.get("valid", False)
+        )
+        info["range_terminal_snapshot_center_error_m"] = float(
+            terminal_snapshot.get("center_error_m", float("inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("inf")
+        )
+        info["range_terminal_snapshot_similarity"] = float(
+            terminal_snapshot.get("similarity", 0.0)
+            if isinstance(terminal_snapshot, dict)
+            else 0.0
+        )
+        info["range_terminal_snapshot_bbox_rel_error"] = float(
+            terminal_snapshot.get("bbox_rel_error", float("inf"))
+            if isinstance(terminal_snapshot, dict)
+            else float("inf")
+        )
+        info["range_terminal_snapshot_target_id"] = str(
+            terminal_snapshot.get("target_id", "")
+            if isinstance(terminal_snapshot, dict)
+            else ""
+        )
+        info["range_reliable_floor_m"] = float(self.cfg.range_sensor_final_stop_m)
 
         center_error = float(info["bottom_center_error"])
         bbox_rel = float(info["bottom_bbox_rel_err"])
@@ -4958,15 +7680,30 @@ class Agent2LandingEnv(gym.Env):
         shaping = float(center_bank + progress_bank + smooth_bank)
         self._reward_bank += max(0.0, shaping)
 
-        # Update touchdown evidence before evaluating a collision from this
-        # physical step. The visual latch covers a short detector gap; the
-        # physical flag records that an ACTUAL, alignment-authorized descent
-        # occurred at least once in the current episode.
+        # The previous collision path classified contact from ``pre_info`` captured
+        # before the 250ms command. That value can be visibly stale at contact.
+        # When the identity-anchored terminal point survived into the first frame
+        # captured after motion cancellation, use that stopped-contact frame. A
+        # detector-only post-contact BBox is never allowed to replace the older
+        # BEST sample, which still prevents a seat/logo close-up from approving
+        # a bad touchdown.
+        collision_measurement_info = pre_info
+        if collision_now and bool(info.get("bottom_terminal_anchor_valid", False)):
+            collision_measurement_info = dict(info)
+            collision_measurement_info["bottom_touchdown_decision_context"] = (
+                "FIRST_CONTACT_STOPPED_FRAME"
+            )
+        collision_decision = self._collision_reward_decision(
+            info=info,
+            pre_contact_info=collision_measurement_info,
+            collision_object=collision_object,
+            collision_now=collision_now,
+        )
+
+        # Update historical diagnostics only after the touchdown decision, so
+        # the post-contact frame can never approve the collision retroactively.
         self._update_verified_alignment_latch(info)
         self._update_authorized_descent_latch_after_observation(info)
-        collision_decision = self._collision_reward_decision(
-            info, collision_object, collision_now=collision_now
-        )
         if bool(self.cfg.parallel_dual_agent_mode):
             recovery_decision = {
                 "requested": False,
@@ -5001,27 +7738,74 @@ class Agent2LandingEnv(gym.Env):
         reason = ""
         reward = float(dense_reward)
         good_xy = bool(collision_decision["success"])
+        latch_attempted = False
+        latch_succeeded = False
+        latch_error = ""
+        touchdown_accepted_monotonic: float | None = None
 
         if collision_now:
             done = True
             if good_xy:
                 reason = "landing_collision_success"
-                reward += float(np.clip(
-                    self.cfg.success_base_reward + self._reward_bank,
+                print(
+                    "[A2 SUCCESS GATE] accepted | "
+                    f"path={collision_decision['success_path']} "
+                    f"center={collision_decision['collision_recent_center_error']:.3f} "
+                    f"bboxRelQuality={collision_decision['collision_recent_bbox_rel_error']:.3f} "
+                    f"simQuality={collision_decision['collision_recent_similarity']:.3f} "
+                    f"age={collision_decision['collision_recent_legacy_age']}"
+                )
+                terminal_quality_reward, terminal_quality_parts = (
+                    self._terminal_landing_quality_reward(collision_decision)
+                )
+                terminal_success_reward = float(np.clip(
+                    self.cfg.success_base_reward
+                    + self._reward_bank
+                    + terminal_quality_reward,
                     self.cfg.success_min_reward,
                     self.cfg.success_max_reward,
                 ))
+                reward += terminal_success_reward
+                print(
+                    "[A2 LANDING QUALITY] "
+                    f"center={terminal_quality_parts['center']:+.1f} "
+                    f"bboxRel={terminal_quality_parts['bbox_rel']:+.1f} "
+                    f"similarity={terminal_quality_parts['similarity']:+.1f} "
+                    f"bank={self._reward_bank:+.1f} "
+                    f"terminal={terminal_success_reward:+.1f}"
+                )
                 # Calibrate in raw AirSim NED-Z, the same coordinate used by
                 # the drone state. No abs()/sign conversion is involved.
                 self._target_surface_z_ned = float(info["drone_z_ned"])
                 self._target_surface_altitude_m = max(0.0, -self._target_surface_z_ned)
                 self._target_surface_source = "verified_collision_api_z_ned"
-            elif collision_decision["success_path"] != "NONE":
+
+                # Capture time-to-touchdown before the blocking latch RPC and
+                # success hold. The timing curriculum measures flight only.
+                touchdown_accepted_monotonic = float(time.monotonic())
+
+                # The latch is deliberately downstream of the verified
+                # collision + XY gate. It can never turn a failed contact into
+                # a success and is never called for timeout, ground contact or
+                # bad alignment. The blocking hold happens only after the
+                # terminal reward has been computed for this transition.
+                latch_attempted = bool(self.cfg.latch_on_success)
+                if latch_attempted:
+                    latch_succeeded, latch_error = (
+                        self._latch_vehicle_after_success()
+                    )
+            elif collision_decision.get(
+                "collision_known_wrong_object_contact", False
+            ):
                 reason = "landing_collision_wrong_object"
                 reward -= float(self.cfg.wrong_collision_penalty)
             else:
                 reason = "landing_collision_bad_xy"
                 reward -= float(self.cfg.wrong_collision_penalty)
+        elif terminal_hard_timeout:
+            done = True
+            reason = "landing_terminal_contact_timeout"
+            reward -= float(self.cfg.timeout_penalty)
         elif self._step >= int(self.cfg.max_episode_steps):
             done = True
             reason = "landing_timeout_no_collision"
@@ -5134,6 +7918,26 @@ class Agent2LandingEnv(gym.Env):
                 "collision_object_name": collision_object,
                 "collision_timestamp": collision_timestamp,
                 "collision_good_xy": good_xy,
+                "latch_on_success_enabled": bool(self.cfg.latch_on_success),
+                "latch_attempted": bool(latch_attempted),
+                "latch_succeeded": bool(latch_succeeded),
+                "latch_error": str(latch_error),
+                "latch_vehicle_name": str(self.cfg.latch_vehicle_name),
+                "latch_target_actor_name": str(self.cfg.latch_target_actor_name),
+                "latch_anchor_component_name": str(self.cfg.latch_anchor_component_name),
+                "latch_success_hold_seconds": float(self.cfg.latch_success_hold_seconds),
+                "touchdown_accepted_monotonic": touchdown_accepted_monotonic,
+                "terminal_signed_z_authority": False,
+                "terminal_range_governed_z": bool(
+                    terminal_handoff_active and not terminal_hard_timeout
+                ),
+                "terminal_conditional_climb_authority": bool(
+                    terminal_handoff_active
+                    and not terminal_hard_timeout
+                    and terminal_climb_allowed
+                ),
+                "terminal_climb_permission_reason": str(terminal_climb_reason),
+                "terminal_inf_descent_active": bool(terminal_inf_descent_active),
                 "collision_alignment_success_path": collision_decision["success_path"],
                 "collision_live_match_at_contact": collision_decision["live_match_at_collision"],
                 "collision_contact_appearance_valid": collision_decision["contact_appearance_valid"],
@@ -5142,6 +7946,23 @@ class Agent2LandingEnv(gym.Env):
                 "collision_contact_center_margin": collision_decision["contact_center_margin"],
                 "collision_contact_best_center_scale": collision_decision["contact_best_center_scale"],
                 "collision_contact_appearance_reason": collision_decision["contact_appearance_reason"],
+                "collision_xy_threshold_m": collision_decision["collision_xy_threshold_m"],
+                "collision_xy_legacy_error_m": collision_decision["collision_xy_legacy_error_m"],
+                "collision_xy_legacy_valid": collision_decision["collision_xy_legacy_valid"],
+                "collision_xy_geometric_error_m": collision_decision["collision_xy_geometric_error_m"],
+                "collision_xy_geometric_valid": collision_decision["collision_xy_geometric_valid"],
+                "collision_xy_geometric_source": collision_decision["collision_xy_geometric_source"],
+                "collision_xy_combined_error_m": collision_decision["collision_xy_combined_error_m"],
+                "collision_xy_combined_valid": collision_decision["collision_xy_combined_valid"],
+                "collision_xy_selected_source": collision_decision["collision_xy_selected_source"],
+                "collision_terminal_snapshot_valid": collision_decision["collision_terminal_snapshot_valid"],
+                "collision_terminal_snapshot_identity_ok": collision_decision["collision_terminal_snapshot_identity_ok"],
+                "collision_terminal_snapshot_center_pass": collision_decision["collision_terminal_snapshot_center_pass"],
+                "collision_terminal_snapshot_center_error_m": collision_decision["collision_terminal_snapshot_center_error_m"],
+                "collision_terminal_snapshot_similarity": collision_decision["collision_terminal_snapshot_similarity"],
+                "collision_terminal_snapshot_bbox_rel_error": collision_decision["collision_terminal_snapshot_bbox_rel_error"],
+                "collision_terminal_snapshot_age_steps": collision_decision["collision_terminal_snapshot_age_steps"],
+                "collision_terminal_snapshot_age_s": collision_decision["collision_terminal_snapshot_age_s"],
                 "collision_alignment_latch_age": collision_decision["alignment_latch_age"],
                 "collision_last_verified_center_error": collision_decision["last_verified_center_error"],
                 "collision_last_verified_bbox_rel_error": collision_decision["last_verified_bbox_rel_error"],
@@ -5154,6 +7975,8 @@ class Agent2LandingEnv(gym.Env):
                 "collision_last_authorized_descent_vz_mps": collision_decision["last_authorized_descent_vz_mps"],
                 "collision_authorized_descent_invalidated_reason": collision_decision["authorized_descent_invalidated_reason"],
                 "collision_object_matches_target": collision_decision["collision_object_matches_target"],
+                "collision_object_name_available": collision_decision["collision_object_name_available"],
+                "collision_known_wrong_object_contact": collision_decision["collision_known_wrong_object_contact"],
                 "collision_object_lock_created": collision_decision["collision_object_lock_created"],
                 "expected_collision_object_name": collision_decision["expected_collision_object_name"],
                 "expected_collision_object_source": collision_decision["expected_collision_object_source"],
@@ -5219,6 +8042,9 @@ class Agent2LandingEnv(gym.Env):
                 f"cornerSim={float(collision_decision['contact_corner_similarity']):.3f} "
                 f"contactMargin={float(collision_decision['contact_center_margin']):+.3f} "
                 f"contactScale={float(collision_decision['contact_best_center_scale']):.2f} "
+                f"xyRecent={float(collision_decision['collision_xy_legacy_error_m']):.3f} "
+                f"xyAge={int(collision_decision.get('collision_recent_legacy_age', 999999))} "
+                f"xySrc={collision_decision['collision_xy_selected_source']} "
                 f"latchAge={int(collision_decision['alignment_latch_age'])} "
                 f"lastCenter={float(collision_decision['last_verified_center_error']):.3f} "
                 f"lastBBoxRel={float(collision_decision['last_verified_bbox_rel_error']):.3f} "

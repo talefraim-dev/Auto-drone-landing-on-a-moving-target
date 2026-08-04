@@ -19,7 +19,7 @@ from observation_builder import (
 )
 from safety_filter import SafetyConfig, safety_filter
 from lidar_processor import LidarProcessor, LidarProcessorConfig, point_cloud_to_array
-from follow_reward_v37 import FollowRewardConfig, compute_follow_reward
+from follow_reward import FollowRewardConfig, compute_follow_reward
 
 
 class DroneEnv(gym.Env):
@@ -485,6 +485,14 @@ class DroneEnv(gym.Env):
         self._parallel_bottom_snapshot_monotonic = 0.0
         self._agent1_bottom_perception_shared = False
 
+        # Agent-2-owned synchronous first-contact probe. Agent 1 never queries
+        # collision state; it only invokes this callback during active motion.
+        self._external_first_contact_probe = None
+
+    def set_external_first_contact_probe(self, callback) -> None:
+        """Register Agent 2's collision probe for parallel landing motion."""
+        self._external_first_contact_probe = callback
+
     def set_parallel_dual_agent_mode(self, enabled: bool) -> None:
         """Enable continuous Agent-1 tracking after landing authority begins."""
         self._parallel_dual_agent_mode = bool(enabled)
@@ -879,6 +887,18 @@ class DroneEnv(gym.Env):
         safety is active.
         """
         requested = float(requested_vz_mps)
+
+        # Agent-2 forced-contact diagnostic mode. A LIVE downward-camera match
+        # means Agent 2 has explicitly requested uninterrupted descent until
+        # collision. Do not let Agent-1 LiDAR/proximity Z gates cancel or cap
+        # that command; Agent 1 still owns XY/yaw and never polls collision.
+        if (
+            requested > 0.0
+            and bool(getattr(self, "_parallel_dual_agent_mode", False))
+            and bool(getattr(self, "_parallel_bottom_measurement_live", False))
+        ):
+            return requested, False, False
+
         blocked = bool(
             hard_safety
             or (
@@ -922,6 +942,7 @@ class DroneEnv(gym.Env):
         bottom_measurement_live: bool = False,
         bottom_predictive_catchup: bool = False,
         reacquire_climb_active: bool = False,
+        terminal_contact_hold: bool = False,
     ) -> None:
         """Set the components used by the single parallel command mixer.
 
@@ -951,6 +972,7 @@ class DroneEnv(gym.Env):
             bottom_predictive_catchup
         )
         self._parallel_reacquire_climb_active = bool(reacquire_climb_active)
+        self._parallel_terminal_contact_hold = bool(terminal_contact_hold)
 
     @staticmethod
     def _fuse_parallel_xy(
@@ -4223,6 +4245,16 @@ class DroneEnv(gym.Env):
                 ),
                 bottom_guidance_active=bool(trusted_bottom_guidance),
             )
+            if bool(getattr(self, "_parallel_terminal_contact_hold", False)):
+                # Deterministic final handoff: do not accept new close-range
+                # visual corrections. Hold XY and yaw while Agent 2 supplies
+                # only the slow terminal Z command.
+                vx_cmd = 0.0
+                vy_cmd = 0.0
+                yaw_rate_cmd = 0.0
+                safety_info.setdefault("safety_reasons", []).append(
+                    "range_terminal_handoff_xy_yaw_hold"
+                )
 
             # Z authority is exclusive, but Agent-1's physical safety layer
             # remains authoritative at the single command boundary. In
@@ -4275,21 +4307,62 @@ class DroneEnv(gym.Env):
         # slow vision cycle. After the pulse finishes, bridge only the much lower
         # XY velocity that the vehicle actually achieved.
         control_period_s = self._measure_command_bridge_period()
-        self.client.moveByVelocityBodyFrameAsync(
+        command_duration_s = float(self.cfg.cmd_duration_s)
+        command_future = self.client.moveByVelocityBodyFrameAsync(
             vx=vx_cmd,
             vy=vy_cmd,
             vz=vz_cmd,
-            duration=float(self.cfg.cmd_duration_s),
+            duration=command_duration_s,
             yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate_cmd),
             vehicle_name=self.cfg.vehicle_name,
-        ).join()
-        self._issue_command_bridge(
-            requested_vx_mps=float(vx_cmd),
-            requested_vy_mps=float(vy_cmd),
-            tracking_mode=previous_mode,
-            safety_info=safety_info,
-            control_period_s=float(control_period_s),
         )
+
+        # During parallel landing, Agent 2 synchronously owns collision polling.
+        # Poll throughout the complete physical command instead of blocking in
+        # join(), so first roof contact is acted on before bounce or slide.
+        first_contact = False
+        probe = self._external_first_contact_probe if self._parallel_dual_agent_mode else None
+        if probe is not None:
+            deadline = time.monotonic() + max(0.0, command_duration_s)
+            poll_s = 0.010
+            while time.monotonic() < deadline:
+                try:
+                    if bool(probe()):
+                        first_contact = True
+                        break
+                except Exception as exc:
+                    print(f"[A2 COLLISION PROBE CALLBACK ERROR] {type(exc).__name__}: {exc}")
+                    break
+                time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+            if first_contact:
+                try:
+                    self.client.cancelLastTask(vehicle_name=self.cfg.vehicle_name)
+                except TypeError:
+                    self.client.cancelLastTask()
+                except Exception:
+                    pass
+                self._cancel_command_bridge("A2_FIRST_CONTACT", send_zero=True)
+            else:
+                command_future.join()
+        else:
+            command_future.join()
+
+        # No asynchronous post-pulse bridge is allowed in parallel landing. It
+        # would create an unmonitored movement interval after the 0.25 s command.
+        if self._parallel_dual_agent_mode:
+            self._command_bridge_active = False
+            self._command_bridge_last_duration_s = 0.0
+            self._command_bridge_last_reason = (
+                "A2_FIRST_CONTACT" if first_contact else "PARALLEL_0P25_COMMAND_NO_BRIDGE"
+            )
+        else:
+            self._issue_command_bridge(
+                requested_vx_mps=float(vx_cmd),
+                requested_vy_mps=float(vy_cmd),
+                tracking_mode=previous_mode,
+                safety_info=safety_info,
+                control_period_s=float(control_period_s),
+            )
 
         frame = self._get_frame()
         bbox_raw = self.tracker.update(frame)
@@ -4620,7 +4693,12 @@ class DroneEnv(gym.Env):
         collision_object_name = ""
         collision_penetration_depth = 0.0
 
-        if self.cfg.use_collision_termination:
+        # In parallel Agent1+Agent2 landing, collision ownership belongs only
+        # to Agent 2. Agent 1 still computes XY/Yaw and safety diagnostics, but
+        # it must not poll or terminate on target contact.
+        if self.cfg.use_collision_termination and not bool(
+            getattr(self, "_parallel_dual_agent_mode", False)
+        ):
             try:
                 col = self.client.simGetCollisionInfo(vehicle_name=self.cfg.vehicle_name)
 

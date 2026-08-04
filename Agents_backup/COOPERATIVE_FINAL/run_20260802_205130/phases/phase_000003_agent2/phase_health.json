@@ -1,0 +1,30 @@
+{
+  "role": "AGENT2",
+  "episodes": 85,
+  "rpc_successes": 84,
+  "rpc_success_rate": 0.9882352941176471,
+  "touchdowns": 84,
+  "touchdown_rate": 0.9882352941176471,
+  "safe_handoffs": 84,
+  "safe_handoff_rate": 0.9882352941176471,
+  "timeout_count": 0,
+  "wrong_object_successes": 0,
+  "terminal_latch_violations": 0,
+  "mean_terminal_center_error_m": 0.1342792271907166,
+  "mean_episode_reward": 7868.3014446823545,
+  "mean_touchdown_time_s": 39.51179761904253,
+  "median_touchdown_time_s": 38.789500000013504,
+  "mean_touchdown_time_reward": -0.1522338363038002,
+  "touchdown_time_classifications": {
+    "FASTER_THAN_MEDIAN": 45,
+    "SLOWER_THAN_MEDIAN": 39,
+    "NO_SUCCESS_NO_UPDATE": 1
+  },
+  "failure_reasons": {
+    "landing_collision_bad_xy": 1
+  },
+  "rolling_window_episodes": 20,
+  "rolling_rpc_success_rate": 1.0,
+  "model_timesteps": 7750,
+  "updated_utc": "2026-08-03T22:01:01Z"
+}

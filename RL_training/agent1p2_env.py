@@ -4,12 +4,12 @@ Agent 1 never leaves the control loop after the initial landing-ready event.
 It continuously owns yaw and search/reacquire tracking while its front and
 bottom camera trackers remain active. During trusted Bottom LIVE/PRED guidance,
 the bottom visual-motion controller owns landing X/Y. Agent 2 continuously
-receives its 37-value landing observation and owns only vertical NED-Z.
+receives its 46-value landing observation (37 base + 9 range features) and owns only vertical NED-Z.
 
 A single AirSim velocity command is sent per environment step:
     X/Y = bottom-camera t+1 predictive tracking + target-velocity feed-forward
-          whenever Bottom LIVE exists; otherwise frozen Agent 1 search/chase
-    Yaw = frozen Agent 1
+          whenever Bottom LIVE exists; otherwise the current Agent 1 search/chase policy
+    Yaw = current Agent 1 policy
     Z   = Agent 2, gated by bottom prediction and landing safety
 
 There is no Agent-2 -> Agent-1 recovery cycle. When the bottom target is lost,
@@ -83,7 +83,7 @@ def exact_env_config_for_checkpoint(checkpoint: Path) -> tuple[EnvConfig, Path]:
 
 
 class Agent1P2Env(gym.Env):
-    """Train Agent 2 while frozen Agent 1 remains active on every control step."""
+    """Fuse the current Agent-1 XY/Yaw policy with Agent-2 Z control."""
 
     metadata = {"render_modes": []}
 
@@ -120,6 +120,12 @@ class Agent1P2Env(gym.Env):
             self.agent1_checkpoint
         )
 
+        # Parallel-only final-metre overrides. The physical fused command is
+        # held for 0.25 s and is synchronously monitored by Agent 2. Disable the
+        # asynchronous bridge so no movement occurs outside that monitored window.
+        agent1_cfg.cmd_duration_s = 0.25
+        agent1_cfg.command_bridge_enabled = False
+
         # Parallel-only final-metre overrides. The checkpoint snapshot remains
         # the source of truth for the frozen Agent-1 policy; only the post-pulse
         # bridge and the external Agent-2 Z safety cap are adjusted for the
@@ -150,6 +156,7 @@ class Agent1P2Env(gym.Env):
         self.max_steps_per_attempt = max(1, int(max_steps_per_attempt))
 
         cfg = agent2_config or Agent2Config()
+        cfg.cmd_duration_s = 0.25
         cfg.parallel_dual_agent_mode = True
         self.agent2_env = Agent2LandingEnv(cfg=cfg)
         self.action_space = self.agent2_env.action_space
@@ -191,6 +198,36 @@ class Agent1P2Env(gym.Env):
         self.agent2_env.set_external_command_executor(
             self._execute_parallel_command
         )
+        self.agent2_env.set_external_motion_stop_callback(
+            self._stop_parallel_motion_from_agent2
+        )
+        self.agent1_env.set_external_first_contact_probe(
+            self.agent2_env.poll_first_contact
+        )
+
+
+    def _stop_parallel_motion_from_agent2(self, reason: str) -> None:
+        """Stop Agent-1-owned motion after Agent 2 detects first contact.
+
+        This method deliberately performs no collision query. Agent 2 remains
+        the exclusive collision owner; Agent 1 only cancels its asynchronous
+        command bridge and sends an explicit zero-velocity hold.
+        """
+        try:
+            self.agent1_env._cancel_command_bridge(str(reason), send_zero=True)
+        except Exception as exc:
+            print(f"[A2 FIRST CONTACT] Agent-1 bridge cancel failed: {exc}")
+        try:
+            self.agent1_env.client.cancelLastTask(
+                vehicle_name=self.agent1_env.cfg.vehicle_name
+            )
+        except TypeError:
+            try:
+                self.agent1_env.client.cancelLastTask()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _agent1_step(self, action):
         if self._verbose_runtime:
@@ -316,6 +353,12 @@ class Agent1P2Env(gym.Env):
         agent1_action, _state = self.agent1_model.predict(
             self._agent1_obs, deterministic=self.agent1_deterministic
         )
+        terminal_contact_hold = bool(
+            getattr(self.agent2_env, "_range_terminal_handoff_active", False)
+        )
+        # The terminal range latch no longer freezes Agent 1. Its X/Y/Yaw
+        # action continues through the same bottom-guidance blending, speed
+        # limits, smoothing, and physical safety filters used before handoff.
 
         ff_vx, ff_vy, ff_valid = (
             self.agent2_env.get_target_velocity_feedforward_body()
@@ -351,6 +394,8 @@ class Agent1P2Env(gym.Env):
             self.bottom_pd_correction_gain
             * float(bottom_guidance.get("bottom_correction_vy_mps", 0.0))
         )
+        # Keep the existing state-dependent feed-forward and bottom-camera
+        # correction active during the terminal exploration window.
 
         # Agent 2 already computed the bottom frame for this control cycle.
         # Reuse that exact perception state in Agent 1 instead of capturing and
@@ -375,6 +420,9 @@ class Agent1P2Env(gym.Env):
             reacquire_climb_active=bool(
                 getattr(self.agent2_env, "_reacquire_climb_active", False)
             ),
+            # The range latch is still reported for state/timeout tracking,
+            # but it must not activate DroneEnv's legacy XY/Yaw freeze.
+            terminal_contact_hold=False,
         )
 
         obs, agent1_reward, done, truncated, info = self._agent1_step(
@@ -396,6 +444,18 @@ class Agent1P2Env(gym.Env):
 
         return {
             "parallel_command_executed": True,
+            "range_terminal_handoff_active": bool(terminal_contact_hold),
+            "terminal_policy_control_active": bool(terminal_contact_hold),
+            "policy_actions_suppressed_after_terminal_handoff": False,
+            "agent1_command_bridge_active": bool(
+                self._agent1_last_info.get("command_bridge_active", False)
+            ),
+            "agent1_command_bridge_duration_s": float(
+                self._agent1_last_info.get("command_bridge_duration_s", 0.0) or 0.0
+            ),
+            "agent1_command_bridge_reason": str(
+                self._agent1_last_info.get("command_bridge_reason", "UNKNOWN")
+            ),
             "agent1_reward_diagnostic": float(agent1_reward),
             "agent1_done_diagnostic": bool(done or truncated),
             "agent1_critical": bool(critical),
