@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import math
+import re
 import sys
 import time
 import traceback
@@ -369,11 +370,13 @@ CSV_FIELDS = [
     "target_physical_area_m2",
     "target_width_m",
     "target_length_m",
+    "initial_altitude_m",
     "success",
     "physical_contact",
     "landing_accepted",
     "rpc_latch_success",
     "termination_reason",
+    "failure_reason",
     "error_type",
     "error_message",
     "total_flight_steps",
@@ -434,6 +437,50 @@ CSV_FIELDS = [
 ]
 
 
+def _parse_attempt_exception(error_type: str, error_message: str) -> tuple[str, str]:
+    """Convert benchmark exceptions into stable failure labels."""
+
+    message = (error_message or "").strip()
+    if not error_type:
+        return "", ""
+
+    if error_type == "RuntimeError":
+        if "Frozen Agent 1 did not reach landing-ready state" in message:
+            match = re.search(r"Last reason=([^\s]+)", message)
+            last_reason = match.group(1) if match else "unknown"
+            termination_reason = "agent1_landing_ready_timeout"
+            failure_reason = (
+                f"agent1_not_landing_ready:last_reason={last_reason}"
+            )
+            return termination_reason, failure_reason
+
+    termination_reason = "tester_exception"
+    failure_reason = message or error_type
+    return termination_reason, failure_reason
+
+
+def _resolve_failure_reason(
+    *,
+    success: bool,
+    termination_reason: str,
+    error_type: str,
+    error_message: str,
+) -> str:
+    if success:
+        return ""
+    if error_type:
+        parsed_termination_reason, parsed_failure_reason = _parse_attempt_exception(
+            error_type, error_message
+        )
+        if parsed_failure_reason:
+            return parsed_failure_reason
+        if parsed_termination_reason:
+            return parsed_termination_reason
+    return termination_reason or error_message or error_type or "unknown_failure"
+
+
+
+
 def _build_row(
     *,
     run_id: str,
@@ -443,6 +490,7 @@ def _build_row(
     target_physical_area_m2: float,
     target_width_m: float,
     target_length_m: float,
+    initial_altitude_m: float,
     telemetry: AttemptTelemetry,
     final_info: dict[str, Any],
     termination_reason: str,
@@ -474,6 +522,13 @@ def _build_row(
         and models_unchanged
     )
 
+    failure_reason = _resolve_failure_reason(
+        success=success,
+        termination_reason=termination_reason,
+        error_type=error_type,
+        error_message=error_message,
+    )
+
     landing_xy_error, landing_xy_source = _landing_xy_error(final_info)
 
     terminal_duration_s = float("nan")
@@ -499,11 +554,13 @@ def _build_row(
         "target_physical_area_m2": target_physical_area_m2,
         "target_width_m": target_width_m,
         "target_length_m": target_length_m,
+        "initial_altitude_m": initial_altitude_m,
         "success": success,
         "physical_contact": physical_contact,
         "landing_accepted": landing_accepted,
         "rpc_latch_success": latch_success,
         "termination_reason": termination_reason,
+        "failure_reason": failure_reason,
         "error_type": error_type,
         "error_message": error_message,
         "total_flight_steps": total_flight_steps,
@@ -722,6 +779,16 @@ def main() -> int:
         help="Optional physical landing-surface length in metres.",
     )
     parser.add_argument(
+        "--initial-altitude-m",
+        type=float,
+        default=None,
+        help=(
+            "Optional experiment override for both reset takeoff altitude "
+            "and Agent-1 altitude-hold target. When omitted, the frozen "
+            "Agent-1 training snapshot value is preserved."
+        ),
+    )
+    parser.add_argument(
         "--continue-after-exception",
         action="store_true",
         help=(
@@ -735,6 +802,8 @@ def main() -> int:
         raise ValueError("--attempts must be positive.")
     if args.max_steps <= 0:
         raise ValueError("--max-steps must be positive.")
+    if args.initial_altitude_m is not None and args.initial_altitude_m <= 0.0:
+        raise ValueError("--initial-altitude-m must be greater than zero.")
 
     missing = [
         path for path in (AGENT1_MODEL, AGENT2_MODEL) if not path.is_file()
@@ -791,6 +860,27 @@ def main() -> int:
         device=device,
         target_identity=None,
         agent2_config=agent2_cfg,
+    )
+
+    # Experiment-only override applied after the checkpoint snapshot has
+    # created Agent 1's environment. This keeps the frozen model and snapshot
+    # untouched while allowing controlled altitude-vs-target-size tests.
+    if args.initial_altitude_m is not None:
+        altitude_m = float(args.initial_altitude_m)
+        parallel_env.agent1_env.cfg.reset_takeoff_altitude_m = altitude_m
+        parallel_env.agent1_env.cfg.altitude_hold_target_m = altitude_m
+
+    effective_initial_altitude_m = float(
+        parallel_env.agent1_env.cfg.reset_takeoff_altitude_m
+    )
+    effective_hold_altitude_m = float(
+        parallel_env.agent1_env.cfg.altitude_hold_target_m
+    )
+    print(
+        "[LANDING BENCHMARK] Initial altitude override: "
+        f"reset={effective_initial_altitude_m:.2f}m "
+        f"hold={effective_hold_altitude_m:.2f}m "
+        f"source={'tester' if args.initial_altitude_m is not None else 'snapshot'}"
     )
 
     # Block training/checkpoint writes for the frozen Agent-1 policy too.
@@ -898,11 +988,19 @@ def main() -> int:
             except Exception as exc:
                 error_type = type(exc).__name__
                 error_message = str(exc)
-                termination_reason = "tester_exception"
+                termination_reason, parsed_failure_reason = _parse_attempt_exception(
+                    error_type, error_message
+                )
                 print(
                     f"[LANDING BENCHMARK] Attempt exception: "
                     f"{error_type}: {error_message}"
                 )
+                if parsed_failure_reason:
+                    print(
+                        "[LANDING BENCHMARK] Exception converted to failure row: "
+                        f"termination_reason={termination_reason} "
+                        f"failure_reason={parsed_failure_reason}"
+                    )
                 traceback.print_exc()
 
             duration_s = time.monotonic() - attempt_started
@@ -935,6 +1033,7 @@ def main() -> int:
                 target_physical_area_m2=args.target_area_m2,
                 target_width_m=args.target_width_m,
                 target_length_m=args.target_length_m,
+                initial_altitude_m=effective_initial_altitude_m,
                 telemetry=current_telemetry,
                 final_info=final_info,
                 termination_reason=termination_reason,
@@ -975,10 +1074,9 @@ def main() -> int:
 
             if error_type and not args.continue_after_exception:
                 print(
-                    "[LANDING BENCHMARK] Stopping after unexpected exception. "
-                    "Use --continue-after-exception only when appropriate."
+                    "[LANDING BENCHMARK] Exception recorded as failure. "
+                    "Benchmark continues to the next attempt."
                 )
-                break
 
     finally:
         env.close()

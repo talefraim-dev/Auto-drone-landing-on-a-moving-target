@@ -87,7 +87,7 @@ class EnvConfig:
     # -----------------------------
     # Reset / takeoff
     # -----------------------------
-    reset_takeoff_altitude_m: float = 5.0
+    reset_takeoff_altitude_m: float = 0.0
     reset_move_to_z_velocity: float = 2.0
     reset_settle_sec: float = 0.5
     # For RL chase/follow training, episodes should start already airborne.
@@ -240,7 +240,7 @@ class EnvConfig:
     # Dynamic altitude safety / hold
     # -----------------------------
     altitude_hold_enabled: bool = True
-    altitude_hold_target_m: float = 5.0
+    altitude_hold_target_m: float = 0.0
     altitude_hold_kp: float = 0.35
     altitude_hold_max_vz_mps: float = 0.80
 
