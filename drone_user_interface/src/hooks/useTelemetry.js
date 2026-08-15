@@ -20,6 +20,7 @@ export const useTelemetry = (stream) => {
 
   useEffect(() => {
     const handleTelemetry = (response) => {
+        console.log("Raw response received from Unreal:", response);
         try {
             const data = JSON.parse(response);
 
