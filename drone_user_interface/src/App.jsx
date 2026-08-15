@@ -56,10 +56,19 @@ function App() {
                 <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
                     <span>BATTERY</span><span style={{color: telemetry.bat > 30 ? 'cyan' : 'red'}}>{Math.floor(Number(telemetry.bat))}%</span>
                 </div>
+                
                 <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
                     <div style={{width:`${telemetry.bat}%`, height:'100%', background: telemetry.bat > 30 ? 'cyan' : 'red'}}></div>
                 </div>
 
+                <div style={{marginTop: 10}}>
+                    <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
+                        <span>LINK QUALITY</span><span style={{color: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}>{Math.floor(telemetry.linkQuality)}%</span>
+                    </div>
+                    <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
+                        <div style={{width:`${telemetry.linkQuality}%`, height:'100%', background: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}></div>
+                    </div>
+                </div>
                 <div style={{display:'flex', gap: 5}}>
                     <div style={{background: '#080a10', padding: 5, flex:1, textAlign:'center', border: '1px solid #333'}}>
                         <div style={{fontSize: 9, color:'#888', marginBottom:2}}>CORE TEMP</div>
@@ -70,6 +79,7 @@ function App() {
                         <div style={{fontSize: 14, color: telemetry.escTemp > 80 ? 'red' : '#e0e6ed', fontWeight: 'bold'}}>{telemetry.escTemp.toFixed(1)}°C</div>
                     </div>
                 </div>
+                
             </div>
         </div>
 
