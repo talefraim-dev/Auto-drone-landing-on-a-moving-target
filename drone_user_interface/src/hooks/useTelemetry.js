@@ -12,7 +12,7 @@ const translateUnrealToLng = (unrealY) => {
   return lngMin + ((unrealY - unrealMin) * (lngMax - lngMin)) / (unrealMax - unrealMin);
 };
 
-export const useTelemetry = (stream) => {
+export const useTelemetry = () => {
   const [telemetry, setTelemetry] = useState({
     alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
     pitch: 0, roll: 0, yaw: 0, 
@@ -20,29 +20,31 @@ export const useTelemetry = (stream) => {
   });
 
   useEffect(() => {
-    const handleTelemetry = (response) => {
-        console.log("Raw response received from Unreal:", response);
-        try {
-            const data = JSON.parse(response);
+    const ws = new WebSocket('ws://127.0.0.1:4000');
 
-            setTelemetry(prev => ({
-                ...prev,
-                lat: data.X !== undefined ? translateUnrealToLat(data.X) : prev.lat,
-                lng: data.Y !== undefined ? translateUnrealToLng(data.Y) : prev.lng,
-                alt: data.Z !== undefined ? data.Z / 100 : prev.alt, 
-                speed: data.Speed !== undefined ? data.Speed : prev.speed,
-                pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
-                roll: data.Roll !== undefined ? data.Roll : prev.roll,
-                yaw: data.Yaw !== undefined ? data.Yaw : prev.yaw,
-            }));
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            
+            if (data.type === "Telemetry") {
+                setTelemetry(prev => ({
+                    ...prev,
+                    lat: data.X !== undefined ? translateUnrealToLat(data.X) : prev.lat,
+                    lng: data.Y !== undefined ? translateUnrealToLng(data.Y) : prev.lng,
+                    alt: data.Z !== undefined ? data.Z / 100 : prev.alt, 
+                    speed: data.Speed !== undefined ? data.Speed : prev.speed,
+                    pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
+                    roll: data.Roll !== undefined ? data.Roll : prev.roll,
+                    yaw: data.Yaw !== undefined ? data.Yaw : prev.yaw,
+                }));
+            }
         } catch (err) {
-            console.error("Failed to parse telemetry:", err);
+            console.error("Failed to parse telemetry from WS:", err);
         }
     };
 
-    if (stream) {
-        stream.addResponseEventListener("Telemetry", handleTelemetry);
-    }
+    ws.onopen = () => console.log("Connected to Telemetry Server");
+    ws.onerror = (err) => console.error("Telemetry WS Error:", err);
 
     const interval = setInterval(() => {
         setTelemetry(prev => ({
@@ -55,11 +57,9 @@ export const useTelemetry = (stream) => {
 
     return () => {
         clearInterval(interval);
-        if (stream) {
-            stream.removeResponseEventListener("Telemetry");
-        }
+        ws.close();
     };
-  }, [stream]);
+  }, []); 
 
   return { telemetry };
 };

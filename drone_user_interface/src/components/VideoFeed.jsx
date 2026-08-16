@@ -34,14 +34,6 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
       <div className="video-hud-stats">
           
           <div className="hud-stat-box">
-              <span className="hud-label">LAT</span>
-              <span className="hud-value">{Number(telemetry.lat).toFixed(5)}</span>
-          </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">LON</span>
-              <span className="hud-value">{Number(telemetry.lng).toFixed(5)}</span>
-          </div>
-          <div className="hud-stat-box">
               <span className="hud-label">ALT</span>
               <span className="hud-value">{Number(telemetry.alt).toFixed(1)}m</span>
           </div>
