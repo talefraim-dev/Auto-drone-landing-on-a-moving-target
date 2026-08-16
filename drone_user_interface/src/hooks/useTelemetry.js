@@ -13,7 +13,6 @@ const translateUnrealToLng = (unrealY) => {
 };
 
 export const useTelemetry = (stream) => {
-  // ה-useState חייב להיות רק כאן בפנים, וכולל עכשיו את yaw: 0
   const [telemetry, setTelemetry] = useState({
     alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
     pitch: 0, roll: 0, yaw: 0, 
