@@ -44,14 +44,7 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
               <span className="hud-label">PITCH</span>
               <span className="hud-value">{Number(telemetry.pitch).toFixed(1)}°</span>
           </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">ROL</span>
-              <span className="hud-value">{Number(telemetry.roll).toFixed(1)}°</span>
-          </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">YAW</span>
-              <span className="hud-value">{Number(telemetry.yaw).toFixed(1)}°</span>
-          </div>
+          
       </div>
 
       {target.status !== 'IDLE' && (
