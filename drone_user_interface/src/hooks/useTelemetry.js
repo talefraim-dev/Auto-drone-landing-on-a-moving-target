@@ -41,7 +41,7 @@ export const useTelemetry = (stream) => {
     };
 
     if (stream) {
-        stream.addResponseEventListener(handleTelemetry);
+        stream.addResponseEventListener("Telemetry", handleTelemetry);
     }
 
     const interval = setInterval(() => {
@@ -56,7 +56,7 @@ export const useTelemetry = (stream) => {
     return () => {
         clearInterval(interval);
         if (stream) {
-            stream.removeResponseEventListener(handleTelemetry);
+            stream.removeResponseEventListener("Telemetry");
         }
     };
   }, [stream]);
