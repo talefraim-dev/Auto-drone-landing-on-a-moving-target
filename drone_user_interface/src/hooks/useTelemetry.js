@@ -12,6 +12,12 @@ const translateUnrealToLng = (unrealY) => {
   return lngMin + ((unrealY - unrealMin) * (lngMax - lngMin)) / (unrealMax - unrealMin);
 };
 
+const [telemetry, setTelemetry] = useState({
+    alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
+    pitch: 0, roll: 0, yaw: 0, 
+    coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
+  });
+
 export const useTelemetry = (stream) => {
   const [telemetry, setTelemetry] = useState({
     alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
@@ -32,6 +38,7 @@ export const useTelemetry = (stream) => {
                 speed: data.Speed !== undefined ? data.Speed : prev.speed,
                 pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
                 roll: data.Roll !== undefined ? data.Roll : prev.roll,
+                yaw: data.Yaw !== undefined ? data.Yaw : prev.yaw,
             }));
         } catch (err) {
             console.error("Failed to parse telemetry:", err);
