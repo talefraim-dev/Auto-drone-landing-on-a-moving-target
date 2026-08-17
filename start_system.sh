@@ -16,7 +16,9 @@ echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
 
 cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers/SignallingWebServer" || { echo -e "${RED}Failed to find Signalling Server directory${NC}"; exit 1; }
 
-node cirrus.js &
+npm install
+npm run build
+npm run start &
 SIG_PID=$!
 
 cd "$ORIGINAL_DIR"
