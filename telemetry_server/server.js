@@ -15,7 +15,7 @@ wss.on('connection', (ws) => {
 
     ws.on('message', (message) => {
         const dataString = message.toString();
-
+        console.log("Received from Unreal:", dataString);
         for (const client of connectedClients) {
             if (client !== ws && client.readyState === 1) { 
                 client.send(dataString);
