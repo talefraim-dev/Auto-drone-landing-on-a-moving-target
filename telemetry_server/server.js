@@ -29,7 +29,7 @@ wss.on('connection', (ws) => {
     });
 });
 
-const PORT = 4000;
+const PORT = 4001;
 server.listen(PORT, () => {
     console.log(`Telemetry Server is running!`);
     console.log(`Listening for React and Unreal WebSocket connections on ws://127.0.0.1:${PORT}`);
