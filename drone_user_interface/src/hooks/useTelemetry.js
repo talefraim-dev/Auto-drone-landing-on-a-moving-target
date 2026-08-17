@@ -27,22 +27,31 @@ export const useTelemetry = () => {
 
     ws.onmessage = (event) => {
         try {
-            const values = JSON.parse(event.data);
-            
-            const keys = ["x", "y", "z", "speed", "roll", "pitch", "yaw"];
+            const rawStr = event.data.trim();
             let data = {};
+            const keys = ["x", "y", "z", "speed", "roll", "pitch", "yaw"];
 
-            if (Array.isArray(values)) {
-                if (values.length !== keys.length) {
-                    throw new Error(`Expected ${keys.length} values, received ${values.length}`);
-                }
+            if (rawStr.startsWith('[') && rawStr.endsWith(']')) {
+                const numberMatches = rawStr.match(/[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?/g);
                 
+                if (!numberMatches) return;
+
+                const values = numberMatches.map(n => parseFloat(n.replace(/,/g, '')));
+
+                if (values.length !== keys.length) {
+                    console.warn(`Expected ${keys.length} values, received ${values.length}`, rawStr);
+                    return; 
+                }
+
                 keys.forEach((key, index) => {
                     data[key] = values[index];
                 });
             } 
-            else if (typeof values === 'object' && values !== null) {
-                data = values;
+            else if (rawStr.startsWith('{') && rawStr.endsWith('}')) {
+                const parsed = JSON.parse(rawStr);
+                if (typeof parsed === 'object' && parsed !== null) {
+                    data = parsed;
+                }
             }
 
             if (Object.keys(data).length > 0) {
@@ -50,7 +59,7 @@ export const useTelemetry = () => {
                     ...prev,
                     lat: data.x !== undefined && data.x !== null ? translateUnrealToLat(data.x) : prev.lat,
                     lng: data.y !== undefined && data.y !== null ? translateUnrealToLng(data.y) : prev.lng,
-                    alt: data.z !== undefined ? data.z / 100 : prev.alt , 
+                    alt: data.z !== undefined ? data.z : prev.alt, 
                     speed: data.speed !== undefined ? data.speed : prev.speed,
                     pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
                     roll: data.roll !== undefined ? data.roll : prev.roll,
@@ -78,7 +87,12 @@ export const useTelemetry = () => {
 
     return () => {
         clearInterval(interval);
-        ws.close();
+        
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.close();
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+            ws.onopen = () => ws.close();
+        }
     };
   }, []); 
 
