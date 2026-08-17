@@ -27,26 +27,37 @@ export const useTelemetry = () => {
 
     ws.onmessage = (event) => {
         try {
-            let sanitizedString = event.data.replace(/(?<=\d),(?=\d)/g, '');
+            const values = JSON.parse(event.data);
             
-            sanitizedString = sanitizedString.replace(/}\s*{/g, '},{');
-            
-            const dataArray = JSON.parse(`[${sanitizedString}]`);
-            
-            const data = dataArray[dataArray.length - 1];
-            
-            if (data && data.type === "Telemetry") {
+            const keys = ["x", "y", "z", "speed", "roll", "pitch", "yaw"];
+            let data = {};
+
+            if (Array.isArray(values)) {
+                if (values.length !== keys.length) {
+                    throw new Error(`Expected ${keys.length} values, received ${values.length}`);
+                }
+                
+                keys.forEach((key, index) => {
+                    data[key] = values[index];
+                });
+            } 
+            else if (typeof values === 'object' && values !== null) {
+                data = values;
+            }
+
+            if (Object.keys(data).length > 0) {
                 setTelemetry(prev => ({
                     ...prev,
-                    lat: data.X !== undefined && data.X !== null ? translateUnrealToLat(data.X) : DEFAULT_LAT,
-                    lng: data.Y !== undefined && data.Y !== null ? translateUnrealToLng(data.Y) : DEFAULT_LNG,
-                    alt: data.Z !== undefined ? data.Z / 100 : prev.alt, 
-                    speed: data.Speed !== undefined ? data.Speed : prev.speed,
-                    pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
-                    roll: data.Roll !== undefined ? data.Roll : prev.roll,
-                    yaw: data.Yaw !== undefined ? data.Yaw : prev.yaw,
+                    lat: data.x !== undefined && data.x !== null ? translateUnrealToLat(data.x) : prev.lat,
+                    lng: data.y !== undefined && data.y !== null ? translateUnrealToLng(data.y) : prev.lng,
+                    alt: data.z !== undefined ? data.z : prev.alt, 
+                    speed: data.speed !== undefined ? data.speed : prev.speed,
+                    pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
+                    roll: data.roll !== undefined ? data.roll : prev.roll,
+                    yaw: data.yaw !== undefined ? data.yaw : prev.yaw,
                 }));
             }
+            
         } catch (err) {
             console.error("Failed to parse telemetry from WS:", err);
             console.log("Raw string that caused error:", event.data);
