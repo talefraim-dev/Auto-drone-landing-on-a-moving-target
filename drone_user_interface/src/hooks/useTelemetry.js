@@ -50,7 +50,7 @@ export const useTelemetry = () => {
                     ...prev,
                     lat: data.x !== undefined && data.x !== null ? translateUnrealToLat(data.x) : prev.lat,
                     lng: data.y !== undefined && data.y !== null ? translateUnrealToLng(data.y) : prev.lng,
-                    alt: data.z !== undefined ? data.z : prev.alt, 
+                    alt: data.z !== undefined ? data.z / 100 : prev.alt , 
                     speed: data.speed !== undefined ? data.speed : prev.speed,
                     pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
                     roll: data.roll !== undefined ? data.roll : prev.roll,
