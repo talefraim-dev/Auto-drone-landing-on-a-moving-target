@@ -27,13 +27,15 @@ export const useTelemetry = () => {
 
     ws.onmessage = (event) => {
         try {
-            const sanitizedString = event.data.replace(/(?<=\d),(?=\d)/g, '');
-            const data = JSON.parse(sanitizedString); 
+            let sanitizedString = event.data.replace(/(?<=\d),(?=\d)/g, '');
             
-            console.log("Raw data from Unreal:", event.data);
-            console.log("Telemetry Data Received:", data);
+            sanitizedString = sanitizedString.replace(/}\s*{/g, '},{');
             
-            if (data.type === "Telemetry") {
+            const dataArray = JSON.parse(`[${sanitizedString}]`);
+            
+            const data = dataArray[dataArray.length - 1];
+            
+            if (data && data.type === "Telemetry") {
                 setTelemetry(prev => ({
                     ...prev,
                     lat: data.X !== undefined && data.X !== null ? translateUnrealToLat(data.X) : DEFAULT_LAT,
@@ -47,6 +49,7 @@ export const useTelemetry = () => {
             }
         } catch (err) {
             console.error("Failed to parse telemetry from WS:", err);
+            console.log("Raw string that caused error:", event.data);
         }
     };
 
