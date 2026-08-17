@@ -7,24 +7,44 @@ NC='\033[0m'
 
 echo -e "${GREEN}Initializing AeroGuard System Startup...${NC}\n"
 
-echo -e "${BLUE}[1/2] Starting Telemetry Server...${NC}"
+ORIGINAL_DIR=$(pwd)
+
+# ---------------------------------------------------------
+# [1/3] Pixel Streaming Signalling Server
+# ---------------------------------------------------------
+echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
+
+cd "C:/Program Files/Epic Games/UE_5.5/Engine/Source/Programs/PixelStreaming/WebServers/SignallingWebServer" || { echo -e "${RED}Failed to find Signalling Server directory${NC}"; exit 1; }
+
+node cirrus.js &
+SIG_PID=$!
+
+cd "$ORIGINAL_DIR"
+
+# ---------------------------------------------------------
+# [2/3] Telemetry Server
+# ---------------------------------------------------------
+echo -e "${BLUE}[2/3] Starting Telemetry Server...${NC}"
 cd telemetry_server || { echo -e "${RED}Failed to find telemetry_server directory${NC}"; exit 1; }
 node server.js &
 SERVER_PID=$!
 cd ..
 
-echo -e "${BLUE}Waiting for server to initialize...${NC}"
+echo -e "${BLUE}Waiting for servers to initialize...${NC}"
 sleep 2
 
-echo -e "${BLUE}[2/2] Starting Drone User Interface...${NC}"
+# ---------------------------------------------------------
+# [3/3] React UI
+# ---------------------------------------------------------
+echo -e "${BLUE}[3/3] Starting Drone User Interface...${NC}"
 cd drone_user_interface || { echo -e "${RED}Failed to find drone_user_interface directory${NC}"; exit 1; }
 npm run dev &
 UI_PID=$!
 cd ..
 
 echo -e "\n${GREEN}✅ All systems are online!${NC}"
-echo -e "Press ${RED}[CTRL+C]${NC} to safely stop both services.\n"
+echo -e "Press ${RED}[CTRL+C]${NC} to safely stop all services.\n"
 
-trap "echo -e '\n${RED}Shutting down systems...${NC}'; kill $SERVER_PID $UI_PID; exit" SIGINT SIGTERM
+trap "echo -e '\n${RED}Shutting down systems...${NC}'; kill $SIG_PID $SERVER_PID $UI_PID; exit" SIGINT SIGTERM
 
-wait $SERVER_PID $UI_PID
+wait $SIG_PID $SERVER_PID $UI_PID
