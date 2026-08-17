@@ -27,6 +27,7 @@ export const useTelemetry = () => {
 
     ws.onmessage = (event) => {
         try {
+            console.log("Raw data from Unreal:", event.data)
             const data = JSON.parse(event.data);
             console.log("Telemetry Data Received:", data);
             if (data.type === "Telemetry") {
