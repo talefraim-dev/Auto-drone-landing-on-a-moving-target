@@ -14,10 +14,12 @@ ORIGINAL_DIR=$(pwd)
 # ---------------------------------------------------------
 echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
 
-cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers/SignallingWebServer" || { echo -e "${RED}Failed to find Signalling Server directory${NC}"; exit 1; }
+cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers" || { echo -e "${RED}Failed to find WebServers directory${NC}"; exit 1; }
 
 npm install
 npm run build
+
+cd SignallingWebServer
 npm run start &
 SIG_PID=$!
 
