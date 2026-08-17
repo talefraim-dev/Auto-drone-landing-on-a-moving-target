@@ -14,7 +14,7 @@ ORIGINAL_DIR=$(pwd)
 # ---------------------------------------------------------
 echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
 
-cd "C:/Program Files/Epic Games/UE_5.5/Engine/Source/Programs/PixelStreaming/WebServers/SignallingWebServer" || { echo -e "${RED}Failed to find Signalling Server directory${NC}"; exit 1; }
+cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers/SignallingWebServer" || { echo -e "${RED}Failed to find Signalling Server directory${NC}"; exit 1; }
 
 node cirrus.js &
 SIG_PID=$!
@@ -28,7 +28,8 @@ echo -e "${BLUE}[2/3] Starting Telemetry Server...${NC}"
 cd telemetry_server || { echo -e "${RED}Failed to find telemetry_server directory${NC}"; exit 1; }
 node server.js &
 SERVER_PID=$!
-cd ..
+
+cd "$ORIGINAL_DIR"
 
 echo -e "${BLUE}Waiting for servers to initialize...${NC}"
 sleep 2
@@ -40,7 +41,8 @@ echo -e "${BLUE}[3/3] Starting Drone User Interface...${NC}"
 cd drone_user_interface || { echo -e "${RED}Failed to find drone_user_interface directory${NC}"; exit 1; }
 npm run dev &
 UI_PID=$!
-cd ..
+
+cd "$ORIGINAL_DIR"
 
 echo -e "\n${GREEN}✅ All systems are online!${NC}"
 echo -e "Press ${RED}[CTRL+C]${NC} to safely stop all services.\n"
