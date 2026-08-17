@@ -29,7 +29,7 @@ export const useTelemetry = () => {
         try {
             const data = JSON.parse(event.data);
             
-            if (data.type === "Telemetry") {
+            
                 setTelemetry(prev => ({
                     ...prev,
                     lat: data.X !== undefined && data.X !== null ? translateUnrealToLat(data.X) : DEFAULT_LAT,
@@ -40,7 +40,7 @@ export const useTelemetry = () => {
                     roll: data.Roll !== undefined ? data.Roll : prev.roll,
                     yaw: data.Yaw !== undefined ? data.Yaw : prev.yaw,
                 }));
-            }
+            
         } catch (err) {
             console.error("Failed to parse telemetry from WS:", err);
         }
