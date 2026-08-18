@@ -35,7 +35,7 @@ export const useTelemetry = () => {
       }
     };
 
-    const telemetryInterval = setInterval(fetchTelemetryFromAPI, 100);
+    const telemetryInterval = setInterval(fetchTelemetryFromAPI, 500);
     return () => clearInterval(telemetryInterval);
   }, []);
 
