@@ -60,7 +60,6 @@ export const useTelemetry = () => {
                     lat: data.x !== undefined && data.x !== null ? translateUnrealToLat(data.x) : prev.lat,
                     lng: data.y !== undefined && data.y !== null ? translateUnrealToLng(data.y) : prev.lng,
                     alt: data.z !== undefined ? data.z : prev.alt, 
-                    speed: data.speed !== undefined ? data.speed : prev.speed,
                     pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
                     roll: data.roll !== undefined ? data.roll : prev.roll,
                     yaw: data.yaw !== undefined ? data.yaw : prev.yaw,
@@ -69,7 +68,6 @@ export const useTelemetry = () => {
             
         } catch (err) {
             console.error("Failed to parse telemetry from WS:", err);
-            console.log("Raw string that caused error:", event.data);
         }
     };
 
@@ -87,7 +85,6 @@ export const useTelemetry = () => {
 
     return () => {
         clearInterval(interval);
-        
         if (ws.readyState === WebSocket.OPEN) {
             ws.close();
         } else if (ws.readyState === WebSocket.CONNECTING) {
@@ -95,6 +92,30 @@ export const useTelemetry = () => {
         }
     };
   }, []); 
+
+  useEffect(() => {
+    const fetchSpeedFromAPI = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/speed');
+        
+        if (response.ok) {
+          const data = await response.json();
+          if (data.speed !== undefined) {
+            setTelemetry(prev => ({
+              ...prev,
+              speed: parseFloat(data.speed.toFixed(2)) 
+            }));
+          }
+        }
+      } catch (error) {
+         console.error("Failed to fetch speed:", error);
+      }
+    };
+
+    const speedInterval = setInterval(fetchSpeedFromAPI, 100);
+
+    return () => clearInterval(speedInterval);
+  }, []);
 
   return { telemetry };
 };
