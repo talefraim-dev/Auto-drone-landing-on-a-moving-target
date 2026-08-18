@@ -1,27 +1,15 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 
-export const useDroneLogic = (stream, addLog) => {
+export const useDroneLogic = (stream) => {
   const [mode, setMode] = useState('MANUAL');
-  const [preHoverMode, setPreHoverMode] = useState('MANUAL');
-  const [target, setTarget] = useState({ x: 0, y: 0, status: 'IDLE' });
+  const [target, setTarget] = useState({ x: 0, y: 0, status: 'IDLE' }); 
+  const [logs, setLogs] = useState([]); 
   const [abortConfirm, setAbortConfirm] = useState(false);
-  const targetLockTimeoutRef = useRef(null);
 
-  useEffect(() => {
-    return () => {
-      if (targetLockTimeoutRef.current) clearTimeout(targetLockTimeoutRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/mode', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ mode: mode }) 
-    }).catch(err => console.error("Failed to update mode on backend:", err));
-  }, [mode]);
+  const addLog = (message, type = 'INFO') => {
+    const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    setLogs(prev => [{ id: crypto.randomUUID(), time, message, type }, ...prev].slice(0, 50));
+  };
 
   const sendToSimulator = (commandObj) => {
     if (stream) {
@@ -35,16 +23,16 @@ export const useDroneLogic = (stream, addLog) => {
     if (cmd === 'ABORT') {
         if (!abortConfirm) {
             setAbortConfirm(true);
-            addLog("ABORT ARMED! PRESS AGAIN TO CONFIRM!", "WARN");
+            addLog("⚠️ ABORT ARMED! PRESS AGAIN TO CONFIRM!", "WARN");
             setTimeout(() => setAbortConfirm(false), 3000);
         } else {
-            addLog("EMERGENCY ABORT EXECUTED ", "ERROR");
+            addLog("🚨 EMERGENCY ABORT EXECUTED 🚨", "ERROR");
             setMode('EMERGENCY');
             setAbortConfirm(false);
             setTarget({ ...target, status: 'IDLE' });
-            sendToSimulator({ Command: "SetMode", Mode: "ABORT" });
+            sendToSimulator({ Command: "SetMode", Mode: "ABORT" }); 
         }
-        return;
+        return; 
     }
 
     if (abortConfirm) setAbortConfirm(false);
@@ -53,52 +41,41 @@ export const useDroneLogic = (stream, addLog) => {
         const newMode = mode === 'MANUAL' ? 'AUTO' : 'MANUAL';
         setMode(newMode);
         addLog(`${newMode} Mode Engaged`, newMode === 'AUTO' ? "WARN" : "INFO");
-        sendToSimulator({ Command: "SetMode", Mode: newMode });
+        sendToSimulator({ Command: "SetMode", Mode: newMode }); 
     }
     else if (cmd === 'HOVER') {
-        if (mode === 'HOVER') {
-            setMode(preHoverMode);
-            addLog("Hover Cancelled", "INFO");
-            sendToSimulator({ Command: "SetMode", Mode: preHoverMode });
-        } else {
-            setPreHoverMode(mode);
-            setMode('HOVER');
-            addLog("Position Hold Engaged", "WARN");
-            sendToSimulator({ Command: "SetMode", Mode: "HOVER" });
-        }
+        const newMode = mode === 'HOVER' ? 'MANUAL' : 'HOVER';
+        setMode(newMode);
+        addLog(newMode === 'HOVER' ? "Position Hold Engaged" : "Hover Cancelled", "INFO");
+        sendToSimulator({ Command: "SetMode", Mode: newMode }); 
     }
     else if (cmd === 'RTH') {
         addLog("Initiating Return to Home...", "WARN");
         setMode('RTH');
-        sendToSimulator({ Command: "SetMode", Mode: "RTH" });
+        sendToSimulator({ Command: "SetMode", Mode: "RTH" }); 
     }
     else if (cmd === 'LAND') {
-        addLog("Initiating Vertical Landing...", "WARN");
-        setMode('LANDING');
-        sendToSimulator({ Command: "ExecuteLanding" });
-    }
-    else if (cmd === 'SYNC') {
-        addLog("Requesting telemetry re-sync with simulator...", "INFO");
-        sendToSimulator({ Command: "SyncTelemetry" });
+        if (target.status === 'LOCKED') {
+            addLog("LANDING SEQUENCE STARTED", "WARN");
+            setMode('LANDING');
+            sendToSimulator({ Command: "ExecuteLanding" }); 
+        } else {
+            addLog("Landing Aborted: No valid target", "ERROR");
+        }
     }
   };
 
-  const handleTargetLock = (pixelX, pixelY, normX, normY) => {
-      if (targetLockTimeoutRef.current) {
-          clearTimeout(targetLockTimeoutRef.current);
-      }
-
-      setTarget({ x: pixelX, y: pixelY, status: 'SEARCHING' });
+  const handleTargetLock = (x, y) => {
+      setTarget({ x, y, status: 'SEARCHING' });
       addLog(`Acquiring target...`, "INFO");
+      
+      sendToSimulator({ Command: "SetTarget", TargetX: x, TargetY: y }); 
 
-      sendToSimulator({ Command: "SetTarget", TargetX: normX, TargetY: normY });
-
-      targetLockTimeoutRef.current = setTimeout(() => {
+      setTimeout(() => {
           setTarget(prev => ({ ...prev, status: 'LOCKED' }));
           addLog("Target Locked. Confidence: 98%", "SUCCESS");
-          targetLockTimeoutRef.current = null;
       }, 1000);
   };
 
-  return { mode, target, abortConfirm, handleCommand, handleTargetLock };
+  return { mode, target, logs, abortConfirm, addLog, handleCommand, handleTargetLock };
 };

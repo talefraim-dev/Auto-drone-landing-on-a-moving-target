@@ -1,0 +1,13 @@
+{
+  "version": "FINAL_MODELS_V1",
+  "agent1_checkpoint": "models/FINAL_MODELS/agent1_final.zip",
+  "agent2_checkpoint": "models/FINAL_MODELS/agent2_final.zip",
+  "agent1_observation_dim": 37,
+  "agent1_action_dim": 4,
+  "agent2_observation_dim": 46,
+  "agent2_action_dim": 4,
+  "source_agent1": "pair_000002/agent1.zip",
+  "source_agent2": "phase_000003_agent2/agent2_recovery_7769.zip",
+  "training_complete": true,
+  "notes": "Final cooperative UAV landing model pair. Agent 1 controls XY/Yaw; Agent 2 controls Z with range-governed terminal descent."
+}

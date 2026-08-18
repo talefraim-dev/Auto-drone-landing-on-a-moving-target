@@ -1,0 +1,30 @@
+{
+  "phase_id": "phase_000001_agent2",
+  "role": "AGENT2",
+  "actual_delta": 2775,
+  "model_timesteps": 2775,
+  "checkpoint": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\phases\\phase_000001_agent2\\output\\agent2.zip",
+  "metrics": {
+    "role": "AGENT2",
+    "episodes": 22,
+    "rpc_successes": 9,
+    "rpc_success_rate": 0.4090909090909091,
+    "touchdowns": 9,
+    "touchdown_rate": 0.4090909090909091,
+    "safe_handoffs": 22,
+    "safe_handoff_rate": 1.0,
+    "timeout_count": 13,
+    "wrong_object_successes": 0,
+    "terminal_latch_violations": 0,
+    "mean_terminal_center_error_m": 0.11286146108124231,
+    "mean_episode_reward": 917.245533,
+    "failure_reasons": {
+      "landing_terminal_contact_timeout": 13
+    },
+    "rolling_window_episodes": 20,
+    "rolling_rpc_success_rate": 0.4,
+    "model_timesteps": 2775,
+    "updated_utc": "2026-08-02T19:54:37Z"
+  },
+  "completed_utc": "2026-08-02T19:54:37Z"
+}

@@ -32,26 +32,17 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
       </div>
 
       <div className="video-hud-stats">
-          
           <div className="hud-stat-box">
-              <span className="hud-label">ALT</span>
+              <span className="hud-label">ALTITUDE</span>
               <span className="hud-value">{Number(telemetry.alt).toFixed(1)}m</span>
           </div>
           <div className="hud-stat-box">
-              <span className="hud-label">SPD</span>
+              <span className="hud-label">SPEED</span>
               <span className="hud-value">{Number(telemetry.speed).toFixed(1)}m/s</span>
           </div>
           <div className="hud-stat-box">
-              <span className="hud-label">PIT</span>
+              <span className="hud-label">PITCH</span>
               <span className="hud-value">{Number(telemetry.pitch).toFixed(1)}°</span>
-          </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">ROL</span>
-              <span className="hud-value">{Number(telemetry.roll).toFixed(1)}°</span>
-          </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">YAW</span>
-              <span className="hud-value">{Number(telemetry.yaw).toFixed(1)}°</span>
           </div>
       </div>
 

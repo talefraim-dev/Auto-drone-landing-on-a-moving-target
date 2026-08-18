@@ -1,0 +1,38 @@
+{
+  "pair_dir": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002",
+  "agent1_checkpoint": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002\\agent1.zip",
+  "agent2_checkpoint": "models\\COOPERATIVE_FINAL\\run_20260802_205130\\pairs\\pair_000002\\agent2.zip",
+  "metrics": {
+    "role": "AGENT1",
+    "episodes": 17,
+    "rpc_successes": 10,
+    "rpc_success_rate": 0.5882352941176471,
+    "touchdowns": 10,
+    "touchdown_rate": 0.5882352941176471,
+    "safe_handoffs": 17,
+    "safe_handoff_rate": 1.0,
+    "timeout_count": 7,
+    "wrong_object_successes": 0,
+    "terminal_latch_violations": 0,
+    "mean_terminal_center_error_m": 0.1361661416446738,
+    "mean_episode_reward": 4087.9049375294117,
+    "failure_reasons": {
+      "landing_terminal_contact_timeout": 7
+    },
+    "rolling_window_episodes": 17,
+    "rolling_rpc_success_rate": 0.5882352941176471,
+    "model_timesteps": 282048,
+    "updated_utc": "2026-08-02T20:22:09Z"
+  },
+  "rank": [
+    -0.0,
+    -0.0,
+    0.5882352941176471,
+    0.5882352941176471,
+    1.0,
+    -0.1361661416446738,
+    -0.4117647058823529,
+    4087.9049375294117
+  ],
+  "updated_utc": "2026-08-02T20:22:09Z"
+}

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+diagnostics/
+logs/
+outputs/
+*.log
+models/COOPERATIVE_FINAL/

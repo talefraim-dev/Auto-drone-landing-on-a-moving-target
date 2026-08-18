@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "calibration_status": "PASS",
+  "generated_from": "calibrate_and_test_range_finders.py V3 relative-motion calibration",
+  "vehicle_name": "Drone1",
+  "sensor_bias_m": {
+    "TOP_LEFT": -0.0002,
+    "TOP_RIGHT": 0.0,
+    "BOTTOM_LEFT": 0.0044,
+    "BOTTOM_RIGHT": -0.0024,
+    "CENTER": 0.002
+  },
+  "sensor_mount_positions_m": {
+    "TOP_LEFT": [
+      0.28,
+      -0.28,
+      0.6
+    ],
+    "TOP_RIGHT": [
+      0.28,
+      0.28,
+      0.6
+    ],
+    "BOTTOM_LEFT": [
+      -0.28,
+      -0.28,
+      0.6
+    ],
+    "BOTTOM_RIGHT": [
+      -0.28,
+      0.28,
+      0.6
+    ],
+    "CENTER": [
+      0.0,
+      0.0,
+      0.6
+    ]
+  },
+  "validation": {
+    "point_1_world_z_m": 0.298,
+    "point_2_world_z_m": -0.647,
+    "measured_world_z_rise_m": 0.944,
+    "measured_range_rise_m": 1.022,
+    "delta_error_m": 0.077,
+    "surface_world_z_1_m": 1.968,
+    "surface_world_z_2_m": 2.045,
+    "surface_consistency_m": 0.077,
+    "direction_pass": true,
+    "overall_pass": true,
+    "valid_ratio": {
+      "TOP_LEFT": 1.0,
+      "TOP_RIGHT": 1.0,
+      "BOTTOM_LEFT": 1.0,
+      "BOTTOM_RIGHT": 1.0,
+      "CENTER": 1.0
+    }
+  }
+}

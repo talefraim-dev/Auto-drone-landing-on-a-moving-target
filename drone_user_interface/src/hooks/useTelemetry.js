@@ -1,62 +1,44 @@
 import { useState, useEffect } from 'react';
 
-const DEFAULT_LAT = 32.0853;
-const DEFAULT_LNG = 34.7818;
+const translateUnrealToLat = (unrealX) => {
+  const unrealMin = -120000, unrealMax = 120000;
+  const latMin = 32.0000, latMax = 32.0800;
+  return latMin + ((unrealX - unrealMin) * (latMax - latMin)) / (unrealMax - unrealMin);
+};
 
-export const useTelemetry = () => {
-  const [telemetry, setTelemetry] = useState({
-    alt: 0, speed: 0.0, bat: 100, lat: DEFAULT_LAT, lng: DEFAULT_LNG,
-    pitch: 0, roll: 0, yaw: 0, 
-    coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
+const translateUnrealToLng = (unrealY) => {
+  const unrealMin = -120000, unrealMax = 120000;
+  const lngMin = 34.7000, lngMax = 34.81635;
+  return lngMin + ((unrealY - unrealMin) * (lngMax - lngMin)) / (unrealMax - unrealMin);
+};
+
+export const useTelemetry = (stream) => {
+  const [telemetry, setTelemetry] = useState({ 
+    alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
+    pitch: 0, roll: 0, coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
   });
 
   useEffect(() => {
-    let isActive = true;
-    let timeoutId;
+    if (stream) {
+        stream.addResponseEventListener("DroneTelemetry", (response) => {
+            try {
+                const data = JSON.parse(response);
+                setTelemetry(prev => ({
+                    ...prev,
+                    lat: data.X !== undefined ? translateUnrealToLat(data.X) : prev.lat,
+                    lng: data.Y !== undefined ? translateUnrealToLng(data.Y) : prev.lng,
+                    alt: data.Z !== undefined ? data.Z / 100 : prev.alt, // ס"מ למטרים
+                    speed: data.Speed !== undefined ? data.Speed : prev.speed,
+                    pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
+                    roll: data.Roll !== undefined ? data.Roll : prev.roll
+                }));
+            } catch (err) {
+                console.error("Failed to parse telemetry:", err);
+            }
+        });
+    }
 
-    const fetchTelemetryFromAPI = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/telemetry');
-        
-        if (response.ok) {
-          const data = await response.json();
-          
-          if (!data.error && isActive) {
-            setTelemetry(prev => {
-              const rawAlt = data.z !== undefined ? -data.z : 0;
-              const correctedAlt = rawAlt + 1.8;
-
-              return {
-                ...prev,
-                lat: data.lat !== undefined ? data.lat : prev.lat,
-                lng: data.lng !== undefined ? data.lng : prev.lng,
-                alt: parseFloat(correctedAlt.toFixed(2)), 
-                speed: data.speed !== undefined ? parseFloat(data.speed.toFixed(2)) : prev.speed,
-                pitch: data.pitch !== undefined ? parseFloat(data.pitch.toFixed(2)) : prev.pitch,
-                roll: data.roll !== undefined ? parseFloat(data.roll.toFixed(2)) : prev.roll,
-                yaw: data.yaw !== undefined ? parseFloat(data.yaw.toFixed(2)) : prev.yaw,
-              };
-            });
-          }
-        }
-      } catch (error) {
-      }
-
-      if (isActive) {
-        timeoutId = setTimeout(fetchTelemetryFromAPI, 500);
-      }
-    };
-
-    fetchTelemetryFromAPI();
-
-    return () => {
-      isActive = false;
-      clearTimeout(timeoutId);
-    };
-  }, []);
-
-  useEffect(() => {
-    const simInterval = setInterval(() => {
+    const interval = setInterval(() => {
         setTelemetry(prev => ({
             ...prev,
             bat: Math.max(0, prev.bat - 0.01),
@@ -65,8 +47,8 @@ export const useTelemetry = () => {
         }));
     }, 1000);
 
-    return () => clearInterval(simInterval);
-  }, []);
+    return () => clearInterval(interval);
+  }, [stream]);
 
   return { telemetry };
 };
