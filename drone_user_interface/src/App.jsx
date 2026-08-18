@@ -1,81 +1,117 @@
-import React, { useState } from 'react';
+import React, { useRef } from 'react';
+import './App.css';
+
+// Hooks
+import { usePixelStreaming } from './hooks/usePixelStreaming';
+import { useTelemetry } from './hooks/useTelemetry';
+import { useDroneLogic } from './hooks/useDroneLogic';
+import { useLogger } from './hooks/useLogger';
+
+// Components
 import VideoFeed from './components/VideoFeed';
-import Footer from './components/Footer';
 import Minimap from './components/Minimap';
-// import './App.css'; // אם יש לך שם דברים, אבל רצוי להשתמש ב index.css בלבד לעיצוב הגלובלי
+import Footer from './components/Footer';
 
 function App() {
-  // נתוני דמה לדוגמה (כאן יכנסו ה-Hooks וה-State האמיתיים שלך מהשרת)
-  const [telemetry, setTelemetry] = useState({
-    alt: 12.4, vs: -0.42, speed: 0.31, roll: 1.2, pitch: -0.8, yaw: 178.4, 
-    lat: 32.0402, lng: 34.7583, x: 0.02, y: -0.01, z: -2.81
-  });
-  const [target, setTarget] = useState({ status: 'LOCKED', confidence: 98, range: 3.2, xyError: 0.18, x: '50%', y: '50%' });
-  const [mode, setMode] = useState('LANDING');
-  const [phase, setPhase] = useState('DESCEND');
+  const videoRef = useRef(null);
+
+  const { logs, addLog } = useLogger();
+  const stream = usePixelStreaming(videoRef, addLog);
+
+  const { telemetry } = useTelemetry(stream);
+  const { mode, target, abortConfirm, handleCommand, handleTargetLock } = useDroneLogic(stream, addLog);
+
+  const onVideoClick = (e) => {
+    if (mode === 'LANDING' || mode === 'EMERGENCY') return;
+    const rect = e.target.getBoundingClientRect();
+    const pixelX = e.clientX - rect.left;
+    const pixelY = e.clientY - rect.top;
+    // Normalized (0-1) coordinates are resolution-independent, unlike raw pixel offsets,
+    // so they stay meaningful to the simulator regardless of how the video element is scaled.
+    const normX = rect.width > 0 ? pixelX / rect.width : 0;
+    const normY = rect.height > 0 ? pixelY / rect.height : 0;
+    handleTargetLock(pixelX, pixelY, normX, normY);
+  };
 
   return (
-    <div className="dashboard-grid">
+    <div className="app-container">
       
-      {/* Top Global Status Bar */}
-      <header className="top-bar">
-        <div className="live-indicator"><div className="live-dot"></div>LIVE</div>
-        <div className="top-bar-item"><span className="label">Mission Mode</span><span className="value cyan">{mode}</span></div>
-        <div className="top-bar-item"><span className="label">Control Mode</span><span className="value">AUTO</span></div>
-        <div className="top-bar-item"><span className="label">Target Status</span><span className="value green">LOCK {target.confidence}%</span></div>
-        <div className="top-bar-item"><span className="label">Link Quality</span><span className="value">81%</span></div>
-        <div className="top-bar-item"><span className="label">Battery</span><span className="value">97%</span></div>
-      </header>
+      <VideoFeed 
+        videoRef={videoRef} 
+        telemetry={telemetry} 
+        mode={mode} 
+        target={target} 
+        onVideoClick={onVideoClick} 
+      />
 
-      {/* Main Camera Area */}
-      <VideoFeed telemetry={telemetry} target={target} mode={mode} />
-
-      {/* Right Sidebar */}
-      <aside className="sidebar">
+      <div className="right-sidebar">
         
-        {/* Map Panel */}
-        <div className="panel" style={{ padding: 0, height: '200px' }}>
-          <div className="panel-title" style={{ position: 'absolute', top: 8, left: 12, zIndex: 10, border: 'none' }}>MAP</div>
-          <Minimap lat={telemetry.lat} lng={telemetry.lng} isConnected={true} />
+        {}
+        <Minimap lat={telemetry.lat} lng={telemetry.lng} />
+
+        {/* System Status Section */}
+        <div>
+            <div className="panel-header">SYSTEM STATUS</div>
+            <div style={{marginTop: 10, fontSize: 12}}>
+                <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
+                    <span>BATTERY</span><span style={{color: telemetry.bat > 30 ? 'cyan' : 'red'}}>{Math.floor(Number(telemetry.bat))}%</span>
+                </div>
+                
+                <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
+                    <div style={{width:`${telemetry.bat}%`, height:'100%', background: telemetry.bat > 30 ? 'cyan' : 'red'}}></div>
+                </div>
+
+                <div style={{marginTop: 10}}>
+                    <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
+                        <span>LINK QUALITY</span><span style={{color: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}>{Math.floor(telemetry.linkQuality)}%</span>
+                    </div>
+                    <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
+                        <div style={{width:`${telemetry.linkQuality}%`, height:'100%', background: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}></div>
+                    </div>
+                </div>
+                <div style={{display:'flex', gap: 5}}>
+                    <div style={{background: '#080a10', padding: 5, flex:1, textAlign:'center', border: '1px solid #333'}}>
+                        <div style={{fontSize: 9, color:'#888', marginBottom:2}}>CORE TEMP</div>
+                        <div style={{fontSize: 14, color: telemetry.coreTemp > 75 ? 'red' : '#e0e6ed', fontWeight: 'bold'}}>{telemetry.coreTemp.toFixed(1)}°C</div>
+                    </div>
+                    <div style={{background: '#080a10', padding: 5, flex:1, textAlign:'center', border: '1px solid #333'}}>
+                        <div style={{fontSize: 9, color:'#888', marginBottom:2}}>ESC TEMP</div>
+                        <div style={{fontSize: 14, color: telemetry.escTemp > 80 ? 'red' : '#e0e6ed', fontWeight: 'bold'}}>{telemetry.escTemp.toFixed(1)}°C</div>
+                    </div>
+                </div>
+                
+            </div>
         </div>
 
-        {/* Mission Status */}
-        <div className="panel">
-          <div className="panel-title">MISSION STATUS</div>
-          <div className="mission-grid">
-            <div className="top-bar-item"><span className="label">Target</span><span className="value green">{target.status}</span></div>
-            <div className="top-bar-item"><span className="label">Confidence</span><span className="value">{target.confidence}%</span></div>
-            <div className="top-bar-item"><span className="label">Range</span><span className="value">{target.range} m</span></div>
-            <div className="top-bar-item"><span className="label">XY Error</span><span className="value orange">{target.xyError} m</span></div>
-            <div className="top-bar-item" style={{ gridColumn: '1 / 3' }}><span className="label">Current Phase</span><span className="value cyan">{phase}</span></div>
-          </div>
+        {/* Commands Grid Section */}
+        <div className="commands-grid">
+            <button className={`cmd-btn ${mode === 'MANUAL' ? 'primary' : 'active'}`} onClick={() => handleCommand('TOGGLE_MODE')}>
+                {mode === 'MANUAL' ? 'MANUAL' : 'AUTO'}
+            </button>
+            <button className="cmd-btn" onClick={() => handleCommand('SYNC')}>⟳ SYNC</button>
+            <button className="cmd-btn" onClick={() => handleCommand('RTH')} style={{color:'#ff9800'}}>⟲ RTH</button>
+            <button className={`cmd-btn ${mode === 'HOVER' ? 'active' : ''}`} onClick={() => handleCommand('HOVER')}>HOVER</button>
+            <button className="cmd-btn danger" onClick={() => handleCommand('LAND')}>↓ LAND</button>
+            <button className={`cmd-btn abort-btn ${abortConfirm ? 'confirm-state' : ''}`} onClick={() => handleCommand('ABORT')}>{abortConfirm ? 'CONFIRM ABORT?' : 'ABORT MISSION'}</button>
         </div>
 
-        {/* System & Controls */}
-        <div className="panel">
-          <div className="panel-title">SYSTEM</div>
-          <div className="system-grid">
-            <div className="top-bar-item"><span className="label">Core Temp</span><span className="value">76.1°C</span></div>
-            <div className="top-bar-item"><span className="label">ESC Temp</span><span className="value">35.0°C</span></div>
-          </div>
+        {/* Log Stream */}
+        <div className="log-stream">
+            {logs.length === 0 && <div style={{opacity:0.5}}>No logs yet...</div>}
+            {logs.map(log => (
+                <div key={log.id} className="log-line">
+                    <span style={{color: '#666'}}>[{log.time}]</span>
+                    <span style={{ color: log.type === 'ERROR' ? '#ff2a2a' : log.type === 'WARN' ? '#ff9800' : log.type === 'SUCCESS' ? '#00ff00' : '#ccc' }}>
+                        {log.message}
+                    </span>
+                </div>
+            ))}
         </div>
 
-        <div className="panel">
-          <div className="panel-title">FLIGHT CONTROLS</div>
-          <div className="controls-grid">
-            <button className="btn active">AUTO</button>
-            <button className="btn">SYNC</button>
-            <button className="btn">RTH</button>
-            <button className="btn">HOVER</button>
-            <button className="btn full">LAND</button>
-            <button className="btn btn-abort">ABORT MISSION</button>
-          </div>
-        </div>
-      </aside>
+      </div>
 
-      {/* Bottom Mission Strip */}
-      <Footer telemetry={telemetry} phase={phase} />
-      
+      <Footer lat={telemetry.lat} lng={telemetry.lng} mode={mode} />
+
     </div>
   );
 }

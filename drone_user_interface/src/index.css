@@ -1,116 +1,68 @@
-@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Roboto+Mono:wght@400;500;700&display=swap');
-
 :root {
-  --bg-base: #02060f;
-  --bg-panel: #0a111f;
-  --bg-hud: rgba(6, 11, 20, 0.75);
-  
-  --border-dim: #1e293b;
-  --border-bright: rgba(0, 240, 255, 0.3);
-  
-  --cyan: #00f0ff;
-  --green: #10b981;
-  --orange: #f59e0b;
-  --red: #ef4444;
-  
-  --text-main: #f8fafc;
-  --text-muted: #64748b;
-  
-  --space-sm: 8px;
-  --space-md: 12px;
-  --space-lg: 16px;
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-* { box-sizing: border-box; margin: 0; padding: 0; }
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #535bf2;
+}
 
 body {
-  background-color: var(--bg-base);
-  color: var(--text-main);
-  font-family: 'Rajdhani', sans-serif;
-  height: 100vh;
-  width: 100vw;
-  overflow: hidden;
-  -webkit-font-smoothing: antialiased;
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
 }
 
-/* --- Layout Grid --- */
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: 1fr 340px; 
-  grid-template-rows: 60px 1fr 90px;
-  height: 100vh;
-  width: 100vw;
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
 }
 
-/* --- Top Bar --- */
-.top-bar {
-  grid-column: 1 / 3; grid-row: 1;
-  background: var(--bg-panel); border-bottom: 1px solid var(--border-dim);
-  display: flex; align-items: center; padding: 0 24px; gap: 32px; z-index: 50;
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  cursor: pointer;
+  transition: border-color 0.25s;
 }
-.top-bar-item { display: flex; flex-direction: column; }
-.label { font-size: 11px; color: var(--text-muted); letter-spacing: 1px; font-weight: 600; text-transform: uppercase; }
-.value { font-size: 18px; font-weight: 700; color: var(--text-main); font-family: 'Roboto Mono', monospace; }
-.value.green { color: var(--green); } .value.cyan { color: var(--cyan); }
-.value.orange { color: var(--orange); } .value.red { color: var(--red); }
-.live-indicator { display: flex; align-items: center; gap: 8px; color: var(--red); font-weight: 700; letter-spacing: 1px; }
-.live-dot { width: 10px; height: 10px; background-color: var(--red); border-radius: 50%; box-shadow: 0 0 8px var(--red); }
-
-/* --- Camera Area (VideoFeed Component) --- */
-.camera-area {
-  grid-column: 1 / 2; grid-row: 2 / 3;
-  position: relative; background: #000; border-right: 1px solid var(--border-dim);
+button:hover {
+  border-color: #646cff;
 }
-.video-feed { width: 100%; height: 100%; object-fit: cover; }
-.target-bounding-box {
-  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  width: 140px; height: 140px; border: 2px solid var(--cyan); background: rgba(0, 240, 255, 0.05); pointer-events: none;
-}
-.target-id-tag {
-  position: absolute; top: -24px; left: -2px; background: var(--cyan); color: #000;
-  font-size: 12px; font-weight: 700; padding: 2px 8px; font-family: 'Roboto Mono', monospace;
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
 }
 
-/* --- HUD Strip --- */
-.camera-hud-strip {
-  position: absolute; bottom: var(--space-lg); left: 160px; right: var(--space-lg);
-  background: var(--bg-hud); backdrop-filter: blur(4px); border: 1px solid var(--border-dim);
-  border-top: 2px solid var(--cyan); padding: 12px 24px; display: flex; justify-content: space-between; border-radius: 4px;
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+  }
 }
-.hud-metric { display: flex; flex-direction: column; align-items: flex-start; border-right: 1px solid rgba(255,255,255,0.1); padding-right: 24px; flex: 1; }
-.hud-metric:last-child { border-right: none; padding-right: 0; }
-.hud-metric .value { font-size: 20px; } .hud-metric .unit { font-size: 12px; color: var(--text-muted); margin-left: 4px; }
-
-/* --- Artificial Horizon --- */
-.horizon-container {
-  position: absolute; bottom: var(--space-lg); left: var(--space-lg); width: 120px; height: 120px;
-  border-radius: 50%; border: 2px solid var(--border-dim); background: linear-gradient(to bottom, #1e3a8a 50%, #713f12 50%);
-  box-shadow: 0 0 20px rgba(0,0,0,0.8); overflow: hidden;
-}
-.horizon-line { position: absolute; top: 50%; width: 100%; height: 2px; background: var(--cyan); }
-
-/* --- Sidebar Panels --- */
-.sidebar {
-  grid-column: 2 / 3; grid-row: 2 / 4; background: var(--bg-panel);
-  display: flex; flex-direction: column; padding: var(--space-md); gap: var(--space-md); overflow-y: auto;
-}
-.panel { border: 1px solid var(--border-dim); background: rgba(0,0,0,0.2); padding: var(--space-md); border-radius: 4px; }
-.panel-title { font-size: 12px; color: var(--text-main); letter-spacing: 1px; font-weight: 700; margin-bottom: var(--space-md); border-bottom: 1px solid var(--border-dim); padding-bottom: 4px; }
-.mission-grid, .system-grid, .controls-grid { display: grid; gap: var(--space-md); }
-.mission-grid { grid-template-columns: 1fr 1fr; margin-bottom: var(--space-md); }
-.system-grid, .controls-grid { grid-template-columns: 1fr 1fr; }
-
-/* Buttons */
-.btn { background: transparent; border: 1px solid var(--border-dim); color: var(--text-main); padding: 10px; font-family: 'Rajdhani', sans-serif; font-weight: 600; font-size: 14px; cursor: pointer; border-radius: 4px; transition: all 0.2s; }
-.btn:hover { border-color: var(--cyan); }
-.btn.active { background: rgba(0, 240, 255, 0.1); border-color: var(--cyan); color: var(--cyan); }
-.btn.full { grid-column: 1 / 3; }
-.btn-abort { grid-column: 1 / 3; margin-top: 12px; border: 1px solid var(--red); color: var(--red); background: rgba(239, 68, 68, 0.05); font-weight: 700; letter-spacing: 2px; }
-.btn-abort:hover { background: var(--red); color: #fff; }
-
-/* --- Bottom Strip (Footer Component) --- */
-.bottom-strip {
-  grid-column: 1 / 2; grid-row: 3 / 4; background: var(--bg-panel); border-top: 1px solid var(--border-dim);
-  display: flex; align-items: center; justify-content: space-between; padding: 0 24px;
-}
-.position-group { display: flex; gap: 32px; }
