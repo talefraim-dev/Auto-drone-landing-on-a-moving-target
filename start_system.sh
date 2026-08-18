@@ -57,9 +57,11 @@ cd "$ORIGINAL_DIR"
 # [3/4] AirSim Python API Server
 # ---------------------------------------------------------
 echo -e "${BLUE}[3/4] Starting AirSim Python API Server...${NC}"
-cd telemetry_server
+cd telemetry_server || { echo -e "${RED}Failed to find telemetry_server directory${NC}"; exit 1; }
 python airsim_api.py &
 PYTHON_PID=$!
+
+cd "$ORIGINAL_DIR" 
 
 echo -e "${BLUE}Waiting for servers to initialize...${NC}"
 sleep 2
