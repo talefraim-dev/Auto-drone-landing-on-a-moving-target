@@ -38,7 +38,7 @@ fi
 # ---------------------------------------------------------
 echo -e "${BLUE}[1/4] Starting Pixel Streaming Signalling Server...${NC}"
 cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers/SignallingWebServer" || exit 1
-npm run start -- --HttpPort 8080 &
+npm run start &
 SIG_PID=$!
 
 cd "$ORIGINAL_DIR"
@@ -57,6 +57,7 @@ cd "$ORIGINAL_DIR"
 # [3/4] AirSim Python API Server
 # ---------------------------------------------------------
 echo -e "${BLUE}[3/4] Starting AirSim Python API Server...${NC}"
+cd telemetry_server
 python airsim_api.py &
 PYTHON_PID=$!
 
