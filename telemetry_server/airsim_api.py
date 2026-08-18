@@ -99,8 +99,11 @@ def telemetry_loop():
 def flight_control_loop():
     asyncio.set_event_loop(asyncio.new_event_loop())
     control_client = airsim.MultirotorClient()
+    VEHICLE_NAME = ""
+    
     try:
         control_client.confirmConnection()
+        control_client.enableApiControl(True, vehicle_name=VEHICLE_NAME)
     except Exception:
         pass
 
@@ -109,7 +112,6 @@ def flight_control_loop():
     VERTICAL_SPEED_MPS = 1.0
     YAW_RATE_DEG_S = 35.0
     COMMAND_DURATION_S = 0.08
-    VEHICLE_NAME = ""
 
     last_mode = None
     was_moving = False 
@@ -118,8 +120,6 @@ def flight_control_loop():
         mode = current_mode 
         
         try:
-            control_client.enableApiControl(True, vehicle_name=VEHICLE_NAME)
-            
             if mode == "MANUAL":
                 if keyboard.is_pressed("space"):
                     control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
@@ -183,12 +183,12 @@ def flight_control_loop():
             try:
                 control_client = airsim.MultirotorClient()
                 control_client.confirmConnection()
+                control_client.enableApiControl(True, vehicle_name=VEHICLE_NAME)
             except:
                 pass
 
 threading.Thread(target=telemetry_loop, daemon=True).start()
 threading.Thread(target=flight_control_loop, daemon=True).start()
-
 
 @app.post("/api/mode")
 def update_mode(data: ModeUpdate):
