@@ -1,4 +1,5 @@
 import cosysairsim as airsim
+from cosysairsim.utils import to_eularian_angles 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import math
@@ -44,7 +45,8 @@ def get_telemetry():
         y = kinematics.position.y_val
         z = kinematics.position.z_val
         
-        pitch, roll, yaw = airsim.to_eularian_angles(kinematics.orientation)
+        pitch, roll, yaw = to_eularian_angles(kinematics.orientation)
+        
         pitch_deg = math.degrees(pitch)
         roll_deg = math.degrees(roll)
         yaw_deg = math.degrees(yaw)
