@@ -96,7 +96,7 @@ def telemetry_loop():
         
         time.sleep(0.05) 
 
-def manual_control_loop():
+def flight_control_loop():
     asyncio.set_event_loop(asyncio.new_event_loop())
     control_client = airsim.MultirotorClient()
     try:
@@ -111,38 +111,72 @@ def manual_control_loop():
     COMMAND_DURATION_S = 0.08
     VEHICLE_NAME = ""
 
-    while True:
-        if current_mode != "MANUAL":
-            time.sleep(0.1)
-            continue
+    last_mode = None
+    was_moving = False 
 
+    while True:
+        mode = current_mode 
+        
         try:
             control_client.enableApiControl(True, vehicle_name=VEHICLE_NAME)
             
-            if keyboard.is_pressed("space"):
-                control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
-                time.sleep(0.05)
-                continue
+            if mode == "MANUAL":
+                if keyboard.is_pressed("space"):
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
+                    was_moving = False
+                    time.sleep(0.05)
+                    continue
 
-            forward = key_axis("w", "s")
-            right = key_axis("d", "a")
-            vertical = key_axis("g", "t")
-            yaw = key_axis("y", "u")
+                forward = key_axis("w", "s")
+                right = key_axis("d", "a")
+                vertical = key_axis("g", "t")
+                yaw = key_axis("y", "u")
 
-            vx = forward * LINEAR_SPEED_MPS
-            vy = right * LINEAR_SPEED_MPS
-            vz = vertical * VERTICAL_SPEED_MPS
+                vx = forward * LINEAR_SPEED_MPS
+                vy = right * LINEAR_SPEED_MPS
+                vz = vertical * VERTICAL_SPEED_MPS
 
-            yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw * YAW_RATE_DEG_S)
+                yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw * YAW_RATE_DEG_S)
 
-            if vx != 0 or vy != 0 or vz != 0 or yaw != 0:
-                control_client.moveByVelocityBodyFrameAsync(
-                    vx=vx, vy=vy, vz=vz, duration=COMMAND_DURATION_S,
-                    drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-                    yaw_mode=yaw_mode, vehicle_name=VEHICLE_NAME
-                ).join()
+                if vx != 0 or vy != 0 or vz != 0 or yaw != 0:
+                    control_client.moveByVelocityBodyFrameAsync(
+                        vx=vx, vy=vy, vz=vz, duration=COMMAND_DURATION_S,
+                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                        yaw_mode=yaw_mode, vehicle_name=VEHICLE_NAME
+                    ).join()
+                    was_moving = True
+                else:
+                    if was_moving:
+                        control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
+                        was_moving = False
+                    time.sleep(0.05)
+                
+                last_mode = mode
+
+            elif mode == "HOVER":
+                if last_mode != "HOVER":
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
+                    was_moving = False
+                    last_mode = mode
+                time.sleep(0.1)
+
+            elif mode == "LANDING":
+                if last_mode != "LANDING":
+                    control_client.landAsync(vehicle_name=VEHICLE_NAME)
+                    was_moving = False
+                    last_mode = mode
+                time.sleep(0.1)
+                
+            elif mode == "EMERGENCY" or mode == "ABORT":
+                if last_mode not in ["EMERGENCY", "ABORT"]:
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
+                    was_moving = False
+                    last_mode = mode
+                time.sleep(0.1)
+
             else:
-                time.sleep(0.05)
+                last_mode = mode
+                time.sleep(0.1)
 
         except Exception:
             time.sleep(0.1)
@@ -153,7 +187,7 @@ def manual_control_loop():
                 pass
 
 threading.Thread(target=telemetry_loop, daemon=True).start()
-threading.Thread(target=manual_control_loop, daemon=True).start()
+threading.Thread(target=flight_control_loop, daemon=True).start()
 
 
 @app.post("/api/mode")
