@@ -25,25 +25,43 @@ def get_airsim_client():
             client = None
     return client
 
-@app.get("/api/speed")
-def get_speed():
+@app.get("/api/telemetry")
+def get_telemetry():
     c = get_airsim_client()
     
     if c is None:
-        return {"error": "AirSim is not running", "speed": 0}
+        return {"error": "AirSim is not running"}
         
     try:
         kinematics = c.simGetGroundTruthKinematics()
+        
         vx = kinematics.linear_velocity.x_val
         vy = kinematics.linear_velocity.y_val
         vz = kinematics.linear_velocity.z_val
-        
         speed = math.sqrt(vx**2 + vy**2 + vz**2)
-        return {"speed": speed}
+        
+        x = kinematics.position.x_val
+        y = kinematics.position.y_val
+        z = kinematics.position.z_val
+        
+        pitch, roll, yaw = airsim.to_eularian_angles(kinematics.orientation)
+        pitch_deg = math.degrees(pitch)
+        roll_deg = math.degrees(roll)
+        yaw_deg = math.degrees(yaw)
+
+        return {
+            "x": x,
+            "y": y,
+            "z": z,
+            "pitch": pitch_deg,
+            "roll": roll_deg,
+            "yaw": yaw_deg,
+            "speed": speed
+        }
     except Exception as e:
         global client
         client = None
-        return {"error": str(e), "speed": 0}
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)

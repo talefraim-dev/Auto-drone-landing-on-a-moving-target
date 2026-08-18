@@ -23,58 +23,36 @@ export const useTelemetry = () => {
   });
 
   useEffect(() => {
-    const ws = new WebSocket('ws://127.0.0.1:4001');
-
-    ws.onmessage = (event) => {
-        try {
-            const rawStr = event.data.trim();
-            let data = {};
-            const keys = ["x", "y", "z", "speed", "roll", "pitch", "yaw"];
-
-            if (rawStr.startsWith('[') && rawStr.endsWith(']')) {
-                const numberMatches = rawStr.match(/[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?/g);
-                
-                if (!numberMatches) return;
-
-                const values = numberMatches.map(n => parseFloat(n.replace(/,/g, '')));
-
-                if (values.length !== keys.length) {
-                    console.warn(`Expected ${keys.length} values, received ${values.length}`, rawStr);
-                    return; 
-                }
-
-                keys.forEach((key, index) => {
-                    data[key] = values[index];
-                });
-            } 
-            else if (rawStr.startsWith('{') && rawStr.endsWith('}')) {
-                const parsed = JSON.parse(rawStr);
-                if (typeof parsed === 'object' && parsed !== null) {
-                    data = parsed;
-                }
-            }
-
-            if (Object.keys(data).length > 0) {
-                setTelemetry(prev => ({
-                    ...prev,
-                    lat: data.x !== undefined && data.x !== null ? translateUnrealToLat(data.x) : prev.lat,
-                    lng: data.y !== undefined && data.y !== null ? translateUnrealToLng(data.y) : prev.lng,
-                    alt: data.z !== undefined ? data.z : prev.alt, 
-                    pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
-                    roll: data.roll !== undefined ? data.roll : prev.roll,
-                    yaw: data.yaw !== undefined ? data.yaw : prev.yaw,
-                }));
-            }
-            
-        } catch (err) {
-            console.error("Failed to parse telemetry from WS:", err);
+    const fetchTelemetryFromAPI = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/telemetry');
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          if (!data.error) {
+            setTelemetry(prev => ({
+              ...prev,
+              lat: data.x !== undefined ? translateUnrealToLat(data.x * 100) : prev.lat,
+              lng: data.y !== undefined ? translateUnrealToLng(data.y * 100) : prev.lng,
+              alt: data.z !== undefined ? parseFloat((-data.z).toFixed(2)) : prev.alt, 
+              speed: data.speed !== undefined ? parseFloat(data.speed.toFixed(2)) : prev.speed,
+              pitch: data.pitch !== undefined ? parseFloat(data.pitch.toFixed(2)) : prev.pitch,
+              roll: data.roll !== undefined ? parseFloat(data.roll.toFixed(2)) : prev.roll,
+              yaw: data.yaw !== undefined ? parseFloat(data.yaw.toFixed(2)) : prev.yaw,
+            }));
+          }
         }
+      } catch (error) {
+      }
     };
 
-    ws.onopen = () => console.log("Connected to Telemetry Server");
-    ws.onerror = (err) => console.error("Telemetry WS Error:", err);
+    const telemetryInterval = setInterval(fetchTelemetryFromAPI, 100);
+    return () => clearInterval(telemetryInterval);
+  }, []);
 
-    const interval = setInterval(() => {
+  useEffect(() => {
+    const simInterval = setInterval(() => {
         setTelemetry(prev => ({
             ...prev,
             bat: Math.max(0, prev.bat - 0.01),
@@ -83,38 +61,7 @@ export const useTelemetry = () => {
         }));
     }, 1000);
 
-    return () => {
-        clearInterval(interval);
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.close();
-        } else if (ws.readyState === WebSocket.CONNECTING) {
-            ws.onopen = () => ws.close();
-        }
-    };
-  }, []); 
-
-  useEffect(() => {
-    const fetchSpeedFromAPI = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/speed');
-        
-        if (response.ok) {
-          const data = await response.json();
-          if (data.speed !== undefined) {
-            setTelemetry(prev => ({
-              ...prev,
-              speed: parseFloat(data.speed.toFixed(2)) 
-            }));
-          }
-        }
-      } catch (error) {
-         console.error("Failed to fetch speed:", error);
-      }
-    };
-
-    const speedInterval = setInterval(fetchSpeedFromAPI, 100);
-
-    return () => clearInterval(speedInterval);
+    return () => clearInterval(simInterval);
   }, []);
 
   return { telemetry };
