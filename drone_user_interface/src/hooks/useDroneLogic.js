@@ -35,10 +35,10 @@ export const useDroneLogic = (stream, addLog) => {
     if (cmd === 'ABORT') {
         if (!abortConfirm) {
             setAbortConfirm(true);
-            addLog("⚠️ ABORT ARMED! PRESS AGAIN TO CONFIRM!", "WARN");
+            addLog("ABORT ARMED! PRESS AGAIN TO CONFIRM!", "WARN");
             setTimeout(() => setAbortConfirm(false), 3000);
         } else {
-            addLog("🚨 EMERGENCY ABORT EXECUTED 🚨", "ERROR");
+            addLog("EMERGENCY ABORT EXECUTED ", "ERROR");
             setMode('EMERGENCY');
             setAbortConfirm(false);
             setTarget({ ...target, status: 'IDLE' });
