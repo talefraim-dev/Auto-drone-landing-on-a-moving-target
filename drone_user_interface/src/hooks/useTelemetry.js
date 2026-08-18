@@ -23,7 +23,7 @@ export const useTelemetry = () => {
   });
 
   useEffect(() => {
-    const ws = new WebSocket('ws://127.0.0.1:4001');
+    const ws = new WebSocket('ws://127.0.0.1:8080');
 
     ws.onmessage = (event) => {
         try {
@@ -96,7 +96,7 @@ export const useTelemetry = () => {
   useEffect(() => {
     const fetchSpeedFromAPI = async () => {
       try {
-        const response = await fetch('http://127.0.0.1:8000/api/speed');
+        const response = await fetch('http://127.0.0.1:8001/api/speed');
         
         if (response.ok) {
           const data = await response.json();
