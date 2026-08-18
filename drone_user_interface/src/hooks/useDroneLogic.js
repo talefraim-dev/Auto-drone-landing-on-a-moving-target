@@ -73,13 +73,9 @@ export const useDroneLogic = (stream, addLog) => {
         sendToSimulator({ Command: "SetMode", Mode: "RTH" });
     }
     else if (cmd === 'LAND') {
-        if (target.status === 'LOCKED') {
-            addLog("LANDING SEQUENCE STARTED", "WARN");
-            setMode('LANDING');
-            sendToSimulator({ Command: "ExecuteLanding" });
-        } else {
-            addLog("Landing Aborted: No valid target", "ERROR");
-        }
+        addLog("Initiating Vertical Landing...", "WARN");
+        setMode('LANDING');
+        sendToSimulator({ Command: "ExecuteLanding" });
     }
     else if (cmd === 'SYNC') {
         addLog("Requesting telemetry re-sync with simulator...", "INFO");
