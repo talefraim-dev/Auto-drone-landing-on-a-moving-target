@@ -161,11 +161,16 @@ def flight_control_loop():
                 time.sleep(0.1)
 
             elif mode == "LANDING":
-                if last_mode != "LANDING":
-                    control_client.landAsync(vehicle_name=VEHICLE_NAME).join() 
-                    was_moving = False
-                    last_mode = mode
+                kinematics = control_client.simGetGroundTruthKinematics()
+                curr_z = kinematics.position.z_val
+                
+                if curr_z < 1.7:
+                    control_client.moveByVelocityAsync(0.0, 0.0, 1.5, duration=0.2, vehicle_name=VEHICLE_NAME)
+                else:
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
+                    
                 time.sleep(0.1)
+                last_mode = mode
                 
             elif mode == "RTH":
                 kinematics = control_client.simGetGroundTruthKinematics()
