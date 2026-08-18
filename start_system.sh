@@ -57,7 +57,7 @@ cd "$ORIGINAL_DIR"
 # [3/4] AirSim Python API Server
 # ---------------------------------------------------------
 echo -e "${BLUE}[3/4] Starting AirSim Python API Server...${NC}"
-python airsim_server.py &
+python airsim_api.py &
 PYTHON_PID=$!
 
 echo -e "${BLUE}Waiting for servers to initialize...${NC}"
