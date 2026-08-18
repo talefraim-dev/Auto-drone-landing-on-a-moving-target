@@ -11,6 +11,9 @@ export const useTelemetry = () => {
   });
 
   useEffect(() => {
+    let isActive = true;
+    let timeoutId;
+
     const fetchTelemetryFromAPI = async () => {
       try {
         const response = await fetch('http://127.0.0.1:8000/api/telemetry');
@@ -18,25 +21,38 @@ export const useTelemetry = () => {
         if (response.ok) {
           const data = await response.json();
           
-          if (!data.error) {
-            setTelemetry(prev => ({
-              ...prev,
-              lat: data.lat !== undefined ? data.lat : prev.lat,
-              lng: data.lng !== undefined ? data.lng : prev.lng,
-              alt: data.z !== undefined ? parseFloat((-data.z).toFixed(2)) : prev.alt, 
-              speed: data.speed !== undefined ? parseFloat(data.speed.toFixed(2)) : prev.speed,
-              pitch: data.pitch !== undefined ? parseFloat(data.pitch.toFixed(2)) : prev.pitch,
-              roll: data.roll !== undefined ? parseFloat(data.roll.toFixed(2)) : prev.roll,
-              yaw: data.yaw !== undefined ? parseFloat(data.yaw.toFixed(2)) : prev.yaw,
-            }));
+          if (!data.error && isActive) {
+            setTelemetry(prev => {
+              const rawAlt = data.z !== undefined ? -data.z : 0;
+              const correctedAlt = rawAlt + 1.8;
+
+              return {
+                ...prev,
+                lat: data.lat !== undefined ? data.lat : prev.lat,
+                lng: data.lng !== undefined ? data.lng : prev.lng,
+                alt: parseFloat(correctedAlt.toFixed(2)), 
+                speed: data.speed !== undefined ? parseFloat(data.speed.toFixed(2)) : prev.speed,
+                pitch: data.pitch !== undefined ? parseFloat(data.pitch.toFixed(2)) : prev.pitch,
+                roll: data.roll !== undefined ? parseFloat(data.roll.toFixed(2)) : prev.roll,
+                yaw: data.yaw !== undefined ? parseFloat(data.yaw.toFixed(2)) : prev.yaw,
+              };
+            });
           }
         }
       } catch (error) {
       }
+
+      if (isActive) {
+        timeoutId = setTimeout(fetchTelemetryFromAPI, 500);
+      }
     };
 
-    const telemetryInterval = setInterval(fetchTelemetryFromAPI, 500);
-    return () => clearInterval(telemetryInterval);
+    fetchTelemetryFromAPI();
+
+    return () => {
+      isActive = false;
+      clearTimeout(timeoutId);
+    };
   }, []);
 
   useEffect(() => {

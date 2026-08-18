@@ -84,7 +84,7 @@ def get_telemetry():
 
         return {
             "x": x,
-            "y": (y+1.8),
+            "y": y,
             "z": z,
             "lat": lat,
             "lng": lng,
