@@ -2,74 +2,59 @@ import React from 'react';
 
 const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
   return (
-    <div className="video-section" onClick={onVideoClick} style={{cursor: 'crosshair'}}>
-      {/* Container element for WebRTC stream */}
-      <div ref={videoRef} className="live-feed" style={{ width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, zIndex: 0 }}></div>
-      <div className="video-overlay-mesh"></div>
+    <main className="camera-area" onClick={onVideoClick}>
+      {/* WebRTC Video Container */}
+      <div ref={videoRef} className="video-feed" style={{ background: '#000' }}></div>
       
-      <div style={{position: 'absolute', top: 20, left: 20, display: 'flex', gap: 20, pointerEvents: 'none'}}>
-          <div style={{background: 'rgba(0,0,0,0.6)', padding: '5px 10px', fontSize: 12}}>
-              <span style={{color: '#ff2a2a'}}>● LIVE</span>
+      {/* Target Tracker Overlay */}
+      {target.status !== 'IDLE' && (
+        <div className="target-bounding-box" style={{ top: target.y, left: target.x }}>
+          <div className="target-id-tag">
+             {target.status === 'SEARCHING' ? 'SCAN...' : 'ID: TRG_01'}
           </div>
-          {/* Emergency overlay */}
-          {mode === 'EMERGENCY' && (
-              <div style={{background: 'red', color:'white', padding: '5px 10px', fontSize: 12, fontWeight:'bold', animation: 'urgentPulse 0.5s infinite'}}>
-                  ⚠ EMERGENCY MODE
-              </div>
-          )}
-      </div>
+        </div>
+      )}
 
-      <div className="attitude-indicator" style={{ transform: `rotate(${-Number(telemetry.roll)}deg)` }}>
+      {/* Artificial Horizon */}
+      <div className="horizon-container" style={{ transform: `rotate(${-Number(telemetry.roll)}deg)` }}>
            <div style={{
                width: '100%', height: '200%', 
-               background: 'linear-gradient(to bottom, #3b82f6 50%, #854d0e 50%)',
+               background: 'linear-gradient(to bottom, #1e3a8a 50%, #713f12 50%)',
                position: 'absolute',
                top: `${-50 + Number(telemetry.pitch) * 2}%`, 
                transition: 'top 0.1s linear'
            }}></div>
-           <div className="attitude-line"></div>
-           <div className="attitude-center-dot"></div>
+           <div className="horizon-line"></div>
       </div>
 
-      <div className="video-hud-stats">
-          
-          <div className="hud-stat-box">
-              <span className="hud-label">ALT</span>
-              <span className="hud-value">{Number(telemetry.alt).toFixed(1)}m</span>
+      {/* HUD Strip */}
+      <div className="camera-hud-strip">
+          <div className="hud-metric">
+              <span className="label">ALT</span>
+              <div><span className="value">{Number(telemetry.alt).toFixed(1)}</span><span className="unit">m</span></div>
           </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">SPD</span>
-              <span className="hud-value">{Number(telemetry.speed).toFixed(1)}m/s</span>
+          <div className="hud-metric">
+              <span className="label">V/S</span>
+              <div><span className="value">{Number(telemetry.vs).toFixed(2)}</span><span className="unit">m/s</span></div>
           </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">PIT</span>
-              <span className="hud-value">{Number(telemetry.pitch).toFixed(1)}°</span>
+          <div className="hud-metric">
+              <span className="label">XY SPEED</span>
+              <div><span className="value">{Number(telemetry.speed).toFixed(2)}</span><span className="unit">m/s</span></div>
           </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">ROL</span>
-              <span className="hud-value">{Number(telemetry.roll).toFixed(1)}°</span>
+          <div className="hud-metric">
+              <span className="label">ROLL</span>
+              <div><span className="value">{Number(telemetry.roll).toFixed(1)}</span><span className="unit">°</span></div>
           </div>
-          <div className="hud-stat-box">
-              <span className="hud-label">YAW</span>
-              <span className="hud-value">{Number(telemetry.yaw).toFixed(1)}°</span>
+          <div className="hud-metric">
+              <span className="label">PITCH</span>
+              <div><span className="value">{Number(telemetry.pitch).toFixed(1)}</span><span className="unit">°</span></div>
+          </div>
+          <div className="hud-metric">
+              <span className="label">YAW</span>
+              <div><span className="value">{Number(telemetry.yaw).toFixed(1)}</span><span className="unit">°</span></div>
           </div>
       </div>
-
-      {target.status !== 'IDLE' && (
-          <div className={`target-box ${target.status === 'SEARCHING' ? 'searching' : 'locked'}`} 
-               style={{ top: target.y, left: target.x }}>
-              <div className="target-label" style={{background: target.status === 'LOCKED' ? 'var(--cyan)' : 'yellow'}}>
-                  {target.status === 'SEARCHING' ? 'SCAN...' : `ID: TRG_01`}
-              </div>
-              {target.status === 'LOCKED' && (
-                  <>
-                      <div className="target-corner tc-tl"></div><div className="target-corner tc-tr"></div>
-                      <div className="target-corner tc-bl"></div><div className="target-corner tc-br"></div>
-                  </>
-              )}
-          </div>
-      )}
-    </div>
+    </main>
   );
 };
 
