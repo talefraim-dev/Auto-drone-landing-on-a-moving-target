@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 client = None
-current_mode = "IDLE" 
+current_mode = "MANUAL" 
 
 class ModeUpdate(BaseModel):
     mode: str
