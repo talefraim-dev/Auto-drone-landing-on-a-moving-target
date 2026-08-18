@@ -13,6 +13,16 @@ export const useDroneLogic = (stream, addLog) => {
     };
   }, []);
 
+  useEffect(() => {
+    fetch('http://127.0.0.1:8000/api/mode', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ mode: mode }) 
+    }).catch(err => console.error("Failed to update mode on backend:", err));
+  }, [mode]);
+
   const sendToSimulator = (commandObj) => {
     if (stream) {
         stream.emitUIInteraction(commandObj);
@@ -47,7 +57,6 @@ export const useDroneLogic = (stream, addLog) => {
     }
     else if (cmd === 'HOVER') {
         if (mode === 'HOVER') {
-            // Return to whatever mode was active before HOVER was engaged, not always MANUAL.
             setMode(preHoverMode);
             addLog("Hover Cancelled", "INFO");
             sendToSimulator({ Command: "SetMode", Mode: preHoverMode });
@@ -78,9 +87,6 @@ export const useDroneLogic = (stream, addLog) => {
     }
   };
 
-  // pixelX/pixelY position the target overlay in screen space; normX/normY (0-1, resolution
-  // independent) are what actually gets sent to Unreal, since raw video-element pixels don't
-  // mean anything to the simulator if the feed is scaled/letterboxed in the browser.
   const handleTargetLock = (pixelX, pixelY, normX, normY) => {
       if (targetLockTimeoutRef.current) {
           clearTimeout(targetLockTimeoutRef.current);
