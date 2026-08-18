@@ -1,5 +1,4 @@
 import React, { useRef } from 'react';
-import './App.css';
 
 // Hooks
 import { usePixelStreaming } from './hooks/usePixelStreaming';
@@ -26,16 +25,52 @@ function App() {
     const rect = e.target.getBoundingClientRect();
     const pixelX = e.clientX - rect.left;
     const pixelY = e.clientY - rect.top;
-    // Normalized (0-1) coordinates are resolution-independent, unlike raw pixel offsets,
-    // so they stay meaningful to the simulator regardless of how the video element is scaled.
     const normX = rect.width > 0 ? pixelX / rect.width : 0;
     const normY = rect.height > 0 ? pixelY / rect.height : 0;
     handleTargetLock(pixelX, pixelY, normX, normY);
   };
 
+  // Safe fallbacks for display
+  const bat = telemetry.bat || 0;
+  const link = telemetry.linkQuality || 0;
+  const targetLockConfidence = target.confidence || (target.status === 'LOCKED' ? 98 : 0);
+
   return (
-    <div className="app-container">
+    <div className="dashboard-grid">
       
+      {/* 1. TOP GLOBAL STATUS BAR */}
+      <header className="top-bar">
+        <div className="live-indicator"><div className="live-dot"></div>LIVE</div>
+        
+        <div className="top-bar-item">
+          <span className="label">Mission Mode</span>
+          <span className={`value ${mode === 'EMERGENCY' ? 'red' : 'cyan'}`}>{mode}</span>
+        </div>
+        
+        <div className="top-bar-item">
+          <span className="label">Control Mode</span>
+          <span className="value">{mode === 'MANUAL' ? 'MANUAL' : 'AUTO'}</span>
+        </div>
+        
+        <div className="top-bar-item">
+          <span className="label">Target Status</span>
+          <span className={`value ${target.status === 'LOCKED' ? 'green' : 'orange'}`}>
+            {target.status !== 'IDLE' ? `LOCK ${targetLockConfidence}%` : 'NO TARGET'}
+          </span>
+        </div>
+
+        <div className="top-bar-item">
+          <span className="label">Link Quality</span>
+          <span className={`value ${link > 40 ? 'green' : 'red'}`}>{Math.floor(link)}%</span>
+        </div>
+
+        <div className="top-bar-item">
+          <span className="label">Battery</span>
+          <span className={`value ${bat > 30 ? 'green' : 'red'}`}>{Math.floor(bat)}%</span>
+        </div>
+      </header>
+
+      {/* 2. MAIN CAMERA AREA */}
       <VideoFeed 
         videoRef={videoRef} 
         telemetry={telemetry} 
@@ -44,73 +79,102 @@ function App() {
         onVideoClick={onVideoClick} 
       />
 
-      <div className="right-sidebar">
+      {/* 3. RIGHT SIDEBAR */}
+      <aside className="sidebar">
         
-        {}
-        <Minimap lat={telemetry.lat} lng={telemetry.lng} />
+        {/* Map Panel */}
+        <div className="panel" style={{ padding: 0, height: '180px', position: 'relative' }}>
+          <div className="panel-title" style={{ position: 'absolute', top: 8, left: 12, zIndex: 10, border: 'none', background: 'rgba(0,0,0,0.6)', padding: '2px 6px' }}>MAP</div>
+          <Minimap lat={telemetry.lat} lng={telemetry.lng} isConnected={true} />
+        </div>
 
-        {/* System Status Section */}
-        <div>
-            <div className="panel-header">SYSTEM STATUS</div>
-            <div style={{marginTop: 10, fontSize: 12}}>
-                <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
-                    <span>BATTERY</span><span style={{color: telemetry.bat > 30 ? 'cyan' : 'red'}}>{Math.floor(Number(telemetry.bat))}%</span>
-                </div>
-                
-                <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
-                    <div style={{width:`${telemetry.bat}%`, height:'100%', background: telemetry.bat > 30 ? 'cyan' : 'red'}}></div>
-                </div>
-
-                <div style={{marginTop: 10}}>
-                    <div style={{display:'flex', justifyContent:'space-between', marginBottom:2}}>
-                        <span>LINK QUALITY</span><span style={{color: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}>{Math.floor(telemetry.linkQuality)}%</span>
-                    </div>
-                    <div style={{width:'100%', height:4, background:'#333', marginBottom: 10}}>
-                        <div style={{width:`${telemetry.linkQuality}%`, height:'100%', background: telemetry.linkQuality > 40 ? 'cyan' : 'red'}}></div>
-                    </div>
-                </div>
-                <div style={{display:'flex', gap: 5}}>
-                    <div style={{background: '#080a10', padding: 5, flex:1, textAlign:'center', border: '1px solid #333'}}>
-                        <div style={{fontSize: 9, color:'#888', marginBottom:2}}>CORE TEMP</div>
-                        <div style={{fontSize: 14, color: telemetry.coreTemp > 75 ? 'red' : '#e0e6ed', fontWeight: 'bold'}}>{telemetry.coreTemp.toFixed(1)}°C</div>
-                    </div>
-                    <div style={{background: '#080a10', padding: 5, flex:1, textAlign:'center', border: '1px solid #333'}}>
-                        <div style={{fontSize: 9, color:'#888', marginBottom:2}}>ESC TEMP</div>
-                        <div style={{fontSize: 14, color: telemetry.escTemp > 80 ? 'red' : '#e0e6ed', fontWeight: 'bold'}}>{telemetry.escTemp.toFixed(1)}°C</div>
-                    </div>
-                </div>
-                
+        {/* Mission Status Panel */}
+        <div className="panel">
+          <div className="panel-title">MISSION STATUS</div>
+          <div className="mission-grid">
+            <div className="top-bar-item">
+              <span className="label">Target State</span>
+              <span className={`value ${target.status === 'LOCKED' ? 'green' : 'orange'}`}>{target.status}</span>
             </div>
+            <div className="top-bar-item">
+              <span className="label">Confidence</span>
+              <span className="value">{targetLockConfidence}%</span>
+            </div>
+            <div className="top-bar-item">
+              <span className="label">Range</span>
+              <span className="value">{target.range ? target.range.toFixed(1) : '---'} m</span>
+            </div>
+            <div className="top-bar-item">
+              <span className="label">XY Error</span>
+              <span className="value orange">{target.xyError ? target.xyError.toFixed(2) : '---'} m</span>
+            </div>
+          </div>
         </div>
 
-        {/* Commands Grid Section */}
-        <div className="commands-grid">
-            <button className={`cmd-btn ${mode === 'MANUAL' ? 'primary' : 'active'}`} onClick={() => handleCommand('TOGGLE_MODE')}>
-                {mode === 'MANUAL' ? 'MANUAL' : 'AUTO'}
+        {/* System Health Panel */}
+        <div className="panel">
+          <div className="panel-title">SYSTEM HEALTH</div>
+          <div className="system-grid">
+            <div className="top-bar-item">
+              <span className="label">Core Temp</span>
+              <span className={`value ${telemetry.coreTemp > 75 ? 'red' : 'cyan'}`}>
+                {telemetry.coreTemp ? telemetry.coreTemp.toFixed(1) : '--'}°C
+              </span>
+            </div>
+            <div className="top-bar-item">
+              <span className="label">ESC Temp</span>
+              <span className={`value ${telemetry.escTemp > 80 ? 'red' : 'cyan'}`}>
+                {telemetry.escTemp ? telemetry.escTemp.toFixed(1) : '--'}°C
+              </span>
+            </div>
+            <div className="top-bar-item" style={{ gridColumn: '1 / 3' }}>
+              <span className="label" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                BATTERY <span style={{ color: bat > 30 ? 'var(--cyan)' : 'var(--red)' }}>{Math.floor(bat)}%</span>
+              </span>
+              <div className="progress-bar-bg">
+                <div className="progress-bar-fill" style={{ width: `${bat}%`, background: bat > 30 ? 'var(--cyan)' : 'var(--red)' }}></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Flight Controls Panel */}
+        <div className="panel">
+          <div className="panel-title">FLIGHT CONTROLS</div>
+          <div className="commands-grid">
+            <button className={`btn ${mode !== 'MANUAL' ? 'active' : ''}`} onClick={() => handleCommand('TOGGLE_MODE')}>
+              {mode === 'MANUAL' ? 'MANUAL' : 'AUTO'}
             </button>
-            <button className="cmd-btn" onClick={() => handleCommand('SYNC')}>⟳ SYNC</button>
-            <button className="cmd-btn" onClick={() => handleCommand('RTH')} style={{color:'#ff9800'}}>⟲ RTH</button>
-            <button className={`cmd-btn ${mode === 'HOVER' ? 'active' : ''}`} onClick={() => handleCommand('HOVER')}>HOVER</button>
-            <button className="cmd-btn danger" onClick={() => handleCommand('LAND')}>↓ LAND</button>
-            <button className={`cmd-btn abort-btn ${abortConfirm ? 'confirm-state' : ''}`} onClick={() => handleCommand('ABORT')}>{abortConfirm ? 'CONFIRM ABORT?' : 'ABORT MISSION'}</button>
+            <button className="btn" onClick={() => handleCommand('SYNC')}>SYNC</button>
+            <button className="btn danger" onClick={() => handleCommand('RTH')}>RTH</button>
+            <button className={`btn ${mode === 'HOVER' ? 'active' : ''}`} onClick={() => handleCommand('HOVER')}>HOVER</button>
+            <button className="btn full" onClick={() => handleCommand('LAND')} style={{ borderColor: 'var(--cyan)' }}>LAND</button>
+            <button className={`btn btn-abort ${abortConfirm ? 'confirm-state' : ''}`} onClick={() => handleCommand('ABORT')}>
+              {abortConfirm ? 'CONFIRM ABORT?' : 'ABORT MISSION'}
+            </button>
+          </div>
         </div>
 
-        {/* Log Stream */}
-        <div className="log-stream">
-            {logs.length === 0 && <div style={{opacity:0.5}}>No logs yet...</div>}
+        {/* Event Log Panel */}
+        <div className="panel log-panel">
+          <div className="panel-title">EVENT LOG</div>
+          <div className="log-stream">
+            {logs.length === 0 && <div style={{opacity:0.5}}>No events recorded...</div>}
             {logs.map(log => (
-                <div key={log.id} className="log-line">
-                    <span style={{color: '#666'}}>[{log.time}]</span>
-                    <span style={{ color: log.type === 'ERROR' ? '#ff2a2a' : log.type === 'WARN' ? '#ff9800' : log.type === 'SUCCESS' ? '#00ff00' : '#ccc' }}>
-                        {log.message}
-                    </span>
-                </div>
+              <div key={log.id} className="log-line">
+                  <span style={{color: 'var(--cyan)', marginRight: '6px'}}>[{log.time}]</span>
+                  <span style={{ color: log.type === 'ERROR' ? 'var(--red)' : log.type === 'WARN' ? 'var(--orange)' : log.type === 'SUCCESS' ? 'var(--green)' : 'var(--text-main)' }}>
+                      {log.message}
+                  </span>
+              </div>
             ))}
+          </div>
         </div>
 
-      </div>
+      </aside>
 
-      <Footer lat={telemetry.lat} lng={telemetry.lng} mode={mode} />
+      {/* 4. BOTTOM STRIP */}
+      <Footer telemetry={telemetry} mode={mode} />
 
     </div>
   );

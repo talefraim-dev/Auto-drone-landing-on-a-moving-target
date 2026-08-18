@@ -1,12 +1,34 @@
 import React from 'react';
 
-const Footer = ({ lat, lng, mode }) => {
+const Footer = ({ telemetry, mode }) => {
   return (
-    <div className="bottom-bar">
-      <div className="footer-stat"><div className="footer-label">LAT</div><div className="footer-value">{Number(lat).toFixed(4)}</div></div>
-      <div className="footer-stat"><div className="footer-label">LON</div><div className="footer-value">{Number(lng).toFixed(4)}</div></div>
-      <div className="footer-stat"><div className="footer-label">MODE</div><div className="footer-value" style={{color: 'cyan'}}>{mode}</div></div>
-    </div>
+    <footer className="bottom-strip">
+      <div className="position-group">
+        <div className="top-bar-item">
+          <span className="label">X POS</span>
+          <span className="value">{Number(telemetry.x || 0).toFixed(2)} m</span>
+        </div>
+        <div className="top-bar-item">
+          <span className="label">Y POS</span>
+          <span className="value">{Number(telemetry.y || 0).toFixed(2)} m</span>
+        </div>
+        <div className="top-bar-item">
+          <span className="label">Z / ALT</span>
+          <span className="value">{Number(telemetry.z || 0).toFixed(2)} m</span>
+        </div>
+        <div className="top-bar-item" style={{ marginLeft: '24px' }}>
+          <span className="label">System Mode</span>
+          <span className="value cyan">{mode}</span>
+        </div>
+      </div>
+
+      <div className="top-bar-item" style={{ alignItems: 'flex-end' }}>
+        <span className="label">GPS Coordinates (Secondary)</span>
+        <span className="value" style={{ fontSize: '14px', color: 'var(--text-muted)' }}>
+          LAT {Number(telemetry.lat || 0).toFixed(4)} &nbsp; LON {Number(telemetry.lng || 0).toFixed(4)}
+        </span>
+      </div>
+    </footer>
   );
 };
 
