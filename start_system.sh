@@ -18,7 +18,7 @@ if [ ! -f "$SETUP_FLAG" ]; then
     echo -e "${BLUE}First run detected. Running required installations...${NC}\n"
     
     echo -e "${BLUE}-> Installing Python dependencies...${NC}"
-    pip install fastapi uvicorn cosysairsim
+    pip install fastapi uvicorn cosysairsim keyboard
     
     echo -e "\n${BLUE}-> Installing Pixel Streaming WebServer dependencies...${NC}"
     cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers" || { echo -e "${RED}Failed to find WebServers directory${NC}"; exit 1; }
