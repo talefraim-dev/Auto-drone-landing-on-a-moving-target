@@ -167,6 +167,13 @@ def flight_control_loop():
                     last_mode = mode
                 time.sleep(0.1)
                 
+            elif mode == "RTH":
+                if last_mode != "RTH":
+                    control_client.moveToPositionAsync(0.0, 0.0, -10.0, 5.0, vehicle_name=VEHICLE_NAME)
+                    was_moving = False
+                    last_mode = mode
+                time.sleep(0.1)
+
             elif mode == "EMERGENCY" or mode == "ABORT":
                 if last_mode not in ["EMERGENCY", "ABORT"]:
                     control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
