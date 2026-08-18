@@ -18,21 +18,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-telemetry_client = None
-current_mode = "MANUAL" 
+current_mode = "MANUAL"
+
+latest_telemetry = {
+    "error": "Initializing..."
+}
 
 class ModeUpdate(BaseModel):
     mode: str
-
-def get_telemetry_client():
-    global telemetry_client
-    if telemetry_client is None:
-        try:
-            telemetry_client = airsim.MultirotorClient()
-            telemetry_client.confirmConnection()
-        except Exception as e:
-            telemetry_client = None
-    return telemetry_client
 
 def translate_unreal_to_lat(unreal_x):
     unreal_min, unreal_max = -120000, 120000
@@ -65,9 +58,46 @@ def quaternion_to_euler(q):
 def key_axis(positive_key: str, negative_key: str) -> float:
     return float(keyboard.is_pressed(positive_key)) - float(keyboard.is_pressed(negative_key))
 
+def telemetry_loop():
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    client = airsim.MultirotorClient()
+    try:
+        client.confirmConnection()
+    except Exception:
+        pass
+
+    global latest_telemetry, current_mode
+    while True:
+        try:
+            kinematics = client.simGetGroundTruthKinematics()
+            vx, vy, vz = kinematics.linear_velocity.x_val, kinematics.linear_velocity.y_val, kinematics.linear_velocity.z_val
+            speed = math.sqrt(vx**2 + vy**2 + vz**2)
+            
+            x, y, z = kinematics.position.x_val, kinematics.position.y_val, kinematics.position.z_val
+            lat = translate_unreal_to_lat(x * 100)
+            lng = translate_unreal_to_lng(y * 100)
+            
+            pitch, roll, yaw = quaternion_to_euler(kinematics.orientation)
+            
+            latest_telemetry = {
+                "x": x, "y": y, "z": z,
+                "lat": lat, "lng": lng,
+                "pitch": math.degrees(pitch), "roll": math.degrees(roll), "yaw": math.degrees(yaw),
+                "speed": speed,
+                "current_backend_mode": current_mode
+            }
+        except Exception as e:
+            latest_telemetry = {"error": str(e)}
+            try:
+                client = airsim.MultirotorClient()
+                client.confirmConnection()
+            except:
+                pass
+        
+        time.sleep(0.05) 
+
 def manual_control_loop():
     asyncio.set_event_loop(asyncio.new_event_loop())
-    
     control_client = airsim.MultirotorClient()
     try:
         control_client.confirmConnection()
@@ -114,7 +144,7 @@ def manual_control_loop():
             else:
                 time.sleep(0.05)
 
-        except Exception as e:
+        except Exception:
             time.sleep(0.1)
             try:
                 control_client = airsim.MultirotorClient()
@@ -122,44 +152,20 @@ def manual_control_loop():
             except:
                 pass
 
+threading.Thread(target=telemetry_loop, daemon=True).start()
 threading.Thread(target=manual_control_loop, daemon=True).start()
 
-# --- API Routes ---
+
 @app.post("/api/mode")
-async def update_mode(data: ModeUpdate):
+def update_mode(data: ModeUpdate):
     global current_mode
     current_mode = data.mode
     print(f"Server mode updated to: {current_mode}")
     return {"status": "success", "mode": current_mode}
 
 @app.get("/api/telemetry")
-async def get_telemetry():
-    c = get_telemetry_client()
-    if c is None:
-        return {"error": "AirSim is not running"}
-        
-    try:
-        kinematics = c.simGetGroundTruthKinematics()
-        vx, vy, vz = kinematics.linear_velocity.x_val, kinematics.linear_velocity.y_val, kinematics.linear_velocity.z_val
-        speed = math.sqrt(vx**2 + vy**2 + vz**2)
-        
-        x, y, z = kinematics.position.x_val, kinematics.position.y_val, kinematics.position.z_val
-        lat = translate_unreal_to_lat(x * 100)
-        lng = translate_unreal_to_lng(y * 100)
-        
-        pitch, roll, yaw = quaternion_to_euler(kinematics.orientation)
-        
-        return {
-            "x": x, "y": y, "z": z,
-            "lat": lat, "lng": lng,
-            "pitch": math.degrees(pitch), "roll": math.degrees(roll), "yaw": math.degrees(yaw),
-            "speed": speed,
-            "current_backend_mode": current_mode
-        }
-    except Exception as e:
-        global telemetry_client
-        telemetry_client = None
-        return {"error": str(e)}
+def get_telemetry():
+    return latest_telemetry
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
