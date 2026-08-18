@@ -7,6 +7,7 @@ import uvicorn
 import keyboard
 import threading
 import time
+import asyncio
 
 app = FastAPI()
 
@@ -17,21 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = None
+telemetry_client = None
 current_mode = "MANUAL" 
 
 class ModeUpdate(BaseModel):
     mode: str
 
-def get_airsim_client():
-    global client
-    if client is None:
+def get_telemetry_client():
+    global telemetry_client
+    if telemetry_client is None:
         try:
-            client = airsim.MultirotorClient()
-            client.confirmConnection()
+            telemetry_client = airsim.MultirotorClient()
+            telemetry_client.confirmConnection()
         except Exception as e:
-            client = None
-    return client
+            telemetry_client = None
+    return telemetry_client
 
 def translate_unreal_to_lat(unreal_x):
     unreal_min, unreal_max = -120000, 120000
@@ -65,6 +66,14 @@ def key_axis(positive_key: str, negative_key: str) -> float:
     return float(keyboard.is_pressed(positive_key)) - float(keyboard.is_pressed(negative_key))
 
 def manual_control_loop():
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    
+    control_client = airsim.MultirotorClient()
+    try:
+        control_client.confirmConnection()
+    except Exception:
+        pass
+
     global current_mode
     LINEAR_SPEED_MPS = 1.5
     VERTICAL_SPEED_MPS = 1.0
@@ -77,16 +86,11 @@ def manual_control_loop():
             time.sleep(0.1)
             continue
 
-        c = get_airsim_client()
-        if c is None:
-            time.sleep(0.5)
-            continue
-
         try:
-            c.enableApiControl(True, vehicle_name=VEHICLE_NAME)
+            control_client.enableApiControl(True, vehicle_name=VEHICLE_NAME)
             
             if keyboard.is_pressed("space"):
-                c.hoverAsync(vehicle_name=VEHICLE_NAME).join()
+                control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
                 time.sleep(0.05)
                 continue
 
@@ -102,29 +106,35 @@ def manual_control_loop():
             yaw_mode = airsim.YawMode(is_rate=True, yaw_or_rate=yaw * YAW_RATE_DEG_S)
 
             if vx != 0 or vy != 0 or vz != 0 or yaw != 0:
-                c.moveByVelocityBodyFrameAsync(
+                control_client.moveByVelocityBodyFrameAsync(
                     vx=vx, vy=vy, vz=vz, duration=COMMAND_DURATION_S,
                     drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
                     yaw_mode=yaw_mode, vehicle_name=VEHICLE_NAME
                 ).join()
             else:
-                time.sleep(0.05) 
+                time.sleep(0.05)
 
         except Exception as e:
             time.sleep(0.1)
+            try:
+                control_client = airsim.MultirotorClient()
+                control_client.confirmConnection()
+            except:
+                pass
 
 threading.Thread(target=manual_control_loop, daemon=True).start()
 
+# --- API Routes ---
 @app.post("/api/mode")
-def update_mode(data: ModeUpdate):
+async def update_mode(data: ModeUpdate):
     global current_mode
     current_mode = data.mode
     print(f"Server mode updated to: {current_mode}")
     return {"status": "success", "mode": current_mode}
 
 @app.get("/api/telemetry")
-def get_telemetry():
-    c = get_airsim_client()
+async def get_telemetry():
+    c = get_telemetry_client()
     if c is None:
         return {"error": "AirSim is not running"}
         
@@ -144,11 +154,11 @@ def get_telemetry():
             "lat": lat, "lng": lng,
             "pitch": math.degrees(pitch), "roll": math.degrees(roll), "yaw": math.degrees(yaw),
             "speed": speed,
-            "current_backend_mode": current_mode 
+            "current_backend_mode": current_mode
         }
     except Exception as e:
-        global client
-        client = None
+        global telemetry_client
+        telemetry_client = None
         return {"error": str(e)}
 
 if __name__ == "__main__":
