@@ -165,7 +165,14 @@ def flight_control_loop():
                 curr_z = kinematics.position.z_val
                 
                 if curr_z < 1.7:
-                    control_client.moveByVelocityAsync(0.0, 0.0, 1.5, duration=0.2, vehicle_name=VEHICLE_NAME)
+                    landing_yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=0.0)
+                    control_client.moveByVelocityAsync(
+                        0.0, 0.0, 1.5, 
+                        duration=0.2, 
+                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                        yaw_mode=landing_yaw_mode, 
+                        vehicle_name=VEHICLE_NAME
+                    )
                 else:
                     control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
                     
@@ -193,7 +200,14 @@ def flight_control_loop():
                     vy = (dy / distance) * speed
                     vz = (dz / distance) * speed
                     
-                    control_client.moveByVelocityAsync(vx, vy, vz, duration=0.2, vehicle_name=VEHICLE_NAME)
+                    rth_yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=0.0)
+                    control_client.moveByVelocityAsync(
+                        vx, vy, vz, 
+                        duration=0.2, 
+                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                        yaw_mode=rth_yaw_mode, 
+                        vehicle_name=VEHICLE_NAME
+                    )
                 else:
                     control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
                     current_mode = "LANDING" 
