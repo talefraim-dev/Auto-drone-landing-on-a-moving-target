@@ -155,28 +155,50 @@ def flight_control_loop():
 
             elif mode == "HOVER":
                 if last_mode != "HOVER":
-                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join() 
                     was_moving = False
                     last_mode = mode
                 time.sleep(0.1)
 
             elif mode == "LANDING":
                 if last_mode != "LANDING":
-                    control_client.landAsync(vehicle_name=VEHICLE_NAME)
+                    control_client.landAsync(vehicle_name=VEHICLE_NAME).join() 
                     was_moving = False
                     last_mode = mode
                 time.sleep(0.1)
                 
             elif mode == "RTH":
-                if last_mode != "RTH":
-                    control_client.moveToPositionAsync(0.0, 0.0, -10.0, 5.0, vehicle_name=VEHICLE_NAME)
-                    was_moving = False
-                    last_mode = mode
+                kinematics = control_client.simGetGroundTruthKinematics()
+                curr_x = kinematics.position.x_val
+                curr_y = kinematics.position.y_val
+                curr_z = kinematics.position.z_val
+
+                target_x = 0.0
+                target_y = 0.0
+                target_z = -10.0
+
+                dx = target_x - curr_x
+                dy = target_y - curr_y
+                dz = target_z - curr_z
+                distance = math.sqrt(dx**2 + dy**2 + dz**2)
+
+                if distance > 1.5: 
+                    speed = 5.0 
+                    vx = (dx / distance) * speed
+                    vy = (dy / distance) * speed
+                    vz = (dz / distance) * speed
+                    
+                    control_client.moveByVelocityAsync(vx, vy, vz, duration=0.2, vehicle_name=VEHICLE_NAME)
+                else:
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join()
+                    current_mode = "LANDING" 
+                    
                 time.sleep(0.1)
+                last_mode = mode
 
             elif mode == "EMERGENCY" or mode == "ABORT":
                 if last_mode not in ["EMERGENCY", "ABORT"]:
-                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME)
+                    control_client.hoverAsync(vehicle_name=VEHICLE_NAME).join() 
                     was_moving = False
                     last_mode = mode
                 time.sleep(0.1)
