@@ -16,8 +16,18 @@ echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
 
 cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers" || { echo -e "${RED}Failed to find WebServers directory${NC}"; exit 1; }
 
-npm install
-npm run build
+SETUP_FLAG=".aeroguard_setup_done"
+
+if [ ! -f "$SETUP_FLAG" ]; then
+    echo -e "${BLUE}First run detected. Running npm install and build...${NC}"
+    npm install
+    npm run build
+    
+    touch "$SETUP_FLAG"
+    echo -e "${GREEN}Setup completed successfully.${NC}"
+else
+    echo -e "${GREEN}Setup already completed in a previous run. Skipping install and build.${NC}"
+fi
 
 cd SignallingWebServer
 npm run start &
