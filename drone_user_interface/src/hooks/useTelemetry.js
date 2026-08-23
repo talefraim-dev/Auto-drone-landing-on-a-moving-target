@@ -1,37 +1,61 @@
 import { useState, useEffect } from 'react';
 
-export const useTelemetry = (stream) => {
-  const [telemetry, setTelemetry] = useState({ 
-    alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
-    pitch: 0, roll: 0, yaw: 0, coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
+const DEFAULT_LAT = 32.0853;
+const DEFAULT_LNG = 34.7818;
+
+export const useTelemetry = () => {
+  const [telemetry, setTelemetry] = useState({
+    alt: 0, speed: 0.0, bat: 100, lat: DEFAULT_LAT, lng: DEFAULT_LNG,
+    pitch: 0, roll: 0, yaw: 0, 
+    coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
   });
 
   useEffect(() => {
-    const fetchTelemetry = async () => {
+    let isActive = true;
+    let timeoutId;
+
+    const fetchTelemetryFromAPI = async () => {
       try {
         const response = await fetch('http://127.0.0.1:8000/api/telemetry');
+        
         if (response.ok) {
           const data = await response.json();
-          if (!data.error) {
-            setTelemetry(prev => ({
-              ...prev,
-              lat: data.lat !== undefined ? data.lat : prev.lat,
-              lng: data.lng !== undefined ? data.lng : prev.lng,
-              alt: data.z !== undefined ? -data.z : prev.alt, 
-              speed: data.speed !== undefined ? data.speed : prev.speed,
-              pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
-              roll: data.roll !== undefined ? data.roll : prev.roll,
-              yaw: data.yaw !== undefined ? data.yaw : prev.yaw
-            }));
+          
+          if (!data.error && isActive) {
+            setTelemetry(prev => {
+              const rawAlt = data.z !== undefined ? -data.z : 0;
+              const correctedAlt = rawAlt + 1.8;
+
+              return {
+                ...prev,
+                lat: data.lat !== undefined ? data.lat : prev.lat,
+                lng: data.lng !== undefined ? data.lng : prev.lng,
+                alt: parseFloat(correctedAlt.toFixed(2)), 
+                speed: data.speed !== undefined ? parseFloat(data.speed.toFixed(2)) : prev.speed,
+                pitch: data.pitch !== undefined ? parseFloat(data.pitch.toFixed(2)) : prev.pitch,
+                roll: data.roll !== undefined ? parseFloat(data.roll.toFixed(2)) : prev.roll,
+                yaw: data.yaw !== undefined ? parseFloat(data.yaw.toFixed(2)) : prev.yaw,
+              };
+            });
           }
         }
-      } catch (err) {
-        console.error("Failed to fetch telemetry from Python API:", err);
+      } catch (error) {
+      }
+
+      if (isActive) {
+        timeoutId = setTimeout(fetchTelemetryFromAPI, 500);
       }
     };
 
-    const telemetryInterval = setInterval(fetchTelemetry, 100);
+    fetchTelemetryFromAPI();
 
+    return () => {
+      isActive = false;
+      clearTimeout(timeoutId);
+    };
+  }, []);
+
+  useEffect(() => {
     const simInterval = setInterval(() => {
         setTelemetry(prev => ({
             ...prev,
@@ -41,11 +65,8 @@ export const useTelemetry = (stream) => {
         }));
     }, 1000);
 
-    return () => {
-      clearInterval(telemetryInterval);
-      clearInterval(simInterval);
-    };
-  }, []); 
+    return () => clearInterval(simInterval);
+  }, []);
 
   return { telemetry };
 };
