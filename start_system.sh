@@ -34,9 +34,9 @@ else
 fi
 
 # ---------------------------------------------------------
-# [1/3] Pixel Streaming Signalling Server
+# [1/4] Pixel Streaming Signalling Server
 # ---------------------------------------------------------
-echo -e "${BLUE}[1/3] Starting Pixel Streaming Signalling Server...${NC}"
+echo -e "${BLUE}[1/4] Starting Pixel Streaming Signalling Server...${NC}"
 cd "C:/Program Files/Epic Games/UE_5.5/Engine/Plugins/Media/PixelStreaming/Resources/WebServers/SignallingWebServer" || exit 1
 npm run start &
 SIG_PID=$!
@@ -44,9 +44,9 @@ SIG_PID=$!
 cd "$ORIGINAL_DIR"
 
 # ---------------------------------------------------------
-# [2/3] AirSim Python API Server
+# [2/4] AirSim Python API Server
 # ---------------------------------------------------------
-echo -e "${BLUE}[2/3] Starting AirSim Python API Server...${NC}"
+echo -e "${BLUE}[2/4] Starting AirSim Python API Server...${NC}"
 cd telemetry_server || { echo -e "${RED}Failed to find telemetry_server directory${NC}"; exit 1; }
 python airsim_api.py &
 PYTHON_PID=$!
@@ -57,18 +57,27 @@ echo -e "${BLUE}Waiting for servers to initialize...${NC}"
 sleep 2
 
 # ---------------------------------------------------------
-# [3/3] React UI
+# [3/4] React UI
 # ---------------------------------------------------------
-echo -e "${BLUE}[3/3] Starting Drone User Interface...${NC}"
+echo -e "${BLUE}[3/4] Starting Drone User Interface...${NC}"
 cd drone_user_interface || { echo -e "${RED}Failed to find drone_user_interface directory${NC}"; exit 1; }
 npm run dev &
 UI_PID=$!
 
-cd "$ORIGINAL_DIR"
+# ---------------------------------------------------------
+# [4/4] Autonomous Landing Benchmark
+# ---------------------------------------------------------
+echo -e "${BLUE}[4/4] Starting Landing Benchmark...${NC}"
+cd "$ORIGINAL_DIR" 
+python run_benchmark.py --target-identity "YOUR_TARGET" &
+BENCHMARK_PID=$!
 
+# ---------------------------------------------------------
+# Ready State & Cleanup
+# ---------------------------------------------------------
 echo -e "\n${GREEN} All systems are online!${NC}"
 echo -e "Press ${RED}[CTRL+C]${NC} to safely stop all services.\n"
 
-trap "echo -e '\n${RED}Shutting down systems...${NC}'; kill $SIG_PID $PYTHON_PID $UI_PID; exit" SIGINT SIGTERM
+trap "echo -e '\n${RED}Shutting down systems...${NC}'; kill $SIG_PID $PYTHON_PID $UI_PID $BENCHMARK_PID; exit" SIGINT SIGTERM
 
-wait $SIG_PID $PYTHON_PID $UI_PID
+wait $SIG_PID $PYTHON_PID $UI_PID $BENCHMARK_PID
