@@ -72,7 +72,7 @@ cd "$ORIGINAL_DIR/RL_training" || { echo -e "${RED}Failed to find RL_training di
 
 rm -f "config/target_bbox.json"
 
-python run_final_object_tracker.py --target-identity "config/target_bbox.json" &
+python run_final_object_tracker.py --target-identity "config/target_bbox.json" --device cpu &
 BENCHMARK_PID=$!
 
 # ---------------------------------------------------------

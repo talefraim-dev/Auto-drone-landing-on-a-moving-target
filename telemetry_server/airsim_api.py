@@ -255,12 +255,14 @@ def update_mode(data: ModeUpdate):
 
 @app.post("/api/SetTargetBBox")
 def set_target_bbox(bbox: TargetBBox):
-    os.makedirs("config", exist_ok=True)
+    config_dir = os.path.join("..", "RL_training", "config")
+    os.makedirs(config_dir, exist_ok=True)
     
-    with open("config/target_bbox.json", "w") as f:
-        json.dump(bbox.model_dump(), f) 
+    file_path = os.path.join(config_dir, "target_bbox.json")
+    with open(file_path, "w") as f:
+        json.dump(bbox.model_dump(), f)
         
-    print(f"Target BBox received and saved: {bbox.model_dump()}")
+    print(f"Target BBox received and saved to {file_path}")
     return {"status": "success", "message": "BBox saved successfully"}
 
 @app.get("/api/telemetry")

@@ -820,7 +820,7 @@ def main() -> int:
             "CUDA was requested but torch.cuda.is_available() is False."
         )
 
-    resnet_model = models.resnet18(pretrained=True)
+    resnet_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     feature_extractor = torch.nn.Sequential(*list(resnet_model.children())[:-1])
     feature_extractor = feature_extractor.to(device)
     feature_extractor.eval()
