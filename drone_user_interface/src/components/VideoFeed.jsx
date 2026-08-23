@@ -6,10 +6,20 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
   const [currentPos, setCurrentPos] = useState({ x: 0, y: 0 });
   const containerRef = useRef(null);
 
+  const getRelativeCoords = (e) => {
+    const videoElement = containerRef.current.querySelector('video');
+    const targetElement = videoElement || containerRef.current;
+    const rect = targetElement.getBoundingClientRect();
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      width: rect.width,
+      height: rect.height
+    };
+  };
+
   const handleMouseDown = (e) => {
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const { x, y } = getRelativeCoords(e);
     setIsDrawing(true);
     setStartPos({ x, y });
     setCurrentPos({ x, y });
@@ -17,9 +27,7 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
 
   const handleMouseMove = (e) => {
     if (!isDrawing) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const { x, y } = getRelativeCoords(e);
     setCurrentPos({ x, y });
   };
 
@@ -33,8 +41,10 @@ const VideoFeed = ({ videoRef, telemetry, mode, target, onVideoClick }) => {
     const height = Math.abs(currentPos.y - startPos.y);
 
     if (width > 15 && height > 15) {
-      const rect = containerRef.current.getBoundingClientRect();
-      
+      const videoElement = containerRef.current.querySelector('video');
+      const targetElement = videoElement || containerRef.current;
+      const rect = targetElement.getBoundingClientRect();
+
       const bbox = {
         x, y, width, height,
         normX: x / rect.width,
