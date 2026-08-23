@@ -32,7 +32,8 @@ import torch
 from stable_baselines3 import PPO
 
 from alternating_cotraining_env import RpcDominantAgent2RewardEnv
-from Run_train_alternating_agents import build_agent2_config, build_parallel_env
+from Run_train_alternating_agents import build_agent2_config, build_parallel_env , TargetIdentitySnapshot
+import pickle
 
 
 AGENT1_MODEL = Path("models") / "FINAL_MODELS" / "agent1_final.zip"
@@ -860,14 +861,21 @@ def main() -> int:
     agent2_cfg = build_agent2_config()
     agent2_cfg.force_descent_while_bottom_match = False
 
-    target_id = args.target_identity
-    if target_id and ',' in target_id:
-        target_id = tuple(map(int, target_id.split(',')))
+    target_id_path = args.target_identity
+    snapshot_obj = None
+
+    if target_id_path and target_id_path != "YOUR_TARGET":
+        try:
+            with open(target_id_path, "rb") as f:
+                snapshot_obj = pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load target identity from {target_id_path}. Error: {e}")
+            
 
     parallel_env = build_parallel_env(
         agent1_checkpoint=AGENT1_MODEL,
         device=device,
-        target_identity=target_id,
+        target_identity=snapshot_obj,
         agent2_config=agent2_cfg,
     )
 

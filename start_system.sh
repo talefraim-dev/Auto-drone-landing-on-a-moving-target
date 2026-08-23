@@ -69,7 +69,7 @@ UI_PID=$!
 # ---------------------------------------------------------
 echo -e "${BLUE}[4/4] Starting Landing Benchmark...${NC}"
 cd "$ORIGINAL_DIR/RL_training" || { echo -e "${RED}Failed to find RL_training directory${NC}"; exit 1; }
-python run_final_object_tracker.py --target-identity "YOUR_TARGET" &
+python run_final_object_tracker.py &
 BENCHMARK_PID=$!
 
 # ---------------------------------------------------------
