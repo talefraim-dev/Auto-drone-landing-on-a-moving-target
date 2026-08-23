@@ -19,10 +19,9 @@ function App() {
   const { telemetry } = useTelemetry(stream);
   const { mode, target, logs, abortConfirm, addLog, handleCommand, handleTargetLock } = useDroneLogic(stream);
 
-  const onVideoClick = (e) => {
+  const onVideoClick = (bbox) => {
     if (mode === 'LANDING' || mode === 'EMERGENCY') return;
-    const rect = e.target.getBoundingClientRect();
-    handleTargetLock(e.clientX - rect.left, e.clientY - rect.top);
+    handleTargetLock(bbox);
   };
 
   return (
@@ -38,7 +37,6 @@ function App() {
 
       <div className="right-sidebar">
         
-        {}
         <Minimap lat={telemetry.lat} lng={telemetry.lng} />
 
         {/* System Status Section */}

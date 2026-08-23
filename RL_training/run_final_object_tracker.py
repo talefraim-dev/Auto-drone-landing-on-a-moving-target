@@ -1,18 +1,4 @@
-"""Read-only 100-landing benchmark for the final cooperative UAV models.
-
-The benchmark uses only:
-    models/FINAL_MODELS/agent1_final.zip
-    models/FINAL_MODELS/agent2_final.zip
-
-It never trains, saves, overwrites, or creates model checkpoints. The only
-artifact it creates is a CSV file containing one row per landing attempt.
-
-The CSV is designed as raw input for later statistical aggregation and plots
-across different target types and target sizes.
-"""
-
 from __future__ import annotations
-
 import argparse
 import csv
 import hashlib
@@ -21,6 +7,9 @@ import re
 import sys
 import time
 import traceback
+import json
+import cv2
+import cosysairsim as airsim
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -31,8 +20,12 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 
+import torchvision.transforms as T
+import torchvision.models as models
+from PIL import Image
+
 from alternating_cotraining_env import RpcDominantAgent2RewardEnv
-from Run_train_alternating_agents import build_agent2_config, build_parallel_env , TargetIdentitySnapshot
+from Run_train_alternating_agents import build_agent2_config, build_parallel_env, TargetIdentitySnapshot
 import pickle
 
 
@@ -480,8 +473,6 @@ def _resolve_failure_reason(
     return termination_reason or error_message or error_type or "unknown_failure"
 
 
-
-
 def _build_row(
     *,
     run_id: str,
@@ -829,6 +820,17 @@ def main() -> int:
             "CUDA was requested but torch.cuda.is_available() is False."
         )
 
+    resnet_model = models.resnet18(pretrained=True)
+    feature_extractor = torch.nn.Sequential(*list(resnet_model.children())[:-1])
+    feature_extractor = feature_extractor.to(device)
+    feature_extractor.eval()
+
+    preprocess = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = (
         args.output
@@ -864,14 +866,55 @@ def main() -> int:
     target_id_path = args.target_identity
     snapshot_obj = None
 
-    if target_id_path and target_id_path != "YOUR_TARGET":
+    if target_id_path and target_id_path.endswith('.json'):
+        print(f"[LANDING BENCHMARK] Attempting to load Target BBox from JSON: {target_id_path}")
+        import os
+        while not os.path.exists(target_id_path):
+            time.sleep(1)
+        
+        time.sleep(0.5)
+        try:
+            with open(target_id_path, "r") as f:
+                bbox_data = json.load(f)
+            
+            client = airsim.MultirotorClient()
+            client.confirmConnection()
+            
+            responses = client.simGetImages([airsim.ImageRequest("bottom_center", airsim.ImageType.Scene, False, False)])
+            response = responses[0]
+            
+            img1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+            img_rgba = img1d.reshape(response.height, response.width, 3)
+            
+            h, w = response.height, response.width
+            x = int(bbox_data["TargetX"] * w)
+            y = int(bbox_data["TargetY"] * h)
+            box_w = int(bbox_data["TargetW"] * w)
+            box_h = int(bbox_data["TargetH"] * h)
+            
+            target_roi = img_rgba[y:y+box_h, x:x+box_w]
+            
+            roi_pil = Image.fromarray(target_roi)
+            input_tensor = preprocess(roi_pil).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                features = feature_extractor(input_tensor)
+                
+            target_fingerprint = features.cpu().numpy().flatten().astype(np.float32)
+            
+            snapshot_obj = TargetIdentitySnapshot(fingerprint=target_fingerprint, class_id=0)
+            print(f"[LANDING BENCHMARK] Successfully generated TargetIdentitySnapshot (Vector size: {target_fingerprint.shape[0]}).")
+
+        except Exception as e:
+            print(f"[LANDING BENCHMARK] Warning: Could not process JSON target identity. Error: {e}")
+            
+    elif target_id_path and target_id_path != "YOUR_TARGET":
         try:
             with open(target_id_path, "rb") as f:
                 snapshot_obj = pickle.load(f)
         except Exception as e:
             print(f"Warning: Could not load target identity from {target_id_path}. Error: {e}")
             
-
     parallel_env = build_parallel_env(
         agent1_checkpoint=AGENT1_MODEL,
         device=device,
@@ -879,9 +922,6 @@ def main() -> int:
         agent2_config=agent2_cfg,
     )
 
-    # Experiment-only override applied after the checkpoint snapshot has
-    # created Agent 1's environment. This keeps the frozen model and snapshot
-    # untouched while allowing controlled altitude-vs-target-size tests.
     if args.initial_altitude_m is not None:
         altitude_m = float(args.initial_altitude_m)
         parallel_env.agent1_env.cfg.reset_takeoff_altitude_m = altitude_m
@@ -900,7 +940,6 @@ def main() -> int:
         f"source={'tester' if args.initial_altitude_m is not None else 'snapshot'}"
     )
 
-    # Block training/checkpoint writes for the frozen Agent-1 policy too.
     parallel_env.agent1_model.policy.set_training_mode(False)
     parallel_env.agent1_model.learn = _forbidden_operation
     parallel_env.agent1_model.save = _forbidden_operation
@@ -1033,9 +1072,6 @@ def main() -> int:
                     "Execution was stopped immediately."
                 )
 
-            # Agent1P2Env exposes the cumulative count after reset. The hook
-            # gives the exact per-attempt physical count, so preparation steps
-            # are the physical Agent-1 steps not paired with cooperative steps.
             agent1_prepare_steps = max(
                 0,
                 current_telemetry.physical_agent1_steps

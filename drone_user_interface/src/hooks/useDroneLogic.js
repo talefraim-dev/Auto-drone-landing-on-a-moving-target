@@ -65,11 +65,30 @@ export const useDroneLogic = (stream) => {
     }
   };
 
-  const handleTargetLock = (x, y) => {
-      setTarget({ x, y, status: 'SEARCHING' });
+  const handleTargetLock = (bbox) => {
+      setTarget({ 
+        x: bbox.x, 
+        y: bbox.y, 
+        width: bbox.width, 
+        height: bbox.height, 
+        status: 'SEARCHING' 
+      });
+      
       addLog(`Acquiring target...`, "INFO");
       
-      sendToSimulator({ Command: "SetTarget", TargetX: x, TargetY: y }); 
+      fetch('http://127.0.0.1:8000/api/SetTargetBBox', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+              TargetX: bbox.normX,
+              TargetY: bbox.normY,
+              TargetW: bbox.normW,
+              TargetH: bbox.normH
+          })
+      })
+      .then(res => res.json())
+      .then(data => console.log("BBox sent to API:", data))
+      .catch(err => console.error("Failed to send BBox:", err));
 
       setTimeout(() => {
           setTarget(prev => ({ ...prev, status: 'LOCKED' }));

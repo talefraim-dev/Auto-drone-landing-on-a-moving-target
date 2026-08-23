@@ -8,6 +8,8 @@ import keyboard
 import threading
 import time
 import asyncio
+import json
+import os
 
 app = FastAPI()
 
@@ -26,6 +28,12 @@ latest_telemetry = {
 
 class ModeUpdate(BaseModel):
     mode: str
+
+class TargetBBox(BaseModel):
+    TargetX: float
+    TargetY: float
+    TargetW: float
+    TargetH: float
 
 def translate_unreal_to_lat(unreal_x):
     unreal_min, unreal_max = -120000, 120000
@@ -244,6 +252,16 @@ def update_mode(data: ModeUpdate):
     current_mode = data.mode
     print(f"Server mode updated to: {current_mode}")
     return {"status": "success", "mode": current_mode}
+
+@app.post("/api/SetTargetBBox")
+def set_target_bbox(bbox: TargetBBox):
+    os.makedirs("config", exist_ok=True)
+    
+    with open("config/target_bbox.json", "w") as f:
+        json.dump(bbox.model_dump(), f) 
+        
+    print(f"Target BBox received and saved: {bbox.model_dump()}")
+    return {"status": "success", "message": "BBox saved successfully"}
 
 @app.get("/api/telemetry")
 def get_telemetry():
