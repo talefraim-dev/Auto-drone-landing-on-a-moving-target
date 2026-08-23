@@ -69,7 +69,7 @@ UI_PID=$!
 # ---------------------------------------------------------
 echo -e "${BLUE}[4/4] Starting Landing Benchmark...${NC}"
 cd "$ORIGINAL_DIR" 
-python run_final_object_tracker.py --target-identity "YOUR_TARGET" &
+python RL_training/run_final_object_tracker.py --target-identity "YOUR_TARGET" &
 BENCHMARK_PID=$!
 
 # ---------------------------------------------------------
