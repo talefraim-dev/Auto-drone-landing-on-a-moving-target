@@ -1,44 +1,38 @@
 import { useState, useEffect } from 'react';
 
-const translateUnrealToLat = (unrealX) => {
-  const unrealMin = -120000, unrealMax = 120000;
-  const latMin = 32.0000, latMax = 32.0800;
-  return latMin + ((unrealX - unrealMin) * (latMax - latMin)) / (unrealMax - unrealMin);
-};
-
-const translateUnrealToLng = (unrealY) => {
-  const unrealMin = -120000, unrealMax = 120000;
-  const lngMin = 34.7000, lngMax = 34.81635;
-  return lngMin + ((unrealY - unrealMin) * (lngMax - lngMin)) / (unrealMax - unrealMin);
-};
-
 export const useTelemetry = (stream) => {
   const [telemetry, setTelemetry] = useState({ 
     alt: 0, speed: 0.0, bat: 100, lat: 32.0853, lng: 34.7818,
-    pitch: 0, roll: 0, coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
+    pitch: 0, roll: 0, yaw: 0, coreTemp: 42.0, escTemp: 35.0, linkQuality: 100
   });
 
   useEffect(() => {
-    if (stream) {
-        stream.addResponseEventListener("DroneTelemetry", (response) => {
-            try {
-                const data = JSON.parse(response);
-                setTelemetry(prev => ({
-                    ...prev,
-                    lat: data.X !== undefined ? translateUnrealToLat(data.X) : prev.lat,
-                    lng: data.Y !== undefined ? translateUnrealToLng(data.Y) : prev.lng,
-                    alt: data.Z !== undefined ? data.Z / 100 : prev.alt, // ס"מ למטרים
-                    speed: data.Speed !== undefined ? data.Speed : prev.speed,
-                    pitch: data.Pitch !== undefined ? data.Pitch : prev.pitch,
-                    roll: data.Roll !== undefined ? data.Roll : prev.roll
-                }));
-            } catch (err) {
-                console.error("Failed to parse telemetry:", err);
-            }
-        });
-    }
+    const fetchTelemetry = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/telemetry');
+        if (response.ok) {
+          const data = await response.json();
+          if (!data.error) {
+            setTelemetry(prev => ({
+              ...prev,
+              lat: data.lat !== undefined ? data.lat : prev.lat,
+              lng: data.lng !== undefined ? data.lng : prev.lng,
+              alt: data.z !== undefined ? -data.z : prev.alt, 
+              speed: data.speed !== undefined ? data.speed : prev.speed,
+              pitch: data.pitch !== undefined ? data.pitch : prev.pitch,
+              roll: data.roll !== undefined ? data.roll : prev.roll,
+              yaw: data.yaw !== undefined ? data.yaw : prev.yaw
+            }));
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch telemetry from Python API:", err);
+      }
+    };
 
-    const interval = setInterval(() => {
+    const telemetryInterval = setInterval(fetchTelemetry, 100);
+
+    const simInterval = setInterval(() => {
         setTelemetry(prev => ({
             ...prev,
             bat: Math.max(0, prev.bat - 0.01),
@@ -47,8 +41,11 @@ export const useTelemetry = (stream) => {
         }));
     }, 1000);
 
-    return () => clearInterval(interval);
-  }, [stream]);
+    return () => {
+      clearInterval(telemetryInterval);
+      clearInterval(simInterval);
+    };
+  }, []); 
 
   return { telemetry };
 };
